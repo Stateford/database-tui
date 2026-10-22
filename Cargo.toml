@@ -1,0 +1,42 @@
+[package]
+name = "database-tui"
+version = "0.1.0"
+edition = "2024"
+description = "A modern terminal UI for exploring and editing SQL databases"
+license = "MIT"
+rust-version = "1.94"
+
+[[bin]]
+name = "dbtui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6"
+futures = "0.3"
+keyring = "4"
+rand = "0.8"
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml = "0.9"
+unicode-width = "0.2"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Keep crypto (argon2) and the database drivers fast in debug builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true
