@@ -189,3 +189,63 @@ fn sqlite_file_names_are_never_uris() {
         assert!(!path.to_string_lossy().starts_with("file:"), "{name}");
     }
 }
+
+/// Audit L8: a key is bound as the value it was read as. In a SQLite
+/// column without type affinity, integer 1 and text '1' (or a blob and its
+/// `0x…` text) are different rows that look the same in the grid; an edit
+/// or delete must reach exactly the one it was made on.
+#[tokio::test]
+async fn keys_match_the_row_they_were_read_from() {
+    use crate::app::grid::Grid;
+    let (_dir, _profile, db) = setup(false).await;
+    db.run_query(
+        "CREATE TABLE t (k PRIMARY KEY, v TEXT);
+         INSERT INTO t VALUES (1, 'integer'), ('1', 'text'), (x'fffe', 'blob'), ('0xfffe', 'blob as text'),
+                              (2.5, 'real'), ('2.5', 'real as text');",
+        false,
+    )
+    .await
+    .unwrap();
+    let table = TableRef::new("main", "t");
+    let structure = db.structure(&table).await.unwrap();
+    let load = async || {
+        let req = PageRequest { default_order: vec!["rowid".into()], limit: 50, ..Default::default() };
+        let rs = db.fetch_page(&table, &req, false).await.unwrap();
+        Grid::new(rs.columns, rs.rows).with_kinds(rs.kinds)
+    };
+    let values = async || {
+        let rs = db.run_query("SELECT v FROM t ORDER BY rowid", false).await.unwrap();
+        rs.rows.into_iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>()
+    };
+    let grid = load().await;
+    let shown: Vec<_> = grid.rows.iter().map(|r| r[0].clone().unwrap()).collect();
+    assert_eq!(shown, ["1", "1", "0xfffe", "0xfffe", "2.5", "2.5"]);
+
+    for row in 0..6 {
+        let mut grid = load().await;
+        grid.set_cell(row, 1, Some(format!("edited {row}")));
+        let statements = grid.build_statements(Driver::Sqlite, &table, &structure).unwrap();
+        assert_eq!(db.apply(&statements).await.unwrap(), 1, "{}", statements[0].preview());
+        let after = values().await;
+        for (i, v) in after.iter().enumerate() {
+            assert_eq!(v.starts_with("edited"), i <= row, "row {row}: {after:?}");
+        }
+    }
+    // Deleting the integer row leaves the text one, and the blob its text.
+    for (row, left) in [(0, "edited 1"), (1, "edited 3")] {
+        let mut grid = load().await;
+        grid.toggle_delete(row);
+        let statements = grid.build_statements(Driver::Sqlite, &table, &structure).unwrap();
+        assert_eq!(db.apply(&statements).await.unwrap(), 1);
+        assert_eq!(values().await[row], left);
+    }
+
+    // Text that is not UTF-8 is shown as hex, which cannot find it again.
+    db.run_query("INSERT INTO t VALUES (CAST(x'fffe' AS TEXT), 'not utf-8')", false).await.unwrap();
+    let mut grid = load().await;
+    let row = grid.rows.len() - 1;
+    assert_eq!(grid.rows[row][0].as_deref(), Some("0xfffe"));
+    grid.toggle_delete(row);
+    let err = grid.build_statements(Driver::Sqlite, &table, &structure).unwrap_err();
+    assert!(err.contains("cannot be matched exactly"), "{err}");
+}

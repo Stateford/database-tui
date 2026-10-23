@@ -1,16 +1,76 @@
 //! SQL generation and inspection helpers. Everything here is pure so it can be
 //! unit tested without a database.
 
-use super::{ColumnInfo, Driver, PageRequest, TableRef};
+use super::{CellKind, ColumnInfo, Driver, PageRequest, TableRef};
 
-/// A parameterised statement. Parameters are always sent as text (or NULL)
-/// and converted by the database to the column type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parameterised statement. Values typed by the user are sent as text (or
+/// NULL) and converted by the database to the column type; the keys that
+/// identify a row are sent as what they were read as (see [`Value`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub sql: String,
-    pub params: Vec<Option<String>>,
+    pub params: Vec<Option<Value>>,
     /// The statement must affect exactly one row (updates/deletes by key).
     pub expect_one: bool,
+}
+
+/// A value bound to a statement parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// Text, converted by the database to the column type.
+    Text(String),
+    /// A SQLite INTEGER or REAL, bound as one: in a column without type
+    /// affinity, integer 1 and text '1' are different keys.
+    Integer(i64),
+    Real(f64),
+    /// Bytes (SQLite BLOB, MySQL binary strings), never their `0x…` text.
+    Bytes(Vec<u8>),
+}
+
+impl Value {
+    /// The value that a cell shown as `text` was read as, so that a key
+    /// matches exactly the row it was read from. `None` when the text does
+    /// not give the value back exactly.
+    pub fn from_cell(text: &str, kind: CellKind) -> Option<Value> {
+        match kind {
+            CellKind::Text => Some(Value::Text(text.to_string())),
+            CellKind::Integer => text.parse().ok().map(Value::Integer),
+            // Shown as Rust's shortest form that reads back as the same f64.
+            CellKind::Real => text.parse().ok().map(Value::Real),
+            CellKind::Bytes => parse_hex(text).map(Value::Bytes),
+            CellKind::Inexact => None,
+        }
+    }
+
+    fn literal(&self) -> String {
+        match self {
+            Value::Text(s) => quote_literal(s),
+            Value::Integer(i) => i.to_string(),
+            Value::Real(f) => format!("{f:?}"),
+            Value::Bytes(b) => format!("x'{}'", b.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        }
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::Text(s.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Text(s)
+    }
+}
+
+/// Bytes from `0x` + hex, as [`super::hex_bytes`] shows them.
+fn parse_hex(text: &str) -> Option<Vec<u8>> {
+    let hex = text.strip_prefix("0x")?;
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
 }
 
 impl Statement {
@@ -23,7 +83,7 @@ impl Statement {
             .params
             .iter()
             .map(|p| match p {
-                Some(v) => quote_literal(v),
+                Some(v) => v.literal(),
                 None => "NULL".to_string(),
             })
             .collect();
@@ -49,14 +109,16 @@ pub fn qualified(driver: Driver, table: &TableRef) -> String {
     format!("{}.{}", quote_ident(driver, &table.schema), quote_ident(driver, &table.name))
 }
 
-fn placeholder(driver: Driver, n: usize, column: &ColumnInfo) -> String {
+fn placeholder(driver: Driver, n: usize, column: &ColumnInfo, value: Option<&Value>) -> String {
     match driver {
-        // Parameters are bound as text; cast them to the column's base type
-        // (never to e.g. `varchar(40)`, which would truncate long values).
-        Driver::Postgres => {
+        // Text is cast to the column's base type (never to e.g.
+        // `varchar(40)`, which would truncate long values).
+        Driver::Postgres if matches!(value, None | Some(Value::Text(_))) => {
             let ty = if column.base_type.is_empty() { &column.data_type } else { &column.base_type };
             format!("CAST(${n} AS {ty})")
         }
+        // Other values are bound with their own type.
+        Driver::Postgres => format!("${n}"),
         Driver::MySql | Driver::Sqlite => "?".to_string(),
     }
 }
@@ -84,31 +146,32 @@ pub fn count_rows(driver: Driver, table: &TableRef, filter: Option<&str>) -> Str
     format!("SELECT COUNT(*) FROM {}{}", qualified(driver, table), where_clause(filter))
 }
 
-fn key_conditions(driver: Driver, key: &[(&ColumnInfo, Option<String>)], params: &mut Vec<Option<String>>) -> String {
+fn key_conditions(driver: Driver, key: &[(&ColumnInfo, Option<Value>)], params: &mut Vec<Option<Value>>) -> String {
     key.iter()
         .map(|(col, value)| match value {
             None => format!("{} IS NULL", quote_ident(driver, &col.name)),
             Some(v) => {
                 params.push(Some(v.clone()));
-                format!("{} = {}", quote_ident(driver, &col.name), placeholder(driver, params.len(), col))
+                format!("{} = {}", quote_ident(driver, &col.name), placeholder(driver, params.len(), col, Some(v)))
             }
         })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
+/// `key`: the values that identify the row, as read (see [`Value::from_cell`]).
 pub fn update_row(
     driver: Driver,
     table: &TableRef,
-    key: &[(&ColumnInfo, Option<String>)],
+    key: &[(&ColumnInfo, Option<Value>)],
     set: &[(&ColumnInfo, Option<String>)],
 ) -> Statement {
     let mut params = Vec::new();
     let assignments = set
         .iter()
         .map(|(col, value)| {
-            params.push(value.clone());
-            format!("{} = {}", quote_ident(driver, &col.name), placeholder(driver, params.len(), col))
+            params.push(value.clone().map(Value::Text));
+            format!("{} = {}", quote_ident(driver, &col.name), placeholder(driver, params.len(), col, None))
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -120,7 +183,7 @@ pub fn update_row(
     }
 }
 
-pub fn delete_row(driver: Driver, table: &TableRef, key: &[(&ColumnInfo, Option<String>)]) -> Statement {
+pub fn delete_row(driver: Driver, table: &TableRef, key: &[(&ColumnInfo, Option<Value>)]) -> Statement {
     let mut params = Vec::new();
     let cond = key_conditions(driver, key, &mut params);
     Statement { sql: format!("DELETE FROM {} WHERE {cond}", qualified(driver, table)), params, expect_one: true }
@@ -139,9 +202,9 @@ pub fn insert_row(driver: Driver, table: &TableRef, values: &[(&ColumnInfo, Opti
     let mut cols = Vec::new();
     let mut holders = Vec::new();
     for (col, value) in values {
-        params.push(value.clone());
+        params.push(value.clone().map(Value::Text));
         cols.push(quote_ident(driver, &col.name));
-        holders.push(placeholder(driver, params.len(), col));
+        holders.push(placeholder(driver, params.len(), col, None));
     }
     Statement {
         sql: format!("INSERT INTO {target} ({}) VALUES ({})", cols.join(", "), holders.join(", ")),
@@ -820,5 +883,40 @@ mod tests {
         let st =
             Statement { sql: "UPDATE t SET a = ?".into(), params: vec![Some("x'y".into()), None], expect_one: true };
         assert_eq!(st.preview(), "UPDATE t SET a = ?;  -- ['x''y', NULL]");
+    }
+
+    /// Audit L8: a key is bound as what it was read as, so that it matches
+    /// exactly the row it was read from, and text that does not give the
+    /// value back exactly is never used as a key.
+    #[test]
+    fn keys_are_bound_as_read() {
+        assert_eq!(Value::from_cell("1", CellKind::Integer), Some(Value::Integer(1)));
+        assert_eq!(Value::from_cell("1", CellKind::Text), Some(Value::Text("1".into())));
+        assert_eq!(Value::from_cell("0xcafe", CellKind::Bytes), Some(Value::Bytes(vec![0xca, 0xfe])));
+        assert_eq!(Value::from_cell("0x", CellKind::Bytes), Some(Value::Bytes(vec![])));
+        for f in [0.1, 3.0, -2.5e-320, 1e300, f64::MAX, f64::INFINITY] {
+            assert_eq!(Value::from_cell(&format!("{f:?}"), CellKind::Real), Some(Value::Real(f)));
+        }
+        for (text, kind) in [
+            ("0xcaf", CellKind::Bytes),
+            ("cafe", CellKind::Bytes),
+            ("0x+1", CellKind::Bytes),
+            ("1.5", CellKind::Integer),
+            ("1", CellKind::Inexact),
+        ] {
+            assert_eq!(Value::from_cell(text, kind), None, "{text} {kind:?}");
+        }
+
+        let (k, v) = (col("k", "BLOB"), col("v", "TEXT"));
+        let t = TableRef::new("main", "t");
+        let st =
+            update_row(Driver::Sqlite, &t, &[(&k, Some(Value::Bytes(vec![0xff, 0xfe])))], &[(&v, Some("x".into()))]);
+        assert_eq!(st.preview(), "UPDATE \"t\" SET \"v\" = ? WHERE \"k\" = ?;  -- ['x', x'fffe']");
+        let st = delete_row(Driver::Sqlite, &t, &[(&k, Some(Value::Integer(1))), (&v, Some(Value::Real(2.5)))]);
+        assert_eq!(st.preview(), "DELETE FROM \"t\" WHERE \"k\" = ? AND \"v\" = ?;  -- [1, 2.5]");
+        // PostgreSQL casts text to the column type; other values have their own.
+        let id = ColumnInfo { base_type: "bytea".into(), ..col("id", "bytea") };
+        let st = delete_row(Driver::Postgres, &TableRef::new("public", "t"), &[(&id, Some(Value::Bytes(vec![1])))]);
+        assert_eq!(st.sql, "DELETE FROM \"public\".\"t\" WHERE \"id\" = $1");
     }
 }

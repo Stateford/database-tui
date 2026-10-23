@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
-use super::grid::Grid;
+use super::grid::{Edits, Grid};
 use super::query::QueryState;
 use crate::config::ConnectionProfile;
-use crate::db::{AccessLevel, Database, Privileges, SchemaInfo, SessionInfo, TableInfo, TableStructure};
+use crate::db::{AccessLevel, Database, Privileges, SchemaInfo, SessionInfo, TableInfo, TableRef, TableStructure};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -80,6 +80,12 @@ impl OpenTable {
         self.structure.as_ref().is_some_and(|s| s.columns.iter().any(|c| c.primary_key))
     }
 
+    /// Names of the primary-key columns.
+    pub fn key_columns(&self) -> Vec<String> {
+        let columns = self.structure.as_ref().map(|s| s.columns.as_slice()).unwrap_or_default();
+        columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect()
+    }
+
     pub fn privileges(&self) -> Privileges {
         self.info.privileges
     }
@@ -100,7 +106,29 @@ impl OpenTable {
     }
 }
 
+/// The staged changes of a table as a commit preview showed them: they are
+/// only committed to that connection and table, as long as they are
+/// unchanged, and once committed exactly these are cleared.
+#[derive(Debug, Clone)]
+pub struct CommitSnapshot {
+    /// [`Browser::generation`] of the connection.
+    pub generation: u64,
+    pub table: TableRef,
+    /// [`Grid::id`] of the grid the changes were staged on.
+    pub grid: u64,
+    pub edits: Edits,
+}
+
+/// A commit sent to the database whose result has not come back yet.
+pub struct Committing {
+    pub seq: u64,
+    pub snapshot: CommitSnapshot,
+}
+
 pub struct Browser {
+    /// Identifies this connection (it is the id of the attempt that opened
+    /// it): results of requests made on an earlier one are dropped.
+    pub generation: u64,
     pub profile: ConnectionProfile,
     pub db: Database,
     pub session: SessionInfo,
@@ -113,12 +141,26 @@ pub struct Browser {
     pub tab: Tab,
     pub table: Option<OpenTable>,
     pub query: QueryState,
+    /// Latest page load of the open table.
     pub seq: u64,
+    /// Latest refresh of the schema tree.
+    pub schema_seq: u64,
+    pub commit_seq: u64,
+    /// The commit in progress: while it runs, the table cannot be changed,
+    /// reloaded or swapped for another one.
+    pub commit: Option<Committing>,
 }
 
 impl Browser {
-    pub fn new(profile: ConnectionProfile, db: Database, session: SessionInfo, schemas: Vec<SchemaInfo>) -> Self {
+    pub fn new(
+        generation: u64,
+        profile: ConnectionProfile,
+        db: Database,
+        session: SessionInfo,
+        schemas: Vec<SchemaInfo>,
+    ) -> Self {
         let mut b = Browser {
+            generation,
             profile,
             db,
             session,
@@ -132,6 +174,9 @@ impl Browser {
             table: None,
             query: QueryState::default(),
             seq: 0,
+            schema_seq: 0,
+            commit_seq: 0,
+            commit: None,
         };
         b.expand_default_schema();
         b

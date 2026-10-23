@@ -36,7 +36,7 @@ const STANDARD: &[Section] = &[
             ("arrows  PgUp PgDn", "move"),
             ("Home End  Ctrl-Home Ctrl-End", "first/last column, first/last row"),
             ("[  ]  Alt-← Alt-→", "previous / next page"),
-            ("Space  F3", "view full value (JSON pretty-printed)"),
+            ("Space  F3", "view full value (JSON re-indented)"),
             ("Ctrl-C", "copy cell (system clipboard via OSC 52)"),
             ("/  Ctrl-F", "filter with a WHERE condition"),
             ("Ctrl-O  F6", "sort by column (asc → desc → off)"),

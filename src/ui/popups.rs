@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Paragraph::new(message.as_str()).wrap(Wrap { trim: false }), text);
             frame.render_widget(footer(&[("y / Enter", "yes"), ("n / Esc", "no")]), foot);
         }
-        Popup::Commit { statements, scroll, non_transactional } => {
+        Popup::Commit { statements, scroll, non_transactional, .. } => {
             let force = commit_needs_force(statements, non_transactional.as_ref());
             let mut head = match non_transactional {
                 None => vec![Line::styled("These statements run in a single transaction:", dim())],
@@ -98,11 +98,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             frame.render_widget(footer(keys), foot);
         }
-        Popup::CellView { title, text, scroll } => {
+        Popup::CellView { title, text, value, scroll } => {
             let r = centered(area, 90, area.height.saturating_sub(6));
             let inner = modal(frame, r, title, CYAN).inner(Margin { horizontal: 2, vertical: 1 });
             let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-            let style = if text == "NULL" { null() } else { Style::default().fg(FG) };
+            // A stored text 'NULL' is not shown as SQL NULL.
+            let style = if value.is_none() { null() } else { Style::default().fg(FG) };
             frame.render_widget(
                 Paragraph::new(text.as_str()).style(style).wrap(Wrap { trim: false }).scroll((*scroll, 0)),
                 body,

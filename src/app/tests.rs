@@ -12,8 +12,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use super::*;
 use crate::config::{Config, SslMode};
-use crate::db::Transport;
 use crate::db::transport_tests::fake_pg_server;
+use crate::db::{Transport, Value};
 use crate::secrets::fake::FakeKeyring;
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -516,7 +516,9 @@ async fn old_passwords_are_bound_once_they_work() {
     // A local session stands in for the server's.
     let (_db_dir, mut db_app, _db_rx) = open_people(KeymapMode::Standard, false).await;
     let browser = db_app.browser.take().unwrap();
-    let connected = |profile: &ConnectionProfile, remember| AppEvent::Connected {
+    // What a connection attempt the app started brings back.
+    let connected = |app: &mut App, profile: &ConnectionProfile, remember| AppEvent::Connected {
+        attempt: app.begin_connect(),
         profile: profile.clone(),
         db: browser.db.clone(),
         session: Box::new(browser.session.clone()),
@@ -526,7 +528,8 @@ async fn old_passwords_are_bound_once_they_work() {
     for (profile, password) in [(&in_vault, "vault-password"), (&in_keyring, "keyring-password")] {
         // What `connect_with_saved` asks for with an unbound password.
         let remember = app.remember(profile, Zeroizing::new(password.into()), true);
-        app.on_app_event(connected(profile, remember));
+        let event = connected(&mut app, profile, remember);
+        app.on_app_event(event);
     }
     settle(&mut app, &mut rx).await;
     let secret = app.vault.as_ref().unwrap().get(&in_vault.id).unwrap().unwrap();
@@ -542,11 +545,13 @@ async fn old_passwords_are_bound_once_they_work() {
     // The profile now points elsewhere: the password is not saved for it.
     let remember = app.remember(&in_vault, Zeroizing::new("typed".into()), false);
     app.update_config(|c| c.connections[0].host = "db2.example.com".into());
-    app.on_app_event(connected(&in_vault, remember));
+    let event = connected(&mut app, &in_vault, remember);
+    app.on_app_event(event);
     // Deleted while connecting.
     let remember = app.remember(&in_keyring, Zeroizing::new("typed".into()), false);
     app.confirm(ConfirmAction::DeleteProfile(in_keyring.id.clone()));
-    app.on_app_event(connected(&in_keyring, remember));
+    let event = connected(&mut app, &in_keyring, remember);
+    app.on_app_event(event);
     settle(&mut app, &mut rx).await;
     assert_eq!(app.vault.as_ref().unwrap().get(&in_vault.id).unwrap().unwrap().password(), "vault-password");
     assert_eq!(keyring.raw(&in_keyring.id), None);
@@ -723,4 +728,467 @@ async fn instances_keep_each_others_changes() {
     two.on_key(key(KeyCode::Char('y')));
     let on_disk = Config::load_from(&dir.path().join("config.toml")).unwrap();
     assert_eq!((names(&on_disk), on_disk.keymap), (vec!["two".to_string()], KeymapMode::Vim));
+}
+
+// ---------------------------------------------------------------------------
+// Async results and staged edits (audit M4, L8, data fidelity)
+// ---------------------------------------------------------------------------
+
+/// A SQLite database file `file` in `dir`, set up with `setup`.
+async fn sqlite_db(dir: &Path, file: &str, setup: &str) -> ConnectionProfile {
+    let path = dir.join(file);
+    std::fs::File::create(&path).unwrap();
+    let mut profile = ConnectionProfile::new(Driver::Sqlite);
+    profile.name = file.into();
+    profile.path = path.to_string_lossy().into_owned();
+    let db = Database::connect(&profile, None).await.unwrap();
+    db.run_query(setup, false).await.unwrap();
+    db.close().await;
+    profile
+}
+
+async fn rows_of(profile: &ConnectionProfile, sql: &str) -> Vec<Vec<Option<String>>> {
+    let db = Database::connect(profile, None).await.unwrap();
+    let rs = db.run_query(sql, false).await.unwrap();
+    db.close().await;
+    rs.rows
+}
+
+/// Connects to `profile` and opens its first table.
+async fn connect_and_open(app: &mut App, rx: &mut UnboundedReceiver<AppEvent>, profile: ConnectionProfile) {
+    app.start(profile);
+    wait_for(app, rx, |a| a.browser.is_some()).await;
+    app.on_key(key(KeyCode::Enter));
+    wait_for(app, rx, |a| a.browser.as_ref().unwrap().table.as_ref().is_some_and(|t| t.loaded && !t.loading)).await;
+}
+
+fn table_mut(app: &mut App) -> &mut OpenTable {
+    app.browser.as_mut().unwrap().table.as_mut().unwrap()
+}
+
+fn names(app: &App) -> Vec<Option<String>> {
+    table(app).grid.rows.iter().map(|r| r[1].clone()).collect()
+}
+
+/// Holds the write lock of a SQLite file, as another program would, until
+/// the transaction is ended.
+async fn lock_sqlite(profile: &ConnectionProfile) -> sqlx::sqlite::SqliteConnection {
+    use sqlx::Connection;
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&profile.path);
+    let mut conn = sqlx::sqlite::SqliteConnection::connect_with(&opts).await.unwrap();
+    sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut conn).await.unwrap();
+    conn
+}
+
+/// Audit M4: a connection that finishes after another one was asked for is
+/// closed and ignored, even while a commit preview is open; and a preview
+/// is only ever committed to the connection it was made on.
+#[tokio::test]
+async fn late_connections_are_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let setup = |v: &str| format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, '{v}');");
+    let a = sqlite_db(dir.path(), "a.db", &setup("a")).await;
+    let b = sqlite_db(dir.path(), "b.db", &setup("b")).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    // Connecting to a, then (before it is done) to b.
+    app.start(a.clone());
+    app.start(b.clone());
+    let mut events = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+    let from_a = |e: &AppEvent| matches!(e, AppEvent::Connected { profile, .. } if profile.name == "a.db");
+    let late = events.remove(events.iter().position(from_a).unwrap());
+    let AppEvent::Connected { attempt: late_attempt, db: late_db, .. } = &late else { unreachable!() };
+    let (late_attempt, late_db) = (*late_attempt, late_db.clone());
+    app.on_app_event(events.remove(0));
+    assert_eq!(app.browser.as_ref().unwrap().profile.name, "b.db");
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| table(a).loaded && !table(a).loading).await;
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace)); // v = NULL
+    app.on_key(ctrl('s'));
+    assert!(matches!(app.popup, Some(Popup::Commit { .. })));
+
+    // a comes through now: closed, and nothing changes.
+    app.on_app_event(late);
+    let error = "late failure".to_string();
+    app.on_app_event(AppEvent::ConnectFailed {
+        attempt: late_attempt,
+        profile: a.clone(),
+        error,
+        needs_password: false,
+    });
+    assert_eq!(app.browser.as_ref().unwrap().profile.name, "b.db");
+    assert!(matches!(app.popup, Some(Popup::Commit { .. })));
+    for _ in 0..100 {
+        if late_db.is_closed() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(late_db.is_closed(), "the discarded connection is closed");
+    app.on_key(key(KeyCode::Char('y')));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none() && !table(a).loading && !table(a).grid.has_pending()).await;
+    assert_eq!(rows_of(&b, "SELECT v FROM t").await, vec![vec![None]]);
+    assert_eq!(rows_of(&a, "SELECT v FROM t").await, vec![vec![Some("a".into())]]);
+
+    // The connection is replaced while a preview is open (nothing in the
+    // UI does that; it stands for any change of connection): refused.
+    app.on_key(key(KeyCode::Enter));
+    type_str(&mut app, "x");
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(ctrl('s'));
+    assert!(matches!(app.popup, Some(Popup::Commit { .. })));
+    app.connect(a.clone());
+    wait_for(&mut app, &mut rx, |a| a.browser.as_ref().unwrap().profile.name == "a.db").await;
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(toast(&app).contains("Nothing was committed"), "{}", toast(&app));
+    assert!(app.busy.is_none());
+    assert_eq!(rows_of(&a, "SELECT v FROM t").await, vec![vec![Some("a".into())]]);
+    assert_eq!(rows_of(&b, "SELECT v FROM t").await, vec![vec![None]]);
+}
+
+/// Audit M4: page, count, schema and query results requested on an
+/// earlier connection are dropped, even when their `seq` matches.
+#[tokio::test]
+async fn results_from_a_previous_connection_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = sqlite_db(
+        dir.path(),
+        "a.db",
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO people VALUES (1, 'Ann-A'), (2, 'Bob-A');",
+    )
+    .await;
+    let b = sqlite_db(
+        dir.path(),
+        "b.db",
+        "CREATE TABLE staff (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO staff VALUES (1, 'Sam-B'), (2, 'Tia-B');",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    app.start(a);
+    wait_for(&mut app, &mut rx, |a| a.browser.is_some()).await;
+    // Requests on a whose results are slow to come.
+    let request_all = |app: &mut App| {
+        app.on_key(key(KeyCode::Enter));
+        app.refresh_schemas();
+        app.on_key(key(KeyCode::Char('3')));
+        type_str(app, "SELECT 'slow'");
+        app.on_key(key(KeyCode::F(5)));
+        app.on_key(key(KeyCode::Esc));
+    };
+    request_all(&mut app);
+    let mut held = Vec::new();
+    while held.len() < 4 {
+        held.push(rx.recv().await.unwrap());
+    }
+    assert_eq!(app.browser.as_ref().map(|b| (b.seq, b.schema_seq, b.query.seq)), Some((1, 1, 1)));
+
+    app.run_command("q!");
+    app.start(b);
+    wait_for(&mut app, &mut rx, |a| a.browser.is_some()).await;
+    request_all(&mut app);
+    wait_for(&mut app, &mut rx, |a| table(a).loaded && !a.browser.as_ref().unwrap().query.running).await;
+    settle(&mut app, &mut rx).await;
+    let state = |app: &App| {
+        let b = app.browser.as_ref().unwrap();
+        let schemas: Vec<String> = b.schemas.iter().flat_map(|s| &s.tables).map(|t| t.table.name.clone()).collect();
+        (names(app), table(app).total, schemas, b.query.result.as_ref().map(|g| g.rows.clone()))
+    };
+    let before = state(&app);
+    assert_eq!(app.browser.as_ref().map(|b| (b.seq, b.schema_seq, b.query.seq)), Some((1, 1, 1)));
+    assert_eq!(before.0, vec![Some("Sam-B".to_string()), Some("Tia-B".into())]);
+    for event in held {
+        app.on_app_event(event);
+    }
+    assert_eq!(state(&app), before);
+}
+
+/// Audit M4: a cell editor stages its value on the row it was opened on,
+/// found by key wherever a reload has put it, and stages nothing if that
+/// row is gone.
+#[tokio::test]
+async fn cell_editor_follows_its_row() {
+    let (_dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Enter)); // Ann (id 1), on row 0
+    // Reloaded meanwhile (say, after a statement run in the SQL tab), in
+    // another order.
+    table_mut(&mut app).order_by = Some(("id".into(), false));
+    app.request_page();
+    wait_for(&mut app, &mut rx, |a| !table(a).loading).await;
+    assert_eq!(names(&app), vec![Some("Bob".to_string()), Some("Ann".into())]);
+    assert!(matches!(app.popup, Some(Popup::CellEditor(_))), "Ann is still there");
+    type_str(&mut app, "-x");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(table(&app).grid.edits.updates, [((1, 1), Some("Ann-x".to_string()))].into());
+    app.on_key(ctrl('s'));
+    let Some(Popup::Commit { statements, .. }) = &app.popup else { panic!("expected the commit preview") };
+    assert_eq!(statements[0].params, vec![Some("Ann-x".into()), Some(Value::Integer(1))]);
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(ctrl('z'));
+
+    // The row is deleted elsewhere while it is being edited.
+    app.on_key(key(KeyCode::Up));
+    app.on_key(key(KeyCode::Enter)); // Bob, on row 0
+    let db = app.browser.as_ref().unwrap().db.clone();
+    db.run_query("DELETE FROM people WHERE id = 2", false).await.unwrap();
+    app.request_page();
+    wait_for(&mut app, &mut rx, |a| !table(a).loading).await;
+    assert!(app.popup.is_none());
+    assert!(toast(&app).contains("no longer shown"), "{}", toast(&app));
+    assert_eq!((names(&app), table(&app).grid.pending_count()), (vec![Some("Ann".to_string())], 0));
+}
+
+/// Audit M4: nothing can be staged while the rows are being replaced or
+/// committed; a second commit, discarding, and switching tables wait for
+/// the commit; quitting and disconnecting say it is still running.
+#[tokio::test]
+async fn editing_waits_for_loads_and_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO people VALUES (1, 'Ann'), (2, 'Bob');
+         CREATE TABLE pets (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile.clone()).await;
+    assert_eq!(table(&app).info.table.name, "people");
+
+    // A reload is on its way.
+    app.on_key(key(KeyCode::F(5)));
+    assert!(table(&app).loading);
+    app.on_key(key(KeyCode::Right));
+    for k in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Insert, KeyCode::Enter, KeyCode::F(2)] {
+        app.on_key(key(k));
+        assert!(toast(&app).contains("loading"), "{k:?}: {}", toast(&app));
+    }
+    assert!(app.popup.is_none());
+    assert_eq!(table(&app).grid.pending_count(), 0);
+    wait_for(&mut app, &mut rx, |a| !table(a).loading).await;
+
+    // A commit is on its way (another program holds the write lock).
+    app.on_key(key(KeyCode::Insert));
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Enter));
+    type_str(&mut app, "Eve");
+    app.on_key(key(KeyCode::Enter));
+    let mut lock = lock_sqlite(&profile).await;
+    app.on_key(ctrl('s'));
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(app.browser.as_ref().unwrap().commit.is_some());
+    app.on_key(ctrl('s'));
+    assert!(app.popup.is_none() && toast(&app).contains("already running"), "{}", toast(&app));
+    for k in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Insert, KeyCode::Enter] {
+        app.on_key(key(k));
+        assert!(app.popup.is_none() && toast(&app).contains("commit is running"), "{k:?}: {}", toast(&app));
+    }
+    app.on_key(ctrl('z'));
+    app.run_command("e!");
+    app.on_key(ctrl('o')); // sort
+    assert_eq!(table(&app).grid.pending_count(), 1);
+    assert!(toast(&app).contains("commit is running"), "{}", toast(&app));
+    app.on_key(key(KeyCode::Tab)); // to the tables
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(table(&app).info.table.name, "people");
+    assert!(toast(&app).contains("commit is running"), "{}", toast(&app));
+    app.on_key(ctrl('q'));
+    let Some(Popup::Confirm { message, .. }) = &app.popup else { panic!("expected a confirmation") };
+    assert!(message.contains("commit to t.db is still running"), "{message}");
+    app.on_key(key(KeyCode::Esc));
+    app.run_command("q");
+    let Some(Popup::Confirm { message, .. }) = &app.popup else { panic!("expected a confirmation") };
+    assert!(message.contains("still running and may still be applied"), "{message}");
+    app.on_key(key(KeyCode::Esc));
+
+    sqlx::raw_sql("COMMIT").execute(&mut lock).await.unwrap();
+    wait_for(&mut app, &mut rx, |a| a.browser.as_ref().unwrap().commit.is_none() && !table(a).loading).await;
+    assert!(app.popup.is_none(), "committed");
+    assert_eq!(rows_of(&profile, "SELECT name FROM people WHERE name = 'Eve'").await.len(), 1);
+    assert_eq!(names(&app), vec![Some("Ann".to_string()), Some("Bob".into()), Some("Eve".into())]);
+    assert_eq!(table(&app).grid.pending_count(), 0);
+}
+
+/// Audit M4: a commit whose result comes while the SQL tab is shown still
+/// reloads the table, so its rows are never stale (and editable) after it.
+#[tokio::test]
+async fn commit_reloads_the_table_from_any_tab() {
+    let (_dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Delete)); // Bob
+    app.on_key(key(KeyCode::Insert));
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Enter));
+    type_str(&mut app, "Eve");
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(ctrl('s'));
+    app.on_key(key(KeyCode::Char('y')));
+    app.on_key(key(KeyCode::Char('3')));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none() && !table(a).loading).await;
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Char('1')));
+    assert_eq!((names(&app), table(&app).grid.pending_count()), (vec![Some("Ann".to_string()), Some("Eve".into())], 0));
+}
+
+/// Audit (data fidelity): the cell viewer copies the stored value, not its
+/// re-indented display, and copies nothing for NULL (which used to be
+/// pasted back as the text 'NULL').
+#[tokio::test]
+async fn viewer_copies_the_stored_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = r#"{"b":1,"a":12345678901234567890123,"b":2}"#;
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        &format!("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, note TEXT); INSERT INTO docs VALUES (1, '{json}', NULL);"),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile.clone()).await;
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Char(' ')));
+    let Some(Popup::CellView { title, text, .. }) = &app.popup else { panic!("expected the viewer") };
+    assert!(title.contains("JSON") && text.contains("\"a\": 12345678901234567890123,"), "{text}");
+    assert_eq!(text.matches("\"b\"").count(), 2, "{text}");
+    app.on_key(key(KeyCode::Char('y')));
+    assert_eq!(app.register.as_deref(), Some(json));
+    app.on_key(key(KeyCode::Esc));
+
+    app.on_key(key(KeyCode::Right)); // note: NULL
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('y')));
+    assert_eq!(toast(&app), "Cell is NULL — nothing copied");
+    assert_eq!(app.register.as_deref(), Some(json));
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(ctrl('v'));
+    assert_eq!(table(&app).grid.edits.updates, [((0, 2), Some(json.to_string()))].into());
+}
+
+/// Audit (data fidelity): confirming the cell editor without a change
+/// stages nothing, and an edit keeps the value's line endings.
+#[tokio::test]
+async fn cell_editor_keeps_values_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+         INSERT INTO notes VALUES (1, 'line1' || char(13, 10) || 'line2' || char(13, 10)), (2, 'a' || char(10) || 'b' || char(10)), (3, NULL);",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile).await;
+    app.on_key(key(KeyCode::Right));
+    for _ in 0..3 {
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.popup, Some(Popup::CellEditor(_))));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+        app.on_key(key(KeyCode::Down));
+    }
+    assert_eq!(table(&app).grid.pending_count(), 0);
+
+    table_mut(&mut app).grid.row = 0;
+    app.on_key(key(KeyCode::Enter));
+    type_str(&mut app, "line3");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(table(&app).grid.cell_text(0, 1).as_deref(), Some("line1\r\nline2\r\nline3"));
+}
+
+/// Audit L8: binary values are shown as `0x…`; that text is never written
+/// back by editing the cell.
+#[tokio::test]
+async fn binary_values_are_not_edited_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB); INSERT INTO files VALUES (1, x'CAFE');",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile).await;
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::F(2)));
+    assert!(app.popup.is_none() && toast(&app).contains("binary data"), "{}", toast(&app));
+    app.on_key(key(KeyCode::Enter));
+    let Some(Popup::CellView { text, .. }) = &app.popup else { panic!("expected the viewer") };
+    assert_eq!(text, "0xcafe");
+}
+
+/// Audit M4: a saved password read for a connection attempt that was given
+/// up for another one does not start connecting after all.
+#[tokio::test]
+async fn stale_saved_passwords_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = pg_profile("127.0.0.1", 1, CredentialStore::Keyring);
+    let config = Config { connections: vec![saved.clone()], ..Config::default() };
+    let (mut app, mut rx, keyring) = app_in(dir.path(), config);
+    keyring.put(&saved.id, &Endpoint::of(&saved), "secret");
+    app.on_key(key(KeyCode::Enter)); // reads the keyring in the background
+    let read = rx.recv().await.unwrap();
+    assert!(matches!(read, AppEvent::SavedPassword { .. }));
+    let local = sqlite_db(dir.path(), "local.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+    app.start(local);
+    wait_for(&mut app, &mut rx, |a| a.browser.is_some()).await;
+    app.on_app_event(read);
+    assert!(app.busy.is_none() && app.connecting.is_none() && app.popup.is_none());
+    assert_eq!(app.browser.as_ref().unwrap().profile.name, "local.db");
+}
+
+/// Audit M4: disconnecting while a commit runs says so, and how the commit
+/// ended is reported when it does.
+#[tokio::test]
+async fn commit_result_is_reported_after_disconnecting() {
+    let (dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    let profile = app.browser.as_ref().unwrap().profile.clone();
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace));
+    let mut lock = lock_sqlite(&profile).await;
+    app.on_key(ctrl('s'));
+    app.on_key(key(KeyCode::Char('y')));
+    app.run_command("q!");
+    assert!(app.browser.is_none() && app.busy.is_none());
+    assert!(toast(&app).contains("its commit is still running and may still be applied"), "{}", toast(&app));
+    sqlx::raw_sql("COMMIT").execute(&mut lock).await.unwrap();
+    wait_for(&mut app, &mut rx, |a| toast(a).starts_with("The commit to test")).await;
+    assert_eq!(toast(&app), "The commit to test finished: 1 row(s) affected");
+    assert_eq!(rows_of(&profile, "SELECT name FROM people WHERE id = 1").await, vec![vec![None]]);
+    drop(dir);
+}
+
+/// After SQL that wrote, the open table is reloaded, so that its rows (and
+/// the keys edits are made on) are not stale; with staged changes, it warns
+/// instead. A plain SELECT reloads nothing.
+#[tokio::test]
+async fn sql_writes_reload_the_open_table() {
+    let (_dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    let run = async |app: &mut App, rx: &mut UnboundedReceiver<AppEvent>, sql: &str| {
+        app.on_key(key(KeyCode::Char('3')));
+        app.browser.as_mut().unwrap().query.editor = TextArea::default();
+        type_str(app, sql);
+        app.on_key(key(KeyCode::F(5)));
+        wait_for(app, rx, |a| !a.browser.as_ref().unwrap().query.running && !table(a).loading).await;
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('1')));
+    };
+    let seq = app.browser.as_ref().unwrap().seq;
+    run(&mut app, &mut rx, "SELECT name FROM people").await;
+    assert_eq!(app.browser.as_ref().unwrap().seq, seq, "not reloaded");
+    let replace = "DELETE FROM people WHERE id = 2; INSERT INTO people VALUES (2, 'Other')";
+    run(&mut app, &mut rx, replace).await;
+    assert_eq!(names(&app), vec![Some("Ann".to_string()), Some("Other".into())]);
+
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace));
+    run(&mut app, &mut rx, replace).await;
+    assert!(toast(&app).contains("The SQL may have changed people"), "{}", toast(&app));
+    assert_eq!(table(&app).grid.pending_count(), 1);
 }

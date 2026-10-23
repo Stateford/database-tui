@@ -10,7 +10,8 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
 - **Explore schemas**: schemas, tables, views and materialized views in a filterable tree.
   The Structure tab lists columns, types, defaults, keys and indexes.
 - **Browse data**: a fast spreadsheet-style grid with paging, sorting, SQL `WHERE` filters,
-  a full-value viewer (JSON is pretty-printed) and copy to the system clipboard (OSC 52).
+  a full-value viewer (JSON is re-indented, nothing else about it changes) and copy to the
+  system clipboard (OSC 52). Copying always copies the stored value; a `NULL` copies nothing.
 - **Edit data safely**: edit cells, set `NULL`, add rows and delete rows. Changes are *staged*
   and highlighted, and you can undo them. Committing first shows a preview of the generated SQL,
   then runs everything in **one transaction**. Each update or delete targets exactly one row by
@@ -18,7 +19,8 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
   rolled back. Values go through the database's normal checks, so one that does not fit the
   column (too long for `varchar(n)`, say) is rejected rather than cut short. MySQL tables on an
   engine without transactions (MyISAM, MEMORY…) cannot be rolled back: the preview warns about
-  this, and committing several changes to them needs an explicit `!`.
+  this, and committing several changes to them needs an explicit `!`. See
+  [How edits reach the right row](#how-edits-reach-the-right-row).
 - **SQL editor**: a multi-line editor with a result grid. You can run the whole buffer or only
   the selection.
 - **Vim or standard keys**: arrows/F-keys/Ctrl shortcuts by default, or a vim-style scheme
@@ -84,6 +86,35 @@ transaction: advisory locks (`pg_advisory_lock`, MySQL `GET_LOCK`), functions th
 another connection (`dblink`) or outside the database (untrusted procedural languages), and
 anything else a server-side function may do. Those are governed by the account's privileges.
 For a hard guarantee, connect with an account that can only read.
+
+## How edits reach the right row
+
+Rows are identified by their primary key, never by where they are on screen:
+
+- **Keys are matched exactly as stored.** Binary keys are sent as bytes, not as the `0x…` text
+  the grid shows, and SQLite keys keep their storage class: in a column without type affinity,
+  integer `1` and text `'1'` are different rows that look the same. A row whose key is not shown
+  exactly as stored (text that is not UTF-8, a MySQL `BIT` value) cannot be changed from the
+  grid; use the SQL editor. Binary values themselves cannot be edited as text either.
+- **The cell editor remembers its row and column**, not their position. If the table is
+  reloaded while it is open, the value goes to the same row wherever it now is, or, if the row
+  is gone, the editor closes without staging anything. Confirming without a change stages
+  nothing, and line endings (CRLF, a final newline) are kept.
+- **Nothing can be staged while a page is loading or a commit is running**, and reloading,
+  sorting, filtering or paging waits until staged changes are committed or discarded. Staged
+  changes are never dropped by a reload.
+- **A commit preview is tied to what it shows**: it only commits to the connection and table it
+  was made for, and only while the staged changes are the ones shown. While a commit runs, a
+  second one, discarding, and opening another table wait for its result; afterwards exactly
+  the committed changes are cleared and the table is reloaded, whichever tab is shown. Quitting
+  or disconnecting during a commit warns that it may still be applied, and after a disconnect
+  its result is still reported.
+- **Results of earlier requests are dropped**: a connection that finishes after you asked for
+  another one is closed, and pages, counts, schema lists and query results from a connection
+  you have left never reach the current one.
+
+After a statement in the SQL editor that may have written, the open table is reloaded (or, with
+staged changes, dbtui warns that their rows may have changed).
 
 ## Connection security
 

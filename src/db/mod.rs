@@ -28,7 +28,7 @@ use sqlx::{AssertSqlSafe, Column, Either, Executor, Row};
 
 use crate::config::{ConnectionProfile, SslMode};
 
-pub use sql::Statement;
+pub use sql::{Statement, Value};
 
 /// Maximum number of rows kept from an ad-hoc query.
 pub const QUERY_ROW_LIMIT: usize = 2_000;
@@ -186,9 +186,40 @@ pub struct TableStructure {
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// Per row, what each cell's text stands for; empty when it is all
+    /// plain text (see [`CellKind`]).
+    pub kinds: Vec<Vec<CellKind>>,
     pub rows_affected: u64,
     pub truncated: bool,
     pub elapsed: Duration,
+}
+
+/// What a cell's text stands for, when it is not just that text. Rows are
+/// found again by their key cells (to update or delete them), which must
+/// then be bound as the values they were read from: text that merely looks
+/// the same can belong to another row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CellKind {
+    /// The text itself (or SQL NULL).
+    #[default]
+    Text,
+    /// A SQLite INTEGER: shown the same as text '1', but a different key.
+    Integer,
+    /// A SQLite REAL, shown so that it reads back as the same number.
+    Real,
+    /// Bytes shown as `0x` and hex (SQLite BLOB, MySQL binary strings that
+    /// are not UTF-8), which are not that text.
+    Bytes,
+    /// Text that does not give the value back exactly (text that is not
+    /// UTF-8, a MySQL BIT value…): never used to find a row.
+    Inexact,
+}
+
+impl CellKind {
+    /// Binary data, shown as `0x…`: editing that text would store the text.
+    pub fn is_binary(self) -> bool {
+        matches!(self, CellKind::Bytes | CellKind::Inexact)
+    }
 }
 
 /// How much the session may change, summarised for the status bar.
@@ -517,11 +548,7 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
@@ -530,11 +557,7 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
@@ -543,15 +566,20 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Database::Postgres(p) => p.is_closed(),
+            Database::MySql(p) => p.is_closed(),
+            Database::Sqlite(p, _) => p.is_closed(),
         }
     }
 
@@ -562,6 +590,29 @@ impl Database {
             Database::Sqlite(p, _) => run_raw_on(p, query, limit).await,
         }
     }
+}
+
+/// The statement with its parameters bound, each with its own type.
+fn bind_params<'q, DB>(st: &Statement) -> sqlx::query::Query<'q, DB, DB::Arguments>
+where
+    DB: sqlx::Database,
+    for<'t> Option<String>: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> String: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> i64: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> f64: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> Vec<u8>: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+{
+    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
+    for value in &st.params {
+        q = match value {
+            None => q.bind(None::<String>),
+            Some(Value::Text(s)) => q.bind(s.clone()),
+            Some(Value::Integer(i)) => q.bind(*i),
+            Some(Value::Real(f)) => q.bind(*f),
+            Some(Value::Bytes(b)) => q.bind(b.clone()),
+        };
+    }
+    q
 }
 
 fn check_affected(st: &Statement, affected: u64) -> Result<u64> {
@@ -600,27 +651,27 @@ where
     result
 }
 
-/// Decodes a single value to display text. Implemented per driver because the
-/// wire formats differ.
+/// Decodes a single value to display text, and what that text stands for.
+/// Implemented per driver because the wire formats differ.
 trait CellText: Row {
-    fn cell_text(&self, idx: usize) -> Option<String>;
+    fn cell(&self, idx: usize) -> (Option<String>, CellKind);
 }
 
 impl CellText for sqlx::postgres::PgRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        postgres::cell_text(self, idx)
+    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
+        postgres::cell(self, idx)
     }
 }
 
 impl CellText for sqlx::mysql::MySqlRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        mysql::cell_text(self, idx)
+    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
+        mysql::cell(self, idx)
     }
 }
 
 impl CellText for sqlx::sqlite::SqliteRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        sqlite::cell_text(self, idx)
+    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
+        sqlite::cell(self, idx)
     }
 }
 
@@ -637,6 +688,7 @@ where
     let mut stream = sqlx::raw_sql(AssertSqlSafe(query.to_string())).fetch_many(executor);
     let mut result = ResultSet::default();
     let mut current: Vec<Vec<Option<String>>> = Vec::new();
+    let mut current_kinds: Vec<Vec<CellKind>> = Vec::new();
     let mut current_cols: Vec<String> = Vec::new();
     let mut truncated = false;
     while let Some(item) = stream.try_next().await? {
@@ -646,6 +698,7 @@ where
                 if !current_cols.is_empty() {
                     result.columns = std::mem::take(&mut current_cols);
                     result.rows = std::mem::take(&mut current);
+                    result.kinds = std::mem::take(&mut current_kinds);
                     result.truncated = std::mem::take(&mut truncated);
                 }
             }
@@ -657,13 +710,16 @@ where
                     truncated = true;
                     continue;
                 }
-                current.push((0..row.len()).map(|i| row.cell_text(i)).collect());
+                let (cells, kinds): (Vec<_>, Vec<_>) = (0..row.len()).map(|i| row.cell(i)).unzip();
+                current.push(cells);
+                current_kinds.push(if kinds.iter().all(|k| *k == CellKind::Text) { Vec::new() } else { kinds });
             }
         }
     }
     if !current_cols.is_empty() {
         result.columns = current_cols;
         result.rows = current;
+        result.kinds = current_kinds;
         result.truncated = truncated;
     }
     result.elapsed = started.elapsed();

@@ -5,19 +5,22 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, ValueRef};
 
 use super::{
-    ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    Transport, hex_bytes, text_col, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
+    TableStructure, Transport, hex_bytes, text_col, truthy,
 };
 
-pub(super) fn cell_text(row: &PgRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+pub(super) fn cell(row: &PgRow, idx: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
-    // Rows come from the simple query protocol, so every value is text.
+    // Rows come from the simple query protocol, so every value is text,
+    // which casts back to the same value (bytea as `\x…`).
     match raw.as_str() {
-        Ok(s) => Some(s.to_string()),
-        Err(_) => Some(hex_bytes(raw.as_bytes().unwrap_or_default())),
+        Ok(s) => (Some(s.to_string()), CellKind::Text),
+        // Not UTF-8 (not expected: the session asks for UTF8): shown as hex,
+        // which it is not.
+        Err(_) => (Some(hex_bytes(raw.as_bytes().unwrap_or_default())), CellKind::Inexact),
     }
 }
 

@@ -18,9 +18,9 @@ use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use self::browser::{Browser, Focus, OpenTable, Tab, TreeItem};
+use self::browser::{Browser, CommitSnapshot, Committing, Focus, OpenTable, Tab, TreeItem};
 use self::form::{ConnectionForm, FormOutcome};
-use self::grid::Grid;
+use self::grid::{Grid, RowKey};
 use self::input::Input;
 use self::query::{EditorFocus, EditorOutcome, VimMode};
 use crate::config::{Config, ConnectionProfile, CredentialStore, KeymapMode, SecretBackend};
@@ -31,8 +31,13 @@ use crate::keymap::{Action, Context, Keymap};
 use crate::secrets::{Endpoint, KEYRING_TIMEOUT, Keyring, StoredSecret, Vault, VaultChanged, VaultExists};
 
 /// Results of background work, delivered to the UI loop.
+///
+/// Each carries what it was requested for: the connection attempt
+/// (`attempt`), or the connection ([`Browser::generation`]) and the request
+/// (`seq`). Results of attempts or requests made since are dropped.
 pub enum AppEvent {
     Connected {
+        attempt: u64,
         profile: ConnectionProfile,
         db: Database,
         session: Box<SessionInfo>,
@@ -41,31 +46,48 @@ pub enum AppEvent {
     },
     /// The password saved in the keyring for a profile being connected.
     SavedPassword {
+        attempt: u64,
         profile: ConnectionProfile,
         result: Result<Option<StoredSecret>, String>,
     },
     ConnectFailed {
+        attempt: u64,
         profile: ConnectionProfile,
         error: String,
         needs_password: bool,
     },
     /// The level is a warning when the server was not authenticated.
     TestResult(Result<(Level, String), String>),
-    Schemas(Result<Vec<SchemaInfo>, String>),
+    Schemas {
+        generation: u64,
+        seq: u64,
+        result: Result<Vec<SchemaInfo>, String>,
+    },
     Page {
+        generation: u64,
         seq: u64,
         structure: Option<Result<TableStructure, String>>,
         data: Result<ResultSet, String>,
     },
     Count {
+        generation: u64,
         seq: u64,
         count: Result<u64, String>,
     },
+    /// `may_write`: the SQL is not plainly read-only.
     Query {
+        generation: u64,
         seq: u64,
+        may_write: bool,
         result: Result<ResultSet, String>,
     },
-    Committed(Result<u64, String>),
+    /// `profile`: the name of the connection, which may be closed by now.
+    Committed {
+        generation: u64,
+        seq: u64,
+        profile: String,
+        result: Result<u64, String>,
+    },
     /// A keyring write finished, possibly long after it was requested.
     KeyringStored(SaveRequest, Result<(), String>),
     /// `report`: tell the user if it failed (the keyring was known to hold
@@ -206,14 +228,56 @@ pub struct VaultPrompt {
     pub working: Option<u64>,
 }
 
+/// The row a cell editor edits.
+pub enum EditTarget {
+    /// A fetched row, by its key: wherever it is when the edit is applied.
+    Row(RowKey),
+    /// A new row staged in the grid ([`Grid::id`]), by position.
+    NewRow { grid: u64, index: usize },
+}
+
+/// Edits one cell. It remembers the cell by connection, table, row key and
+/// column name, not by position: the edit is staged on that cell, wherever
+/// it is by then, or not at all if it is gone.
 pub struct CellEditor {
     pub editor: TextArea<'static>,
-    pub row: usize,
-    pub col: usize,
+    pub generation: u64,
+    pub table: TableRef,
+    pub target: EditTarget,
     pub column: String,
+    /// The value when the editor opened (`None`: NULL or the default).
+    pub original: Option<String>,
+    /// How the lines are joined: CRLF when the value used it throughout,
+    /// so that the value comes back exactly as it was.
+    pub newline: &'static str,
+    /// Whether the text was changed at all.
+    pub modified: bool,
     pub data_type: String,
     pub nullable: bool,
     pub new_row: bool,
+}
+
+impl CellEditor {
+    pub fn value(&self) -> String {
+        self.editor.lines().join(self.newline)
+    }
+
+    /// Whether confirming `value` would change nothing: the same text, or a
+    /// NULL (or default) left untouched.
+    fn unchanged(&self, value: &str) -> bool {
+        match &self.original {
+            Some(original) => original == value,
+            None => !self.modified,
+        }
+    }
+}
+
+/// Splits a value into editor lines that join back into exactly that value
+/// (`str::lines` would drop `\r` and a final newline).
+fn editor_lines(text: &str) -> (Vec<String>, &'static str) {
+    let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+    let newline = if crlf { "\r\n" } else { "\n" };
+    (text.split(newline).map(String::from).collect(), newline)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,10 +301,20 @@ pub enum Popup {
     Password(PasswordPrompt),
     Vault(VaultPrompt),
     CellEditor(Box<CellEditor>),
-    CellView { title: String, text: String, scroll: u16 },
+    // `text` is what is shown (JSON re-indented); `value` is the cell's
+    // value, which is what gets copied (`None`: NULL or the default).
+    CellView { title: String, text: String, value: Option<String>, scroll: u16 },
     Prompt(Prompt),
-    // `non_transactional`: engine of a MySQL table that cannot roll back.
-    Commit { statements: Vec<Statement>, scroll: u16, non_transactional: Option<String> },
+    // `non_transactional`: engine of a MySQL table that cannot roll back;
+    // `snapshot`: what the statements were built from (see `CommitSnapshot`).
+    Commit { statements: Vec<Statement>, scroll: u16, non_transactional: Option<String>, snapshot: Box<CommitSnapshot> },
+}
+
+/// A change a cell editor stages.
+enum CellChange {
+    Set(Option<String>),
+    /// Back to the column default (new rows only).
+    Default,
 }
 
 /// Several statements on a table that cannot roll back are only committed
@@ -264,6 +338,10 @@ pub struct App {
     credentials: CredentialOps,
     /// Last vault prompt request (see [`VaultPrompt::working`]).
     vault_seq: u64,
+    /// Id of the latest connection attempt, and that attempt while it is
+    /// not over: the result of any other one is discarded.
+    connect_seq: u64,
+    connecting: Option<u64>,
     /// Where `config.toml` and `vault.toml` live.
     config_dir: Option<PathBuf>,
     pub busy: Option<String>,
@@ -305,6 +383,8 @@ impl App {
             keyring: Keyring::os(),
             credentials: CredentialOps::default(),
             vault_seq: 0,
+            connect_seq: 0,
+            connecting: None,
             config_dir: crate::config::config_dir().ok(),
             busy: None,
             tick: 0,
@@ -407,7 +487,7 @@ impl App {
             }
             Some(Popup::Prompt(p)) => p.input.insert_str(&text.replace('\n', " ")),
             Some(Popup::CellEditor(c)) => {
-                c.editor.insert_str(text.as_str());
+                c.modified |= c.editor.insert_str(text.as_str());
             }
             Some(_) => {}
             None => {
@@ -758,14 +838,13 @@ impl App {
                     self.run_query();
                 }
             }
-            Action::Select => {
-                // Enter edits when allowed, otherwise shows the value.
-                if self.edit_permission(false).is_ok() {
-                    self.edit_cell();
-                } else {
-                    self.view_cell();
-                }
-            }
+            // Enter edits when allowed, otherwise shows the value; while the
+            // table is busy, it says why it cannot edit yet.
+            Action::Select => match self.edit_permission(false) {
+                Ok(()) if !self.binary_cell() => self.edit_cell(),
+                Err(reason) if self.table_busy().is_some_and(|busy| reason == busy) => self.deny(reason),
+                _ => self.view_cell(),
+            },
             Action::Edit => self.edit_cell(),
             Action::SetNull => self.set_current_cell(None),
             Action::Paste => {
@@ -778,6 +857,9 @@ impl App {
             Action::DeleteRow => self.delete_row(),
             Action::InsertRow => self.insert_row(),
             Action::Undo => {
+                if let Some(reason) = self.table_busy() {
+                    return self.deny(reason.into());
+                }
                 if let Some(grid) = self.active_grid()
                     && !grid.undo()
                 {
@@ -797,17 +879,50 @@ impl App {
     // Permissions
     // ------------------------------------------------------------------
 
+    /// Why the open table cannot be changed right now: its rows are being
+    /// replaced, or its changes committed. Changes staged meanwhile would
+    /// land on whatever rows are there once that is done.
+    fn table_busy(&self) -> Option<&'static str> {
+        let b = self.browser.as_ref()?;
+        if b.commit.is_some() {
+            return Some("A commit is running — wait for its result");
+        }
+        b.table.as_ref().filter(|t| t.loading).map(|_| "The table is loading — wait for it to finish")
+    }
+
+    /// Whether the table cannot be reloaded (or filtered, sorted, paged)
+    /// now; tells the user why.
+    fn reload_blocked(&mut self) -> bool {
+        let Some(b) = &self.browser else { return true };
+        if b.commit.is_some() {
+            self.notify(Level::Warning, "A commit is running — wait for its result");
+            return true;
+        }
+        if b.has_pending_edits() {
+            let hint = match self.config.keymap {
+                KeymapMode::Vim => ":w to commit, :e! to discard",
+                KeymapMode::Standard => "Ctrl-S to commit, Ctrl-Z to undo",
+            };
+            self.notify(Level::Warning, format!("Pending changes — {hint} before reloading"));
+            return true;
+        }
+        false
+    }
+
     /// Checks whether the current cell may be edited. `Err` carries the reason.
     fn edit_permission(&self, set_null: bool) -> Result<(), String> {
         let b = self.browser.as_ref().ok_or("not connected")?;
         let t = b.table.as_ref().ok_or("no table open")?;
+        if let Some(reason) = &b.session.read_only_reason {
+            return Err(format!("Read-only session: {reason}"));
+        }
+        if let Some(reason) = self.table_busy() {
+            return Err(reason.into());
+        }
         if t.grid.is_empty() {
             return Err("no rows".into());
         }
         let row = t.grid.row;
-        if let Some(reason) = &b.session.read_only_reason {
-            return Err(format!("Read-only session: {reason}"));
-        }
         if t.grid.is_inserted(row) {
             return if t.privileges().insert {
                 Ok(())
@@ -825,8 +940,8 @@ impl App {
             return Err("Row is marked for deletion — undo first".into());
         }
         if set_null
-            && let Some(col) =
-                t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == t.grid.columns[t.grid.col]))
+            && let Some(name) = t.grid.columns.get(t.grid.col)
+            && let Some(col) = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == *name))
             && !col.nullable
         {
             return Err(format!("Column {} does not accept NULL", col.name));
@@ -842,24 +957,53 @@ impl App {
     // Grid editing
     // ------------------------------------------------------------------
 
+    /// Whether the current cell holds a stored binary value, shown as
+    /// `0x…`: editing that text would store the text instead.
+    fn binary_cell(&self) -> bool {
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return false };
+        let (row, col) = (t.grid.row, t.grid.col);
+        t.grid.cell(row, col).1 == grid::CellState::Clean && t.grid.kind(row, col).is_binary()
+    }
+
     fn edit_cell(&mut self) {
         if let Err(reason) = self.edit_permission(false) {
             return self.deny(reason);
         }
-        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
+        if self.binary_cell() {
+            return self.deny("This is binary data, shown as hex: edit it with SQL".into());
+        }
+        let Some(b) = self.browser.as_ref() else { return };
+        let Some(t) = b.table.as_ref() else { return };
         let (row, col) = (t.grid.row, t.grid.col);
-        let column = t.grid.columns[col].clone();
+        let Some(column) = t.grid.columns.get(col).cloned() else { return };
+        let new_row = t.grid.is_inserted(row);
+        let target = if new_row {
+            EditTarget::NewRow { grid: t.grid.id, index: row - t.grid.rows.len() }
+        } else {
+            match t.grid.row_key(row, &t.key_columns()) {
+                Some(key) => EditTarget::Row(key),
+                None => {
+                    return self.deny(format!("{} has no primary key, so rows cannot be edited safely", t.info.table));
+                }
+            }
+        };
         let info = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == column));
-        let mut editor = TextArea::from(t.grid.cell_text(row, col).unwrap_or_default().lines());
+        let original = t.grid.cell_text(row, col);
+        let (lines, newline) = editor_lines(original.as_deref().unwrap_or_default());
+        let mut editor = TextArea::new(lines);
         editor.move_cursor(ratatui_textarea::CursorMove::Bottom);
         editor.move_cursor(ratatui_textarea::CursorMove::End);
         self.popup = Some(Popup::CellEditor(Box::new(CellEditor {
             editor,
-            row,
-            col,
+            generation: b.generation,
+            table: t.info.table.clone(),
+            target,
+            original,
+            newline,
+            modified: false,
             data_type: info.map(|c| c.data_type.clone()).unwrap_or_default(),
             nullable: info.is_none_or(|c| c.nullable),
-            new_row: t.grid.is_inserted(row),
+            new_row,
             column,
         })));
     }
@@ -875,6 +1019,9 @@ impl App {
     }
 
     fn delete_row(&mut self) {
+        if let Some(reason) = self.table_busy() {
+            return self.deny(reason.into());
+        }
         let Some(b) = self.browser.as_ref() else { return };
         let Some(t) = b.table.as_ref() else { return };
         if t.grid.is_empty() {
@@ -907,6 +1054,8 @@ impl App {
             Some(format!("Read-only session: {reason}"))
         } else if !t.privileges().insert {
             Some(format!("Read-only: no INSERT permission on {}", t.info.table))
+        } else if let Some(reason) = self.table_busy() {
+            Some(reason.to_string())
         } else if !t.loaded || t.grid.columns.is_empty() {
             Some("Table is still loading".to_string())
         } else {
@@ -930,12 +1079,15 @@ impl App {
         };
         let Some(grid) = grid.filter(|g| !g.is_empty()) else { return };
         let column = grid.columns.get(grid.col).cloned().unwrap_or_default();
-        let text = match grid.cell(grid.row, grid.col).0 {
-            grid::CellValue::Value(v) => v.to_string(),
-            grid::CellValue::Null => "NULL".into(),
-            grid::CellValue::Default => "(default)".into(),
+        let (value, text) = match grid.cell(grid.row, grid.col).0 {
+            grid::CellValue::Value(v) => (Some(v.to_string()), None),
+            grid::CellValue::Null => (None, Some("NULL".to_string())),
+            grid::CellValue::Default => (None, Some("(default)".to_string())),
         };
-        self.popup = Some(Popup::CellView { title: column, text: pretty_value(&text), scroll: 0 });
+        let formatted = value.as_deref().and_then(pretty_value);
+        let title = if formatted.is_some() { format!("{column} · JSON, re-indented") } else { column };
+        let text = formatted.or(text).or_else(|| value.clone()).unwrap_or_default();
+        self.popup = Some(Popup::CellView { title, text, value, scroll: 0 });
     }
 
     fn copy_cell(&mut self) {
@@ -952,10 +1104,10 @@ impl App {
     }
 
     fn change_page(&mut self, delta: isize) {
-        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before changing page");
+        if self.reload_blocked() {
+            return;
         }
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
         if delta > 0 && !t.has_next_page() {
             return self.notify(Level::Info, "Already on the last page");
         }
@@ -968,10 +1120,10 @@ impl App {
     }
 
     fn open_filter_prompt(&mut self) {
-        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before filtering");
+        if self.browser.as_ref().is_none_or(|b| b.table.is_none()) || self.reload_blocked() {
+            return;
         }
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
         let column = t.grid.columns.get(t.grid.col).cloned();
         self.popup = Some(Popup::Prompt(Prompt {
             kind: PromptKind::Filter,
@@ -985,10 +1137,10 @@ impl App {
     }
 
     fn toggle_sort(&mut self) {
-        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before sorting");
+        if self.reload_blocked() {
+            return;
         }
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
         let Some(col) = t.grid.columns.get(t.grid.col).cloned() else { return };
         t.order_by = match &t.order_by {
             Some((c, true)) if *c == col => Some((col, false)),
@@ -1036,17 +1188,27 @@ impl App {
                     scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                 }),
             },
-            Popup::CellView { title, text, scroll } => match key.code {
+            Popup::CellView { title, text, value, scroll } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') | KeyCode::Char('v') => None,
                 KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || key.code == KeyCode::Char('c') => {
-                    crate::clipboard::copy(&text);
-                    self.register = Some(text.clone());
-                    self.notify(Level::Success, "Copied value");
-                    Some(Popup::CellView { title, text, scroll })
+                    // The value itself, as the grid copies it: not the
+                    // re-indented text, and nothing for NULL (which would
+                    // otherwise be pasted back as the text 'NULL').
+                    match &value {
+                        Some(v) => {
+                            crate::clipboard::copy(v);
+                            self.register = Some(v.clone());
+                            self.notify(Level::Success, "Copied value");
+                        }
+                        None if text == "NULL" => self.notify(Level::Info, "Cell is NULL — nothing copied"),
+                        None => self.notify(Level::Info, "Cell uses the column default — nothing copied"),
+                    }
+                    Some(Popup::CellView { title, text, value, scroll })
                 }
                 _ => Some(Popup::CellView {
                     title,
                     text,
+                    value,
                     scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                 }),
             },
@@ -1058,15 +1220,15 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => None,
                 _ => Some(Popup::Confirm { title, message, action }),
             },
-            Popup::Commit { statements, scroll, non_transactional } => {
+            Popup::Commit { statements, scroll, non_transactional, snapshot } => {
                 let force = commit_needs_force(&statements, non_transactional.as_ref());
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !force => {
-                        self.apply_statements(statements, non_transactional);
+                        self.apply_statements(statements, non_transactional, *snapshot);
                         None
                     }
                     KeyCode::Char('!') if force => {
-                        self.apply_statements(statements, non_transactional);
+                        self.apply_statements(statements, non_transactional, *snapshot);
                         None
                     }
                     KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
@@ -1078,6 +1240,7 @@ impl App {
                             statements,
                             scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                             non_transactional,
+                            snapshot,
                         })
                     }
                 }
@@ -1176,30 +1339,25 @@ impl App {
                     KeyCode::Esc => None,
                     KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         c.editor.insert_newline();
+                        c.modified = true;
                         Some(Popup::CellEditor(c))
                     }
                     KeyCode::Enter => {
-                        let value = c.editor.lines().join("\n");
-                        self.apply_cell_edit(c.row, c.col, Some(value));
-                        None
+                        let value = c.value();
+                        // Nothing to stage: not even a rewritten line ending.
+                        if c.unchanged(&value) { None } else { self.stage_from_editor(c, CellChange::Set(Some(value))) }
                     }
                     KeyCode::Char('n') if ctrl => {
                         if c.nullable {
-                            self.apply_cell_edit(c.row, c.col, None);
-                            None
+                            self.stage_from_editor(c, CellChange::Set(None))
                         } else {
                             self.notify(Level::Warning, format!("Column {} does not accept NULL", c.column));
                             Some(Popup::CellEditor(c))
                         }
                     }
-                    KeyCode::Char('d') if ctrl && c.new_row => {
-                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-                            t.grid.set_default(c.row, c.col);
-                        }
-                        None
-                    }
+                    KeyCode::Char('d') if ctrl && c.new_row => self.stage_from_editor(c, CellChange::Default),
                     _ => {
-                        c.editor.input(key);
+                        c.modified |= c.editor.input(key);
                         Some(Popup::CellEditor(c))
                     }
                 }
@@ -1207,11 +1365,56 @@ impl App {
         };
     }
 
-    fn apply_cell_edit(&mut self, row: usize, col: usize, value: Option<String>) {
+    /// Where the cell an editor edits is now, if it is still there: the
+    /// same connection and table, the row with the same key (or the same
+    /// new row), and the column with the same name.
+    fn editor_cell(&self, c: &CellEditor) -> Option<(usize, usize)> {
+        let b = self.browser.as_ref().filter(|b| b.generation == c.generation)?;
+        let t = b.table.as_ref().filter(|t| t.info.table == c.table)?;
+        let col = t.grid.columns.iter().position(|name| *name == c.column)?;
+        let row = match &c.target {
+            EditTarget::Row(key) => t.grid.find_row(key)?,
+            EditTarget::NewRow { grid, index } => {
+                (t.grid.id == *grid && *index < t.grid.edits.inserted.len()).then(|| t.grid.rows.len() + index)?
+            }
+        };
+        Some((row, col))
+    }
+
+    /// Stages what a cell editor asks for on its cell, wherever that is
+    /// now. While the table is busy the editor stays open, to try again.
+    fn stage_from_editor(&mut self, c: Box<CellEditor>, change: CellChange) -> Option<Popup> {
+        if let Some(reason) = self.table_busy() {
+            self.deny(reason.into());
+            return Some(Popup::CellEditor(c));
+        }
+        let Some((row, col)) = self.editor_cell(&c) else {
+            self.notify(Level::Warning, "The row is no longer shown (the table was reloaded): nothing was staged");
+            return None;
+        };
         if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-            t.grid.set_cell(row, col, value);
+            match change {
+                CellChange::Set(value) => t.grid.set_cell(row, col, value),
+                CellChange::Default => t.grid.set_default(row, col),
+            }
             t.grid.row = row;
             t.grid.col = col;
+        }
+        None
+    }
+
+    /// After the open table's rows or staged changes were replaced: closes
+    /// a cell editor whose cell is gone, rather than leaving it to stage
+    /// its value on another one.
+    fn check_cell_editor(&mut self) {
+        if let Some(Popup::CellEditor(c)) = &self.popup
+            && self.editor_cell(c).is_none()
+        {
+            self.popup = None;
+            self.notify(
+                Level::Warning,
+                "The row being edited is no longer shown (the table was reloaded): nothing was staged",
+            );
         }
     }
 
@@ -1225,6 +1428,9 @@ impl App {
             }
             PromptKind::Filter => {
                 let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
+                if self.reload_blocked() {
+                    return;
+                }
                 let value = p.input.value().trim().to_string();
                 if let Err(e) = sql::validate_filter(driver, &value) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
@@ -1250,6 +1456,11 @@ impl App {
             }
             ConfirmAction::Disconnect => self.disconnect(),
             ConfirmAction::Quit => self.should_quit = true,
+            // The changes being committed are not discarded: they are no
+            // longer the user's to discard.
+            ConfirmAction::DiscardAndOpen(_) | ConfirmAction::DiscardEdits if self.commit_running() => {
+                self.notify(Level::Warning, "A commit is running — wait for its result");
+            }
             ConfirmAction::DiscardAndOpen(table) => {
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
                     t.grid.clear_edits();
@@ -1266,9 +1477,23 @@ impl App {
         }
     }
 
+    fn commit_running(&self) -> bool {
+        self.browser.as_ref().is_some_and(|b| b.commit.is_some())
+    }
+
     fn request_quit(&mut self) {
         let pending = self.browser.as_ref().map(|b| b.pending_count()).unwrap_or(0);
-        if pending > 0 {
+        if let Some(b) = self.browser.as_ref().filter(|b| b.commit.is_some()) {
+            self.popup = Some(Popup::Confirm {
+                title: "Quit".into(),
+                message: format!(
+                    "A commit to {} is still running. It may still be applied, and its result will not be shown. \
+                     Quit anyway?",
+                    b.profile.name
+                ),
+                action: ConfirmAction::Quit,
+            });
+        } else if pending > 0 {
             self.popup = Some(Popup::Confirm {
                 title: "Quit".into(),
                 message: format!("You have {pending} uncommitted change(s). Quit and discard them?"),
@@ -1282,7 +1507,9 @@ impl App {
     fn request_disconnect(&mut self) {
         let Some(b) = &self.browser else { return };
         let pending = b.pending_count();
-        let message = if pending > 0 {
+        let message = if b.commit.is_some() {
+            format!("A commit to {} is still running and may still be applied. Disconnect anyway?", b.profile.name)
+        } else if pending > 0 {
             format!("Disconnect from {} and discard {pending} uncommitted change(s)?", b.profile.name)
         } else {
             format!("Disconnect from {}?", b.profile.name)
@@ -1294,7 +1521,19 @@ impl App {
         if let Some(b) = self.browser.take() {
             let db = b.db.clone();
             tokio::spawn(async move { db.close().await });
-            self.notify(Level::Info, format!("Disconnected from {}", b.profile.name));
+            if b.commit.is_some() {
+                // Its result is reported when it comes (see `Committed`).
+                self.busy = None;
+                self.notify(
+                    Level::Warning,
+                    format!(
+                        "Disconnected from {}; its commit is still running and may still be applied",
+                        b.profile.name
+                    ),
+                );
+            } else {
+                self.notify(Level::Info, format!("Disconnected from {}", b.profile.name));
+            }
         }
         self.screen = Screen::Connections;
     }
@@ -1338,6 +1577,9 @@ impl App {
             "run" if connected => self.run_query(),
             "filter" | "where" if connected => {
                 let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
+                if self.reload_blocked() {
+                    return;
+                }
                 if let Err(e) = sql::validate_filter(driver, arg) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
                 }
@@ -1349,6 +1591,9 @@ impl App {
             }
             "nofilter" if connected => self.run_command("filter"),
             "sort" if connected => {
+                if self.reload_blocked() {
+                    return;
+                }
                 let mut parts = arg.split_whitespace();
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
                     t.order_by = parts.next().map(|c| (c.to_string(), !matches!(parts.next(), Some("desc" | "DESC"))));
@@ -1382,7 +1627,16 @@ impl App {
         }
     }
 
+    /// Starts a connection attempt. Whatever an earlier attempt still
+    /// brings back (a connection, an error, a saved password) is discarded.
+    fn begin_connect(&mut self) -> u64 {
+        self.connect_seq += 1;
+        self.connecting = Some(self.connect_seq);
+        self.connect_seq
+    }
+
     fn connect(&mut self, profile: ConnectionProfile) {
+        let attempt = self.begin_connect();
         if !profile.needs_password() {
             return self.spawn_connect(profile, None, None);
         }
@@ -1394,7 +1648,7 @@ impl App {
                 let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
                 tokio::task::spawn_blocking(move || {
                     let result = keyring.get(&profile.id).map_err(err_text);
-                    let _ = tx.send(AppEvent::SavedPassword { profile, result });
+                    let _ = tx.send(AppEvent::SavedPassword { attempt, profile, result });
                 });
             }
             CredentialStore::Vault => match &self.vault {
@@ -1457,21 +1711,27 @@ impl App {
         password: Option<Zeroizing<String>>,
         remember: Option<Remember>,
     ) {
+        let attempt = self.begin_connect();
         self.busy = Some(format!("Connecting to {}", profile.name));
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = async {
                 let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
-                let session = db.session_info(&profile).await?;
-                let schemas = db.schemas().await?;
-                anyhow::Ok((db, session, schemas))
+                let info = async { anyhow::Ok((db.session_info(&profile).await?, db.schemas().await?)) }.await;
+                match info {
+                    Ok((session, schemas)) => anyhow::Ok((db, session, schemas)),
+                    Err(e) => {
+                        db.close().await;
+                        Err(e)
+                    }
+                }
             }
             .await;
             let event = match result {
                 Ok((db, session, schemas)) => {
-                    AppEvent::Connected { profile, db, session: Box::new(session), schemas, remember }
+                    AppEvent::Connected { attempt, profile, db, session: Box::new(session), schemas, remember }
                 }
-                Err(e) => AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: false },
+                Err(e) => AppEvent::ConnectFailed { attempt, profile, error: err_text(e), needs_password: false },
             };
             let _ = tx.send(event);
         });
@@ -1841,6 +2101,9 @@ impl App {
             }
             return;
         }
+        if b.commit.is_some() {
+            return self.notify(Level::Warning, "A commit is running — wait for its result");
+        }
         if b.has_pending_edits() {
             self.popup = Some(Popup::Confirm {
                 title: "Discard changes".into(),
@@ -1866,23 +2129,18 @@ impl App {
         self.request_page();
     }
 
+    /// Reloads the open table (whichever tab is shown), unless that would
+    /// drop staged changes or come before a commit's result.
     fn request_page(&mut self) {
-        let Some(b) = &mut self.browser else { return };
-        if b.tab == Tab::Query {
+        if self.browser.as_ref().is_none_or(|b| b.table.is_none()) || self.reload_blocked() {
             return;
         }
+        let Some(b) = &mut self.browser else { return };
         // The filter is user SQL: same read-only guard as the SQL editor.
         let read_only = b.fully_read_only();
         let Some(t) = &mut b.table else { return };
-        if t.grid.has_pending() {
-            let hint = match self.config.keymap {
-                KeymapMode::Vim => ":w to commit, :e! to discard",
-                KeymapMode::Standard => "Ctrl-S to commit, Ctrl-Z to undo",
-            };
-            return self.notify(Level::Warning, format!("Pending changes — {hint} before reloading"));
-        }
         b.seq += 1;
-        let seq = b.seq;
+        let (generation, seq) = (b.generation, b.seq);
         t.loading = true;
         t.total = None;
         let db = b.db.clone();
@@ -1908,20 +2166,22 @@ impl App {
             req.default_order = columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
             let data = db.fetch_page(&table, &req, read_only).await.map_err(err_text);
             let ok = data.is_ok();
-            let _ = tx.send(AppEvent::Page { seq, structure, data });
+            let _ = tx.send(AppEvent::Page { generation, seq, structure, data });
             if ok {
                 let count = db.count_rows(&table, req.filter.as_deref(), read_only).await.map_err(err_text);
-                let _ = tx.send(AppEvent::Count { seq, count });
+                let _ = tx.send(AppEvent::Count { generation, seq, count });
             }
         });
     }
 
     fn refresh_schemas(&mut self) {
-        let Some(b) = &self.browser else { return };
-        let db = b.db.clone();
+        let Some(b) = &mut self.browser else { return };
+        b.schema_seq += 1;
+        let (generation, seq, db) = (b.generation, b.schema_seq, b.db.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(AppEvent::Schemas(db.schemas().await.map_err(err_text)));
+            let result = db.schemas().await.map_err(err_text);
+            let _ = tx.send(AppEvent::Schemas { generation, seq, result });
         });
     }
 
@@ -1941,17 +2201,21 @@ impl App {
         b.query.seq += 1;
         b.query.running = true;
         b.query.message = Some(("Running…".into(), false));
-        let seq = b.query.seq;
+        let (generation, seq) = (b.generation, b.query.seq);
+        let may_write = sql::write_keyword(b.db.driver(), &sql).is_some();
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = db.run_query(&sql, read_only).await.map_err(err_text);
-            let _ = tx.send(AppEvent::Query { seq, result });
+            let _ = tx.send(AppEvent::Query { generation, seq, may_write, result });
         });
     }
 
     fn begin_commit(&mut self) {
         let Some(b) = &self.browser else { return };
+        if b.commit.is_some() {
+            return self.notify(Level::Warning, "A commit is already running — wait for its result");
+        }
         let Some(t) = &b.table else { return self.notify(Level::Info, "Nothing to commit") };
         if !t.grid.has_pending() {
             return self.notify(Level::Info, "Nothing to commit");
@@ -1959,11 +2223,21 @@ impl App {
         if let Some(reason) = &b.session.read_only_reason {
             return self.deny(format!("Read-only session: {reason}"));
         }
+        if t.loading {
+            return self.notify(Level::Warning, "The table is loading — wait for it to finish");
+        }
         let Some(structure) = &t.structure else { return };
         match t.grid.build_statements(b.db.driver(), &t.info.table, structure) {
             Ok(statements) => {
                 let non_transactional = structure.non_transactional_engine.clone();
-                self.popup = Some(Popup::Commit { statements, scroll: 0, non_transactional })
+                let snapshot = CommitSnapshot {
+                    generation: b.generation,
+                    table: t.info.table.clone(),
+                    grid: t.grid.id,
+                    edits: t.grid.edits.clone(),
+                };
+                self.popup =
+                    Some(Popup::Commit { statements, scroll: 0, non_transactional, snapshot: Box::new(snapshot) })
             }
             Err(e) => {
                 self.popup = Some(Popup::Message { title: "Cannot commit".into(), body: e, error: true, scroll: 0 })
@@ -1971,8 +2245,33 @@ impl App {
         }
     }
 
-    fn apply_statements(&mut self, statements: Vec<Statement>, non_transactional: Option<String>) {
-        let Some(b) = &self.browser else { return };
+    /// Runs the statements of a commit preview, if they still are what the
+    /// preview showed: the same connection, table and staged changes.
+    fn apply_statements(
+        &mut self,
+        statements: Vec<Statement>,
+        non_transactional: Option<String>,
+        snapshot: CommitSnapshot,
+    ) {
+        let Some(b) = &mut self.browser else { return };
+        let current = b.table.as_ref().is_some_and(|t| {
+            t.info.table == snapshot.table && t.grid.id == snapshot.grid && t.grid.edits.same_changes(&snapshot.edits)
+        });
+        let refused = if b.generation != snapshot.generation {
+            Some("the connection is not the one the changes were made on")
+        } else if b.commit.is_some() {
+            Some("another commit is still running")
+        } else if !current {
+            Some("the table or its staged changes are no longer the ones previewed")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            return self.notify(Level::Error, format!("Nothing was committed: {reason}"));
+        }
+        b.commit_seq += 1;
+        let (generation, seq, profile) = (b.generation, b.commit_seq, b.profile.name.clone());
+        b.commit = Some(Committing { seq, snapshot });
         self.busy = Some(format!("Committing {} statement(s)", statements.len()));
         // The database's "rolled back" is not true for these engines.
         let note = non_transactional.filter(|_| statements.len() > 1).map(|engine| {
@@ -1985,7 +2284,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = db.apply(&statements).await.map_err(|e| err_text(e) + note.as_deref().unwrap_or_default());
-            let _ = tx.send(AppEvent::Committed(result));
+            let _ = tx.send(AppEvent::Committed { generation, seq, profile, result });
         });
     }
 
@@ -1995,12 +2294,21 @@ impl App {
 
     pub fn on_app_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Connected { profile, db, session, schemas, remember } => {
+            AppEvent::Connected { attempt, profile, db, session, schemas, remember } => {
+                if self.connecting != Some(attempt) {
+                    // Another connection was asked for since: this one goes.
+                    tokio::spawn(async move { db.close().await });
+                    return;
+                }
+                self.connecting = None;
                 self.busy = None;
                 if let Some(remember) = remember {
                     self.remember_password(&profile, remember);
                 }
-                let browser = Browser::new(profile, db, *session, schemas);
+                if let Some(old) = self.browser.take() {
+                    tokio::spawn(async move { old.db.close().await });
+                }
+                let browser = Browser::new(attempt, profile, db, *session, schemas);
                 let level = browser.access_level();
                 let mut msg = format!("Connected as {} · {}", browser.session.user, level.label());
                 if let Some(reason) = &browser.session.read_only_reason {
@@ -2015,7 +2323,11 @@ impl App {
                 self.browser = Some(browser);
                 self.screen = Screen::Browser;
             }
-            AppEvent::ConnectFailed { profile, error, needs_password } => {
+            AppEvent::ConnectFailed { attempt, profile, error, needs_password } => {
+                if self.connecting != Some(attempt) {
+                    return;
+                }
+                self.connecting = None;
                 self.busy = None;
                 if needs_password {
                     self.ask_password(profile, Some(error));
@@ -2028,8 +2340,10 @@ impl App {
                     });
                 }
             }
-            AppEvent::SavedPassword { profile, result } => {
-                self.connect_with_saved(profile, result.map_err(anyhow::Error::msg), "the OS keyring")
+            AppEvent::SavedPassword { attempt, profile, result } => {
+                if self.connecting == Some(attempt) {
+                    self.connect_with_saved(profile, result.map_err(anyhow::Error::msg), "the OS keyring")
+                }
             }
             AppEvent::KeyringStored(request, result) => self.keyring_stored(request, result),
             AppEvent::KeyringRemoved { op, report, result } => {
@@ -2053,19 +2367,20 @@ impl App {
                     }
                 }
             }
-            AppEvent::Schemas(result) => match result {
-                Ok(schemas) => {
-                    if let Some(b) = &mut self.browser {
-                        b.set_schemas(schemas);
-                    }
-                }
-                Err(e) => self.notify(Level::Error, e),
-            },
-            AppEvent::Page { seq, structure, data } => {
-                let Some(b) = &mut self.browser else { return };
-                if seq != b.seq {
+            AppEvent::Schemas { generation, seq, result } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.schema_seq == seq)
+                else {
                     return;
+                };
+                match result {
+                    Ok(schemas) => b.set_schemas(schemas),
+                    Err(e) => self.notify(Level::Error, e),
                 }
+            }
+            AppEvent::Page { generation, seq, structure, data } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.seq == seq) else {
+                    return;
+                };
                 let Some(t) = &mut b.table else { return };
                 t.loading = false;
                 if let Some(structure) = structure {
@@ -2074,7 +2389,15 @@ impl App {
                         Err(e) => t.error = Some(e),
                     }
                 }
+                // Staged changes are never dropped (reloads wait for them to
+                // be committed or discarded, so this is not expected): they
+                // stay on the rows they were made on.
+                let pending = t.grid.pending_count();
                 match data {
+                    Ok(_) if pending > 0 => self.notify(
+                        Level::Warning,
+                        format!("Not reloaded: {pending} pending change(s) are kept on the rows shown"),
+                    ),
                     Ok(rs) => {
                         let columns = if rs.columns.is_empty() {
                             t.structure
@@ -2085,7 +2408,7 @@ impl App {
                             rs.columns
                         };
                         let (row, col) = (t.grid.row, t.grid.col);
-                        let mut grid = Grid::new(columns, rs.rows);
+                        let mut grid = Grid::new(columns, rs.rows).with_kinds(rs.kinds);
                         grid.row = row.min(grid.total_rows().saturating_sub(1));
                         grid.col = col.min(grid.columns.len().saturating_sub(1));
                         t.grid = grid;
@@ -2094,26 +2417,27 @@ impl App {
                     }
                     Err(e) => {
                         // Don't leave stale rows on screen under a new filter/page.
-                        t.grid.rows.clear();
-                        t.grid.clear_edits();
+                        if pending == 0 {
+                            t.grid.clear_rows();
+                        }
                         t.error = Some(e.clone());
                         self.notify(Level::Error, e);
                     }
                 }
+                self.check_cell_editor();
             }
-            AppEvent::Count { seq, count } => {
+            AppEvent::Count { generation, seq, count } => {
                 if let Some(b) = &mut self.browser
-                    && seq == b.seq
+                    && (b.generation, b.seq) == (generation, seq)
                     && let Some(t) = &mut b.table
                 {
                     t.total = count.ok();
                 }
             }
-            AppEvent::Query { seq, result } => {
-                let Some(b) = &mut self.browser else { return };
-                if seq != b.query.seq {
+            AppEvent::Query { generation, seq, may_write, result } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.query.seq == seq) else {
                     return;
-                }
+                };
                 b.query.running = false;
                 match result {
                     Ok(rs) => {
@@ -2126,41 +2450,80 @@ impl App {
                             format!("✓ {} row(s){more} · {ms:.1} ms", rs.rows.len())
                         };
                         b.query.message = Some((msg, false));
-                        // Statements may have changed the schema or the open table.
-                        let changed = rs.rows_affected > 0 || rs.columns.is_empty();
+                        // Statements may have changed the schema or the open table
+                        // (PostgreSQL also counts the rows a SELECT returns).
+                        let changed = may_write && (rs.rows_affected > 0 || rs.columns.is_empty());
                         b.query.result = (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows));
                         if changed {
                             self.refresh_schemas();
+                            self.reload_after_sql();
                         }
                     }
                     Err(e) => b.query.message = Some((format!("✗ {e}"), true)),
                 }
             }
-            AppEvent::Committed(result) => {
-                self.busy = None;
-                match result {
-                    Ok(n) => {
-                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-                            t.grid.clear_edits();
-                        }
-                        self.notify(Level::Success, format!("Committed — {n} row(s) affected"));
-                        self.request_page();
-                    }
-                    Err(e) => {
-                        self.popup =
-                            Some(Popup::Message { title: "Commit failed".into(), body: e, error: true, scroll: 0 })
-                    }
+            AppEvent::Committed { generation, seq, profile, result } => {
+                self.committed(generation, seq, profile, result)
+            }
+        }
+    }
+
+    /// After SQL that may have written: the open table's rows may be stale,
+    /// and a row's key may now belong to another record.
+    fn reload_after_sql(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let Some(t) = &b.table else { return };
+        if b.commit.is_some() {
+            // Reloaded once the commit is done.
+        } else if t.grid.has_pending() {
+            let message = format!(
+                "The SQL may have changed {}: check the rows of your {} pending change(s) before committing",
+                t.info.table.name,
+                t.grid.pending_count()
+            );
+            self.notify(Level::Warning, message);
+        } else {
+            self.request_page();
+        }
+    }
+
+    fn committed(&mut self, generation: u64, seq: u64, profile: String, result: Result<u64, String>) {
+        let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation) else {
+            // From a connection closed while the commit ran.
+            return match result {
+                Ok(n) => self.notify(Level::Info, format!("The commit to {profile} finished: {n} row(s) affected")),
+                Err(e) => {
+                    self.notify(Level::Error, format!("The commit to {profile} failed: {}", crate::util::one_line(&e)))
                 }
+            };
+        };
+        let Some(commit) = b.commit.take_if(|c| c.seq == seq) else { return };
+        self.busy = None;
+        match result {
+            Ok(n) => {
+                let snapshot = commit.snapshot;
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut())
+                    && t.info.table == snapshot.table
+                    && t.grid.id == snapshot.grid
+                {
+                    t.grid.remove_committed(&snapshot.edits);
+                }
+                self.check_cell_editor();
+                self.notify(Level::Success, format!("Committed — {n} row(s) affected"));
+                self.request_page();
+            }
+            Err(e) => {
+                self.popup = Some(Popup::Message { title: "Commit failed".into(), body: e, error: true, scroll: 0 })
             }
         }
     }
 }
 
-/// Pretty-prints JSON values for the cell viewer.
-fn pretty_value(text: &str) -> String {
+/// JSON values re-indented for the cell viewer; `None` for anything else.
+fn pretty_value(text: &str) -> Option<String> {
     let t = text.trim();
     if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
-        return crate::util::pretty_json(t).unwrap_or_else(|| text.to_string());
+        return crate::util::pretty_json(t);
     }
-    text.to_string()
+    None
 }

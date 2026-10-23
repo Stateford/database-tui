@@ -5,25 +5,37 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::{
-    ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    Transport, hex_bytes, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
+    TableStructure, Transport, hex_bytes, truthy,
 };
 
 pub(super) fn cell_text(row: &SqliteRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+    cell(row, idx).0
+}
+
+/// A value's text, and its storage class: a column without type affinity
+/// can hold integer 1, real 1.5, text '1' and a blob side by side.
+pub(super) fn cell(row: &SqliteRow, idx: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
+    // The value's storage class, not the column's declared type.
     let ty = raw.type_info().name().to_string();
-    match ty.as_str() {
-        "INTEGER" | "BOOLEAN" => row.try_get_unchecked::<i64, _>(idx).ok().map(|v| v.to_string()),
-        // Debug keeps the decimal point (`3.0`, not `3`).
-        "REAL" => row.try_get_unchecked::<f64, _>(idx).ok().map(|v| format!("{v:?}")),
-        "BLOB" => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| hex_bytes(&b)),
+    let decoded = match ty.as_str() {
+        "INTEGER" | "BOOLEAN" => row.try_get_unchecked::<i64, _>(idx).ok().map(|v| (v.to_string(), CellKind::Integer)),
+        // Debug keeps the decimal point (`3.0`, not `3`) and reads back exactly.
+        "REAL" => row.try_get_unchecked::<f64, _>(idx).ok().map(|v| (format!("{v:?}"), CellKind::Real)),
+        "BLOB" => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| (hex_bytes(&b), CellKind::Bytes)),
         _ => match row.try_get_unchecked::<String, _>(idx) {
-            Ok(s) => Some(s),
-            Err(_) => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| hex_bytes(&b)),
+            Ok(s) => Some((s, CellKind::Text)),
+            // Text that is not UTF-8: shown as hex, which it is not.
+            Err(_) => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| (hex_bytes(&b), CellKind::Inexact)),
         },
+    };
+    match decoded {
+        Some((text, kind)) => (Some(text), kind),
+        None => (None, CellKind::Inexact),
     }
 }
 

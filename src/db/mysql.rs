@@ -2,26 +2,30 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use sqlx::mysql::{MySqlPool, MySqlRow};
-use sqlx::{Row, ValueRef};
+use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::grants::Grants;
 use super::{
-    ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
-    TableStructure, Transport, hex_bytes, run_raw_on, text_col, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind,
+    TableRef, TableStructure, Transport, hex_bytes, run_raw_on, text_col, truthy,
 };
 
 const SYSTEM_SCHEMAS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
 
-pub(super) fn cell_text(row: &MySqlRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+pub(super) fn cell(row: &MySqlRow, idx: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
+    // A BIT value arrives as its bytes, and compares as a number: no text
+    // or bytes given back to the server would surely match it alone.
+    let bit = raw.type_info().name() == "BIT";
     // Text protocol: numbers, dates, etc. all arrive as strings.
-    let bytes = row.try_get_unchecked::<Vec<u8>, _>(idx).ok()?;
+    let Ok(bytes) = row.try_get_unchecked::<Vec<u8>, _>(idx) else { return (None, CellKind::Inexact) };
     match String::from_utf8(bytes) {
-        Ok(s) => Some(s),
-        Err(e) => Some(hex_bytes(e.as_bytes())),
+        Ok(s) => (Some(s), if bit { CellKind::Inexact } else { CellKind::Text }),
+        // Only binary strings are not UTF-8 (sqlx asks for utf8mb4).
+        Err(e) => (Some(hex_bytes(e.as_bytes())), if bit { CellKind::Inexact } else { CellKind::Bytes }),
     }
 }
 
