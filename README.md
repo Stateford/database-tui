@@ -237,7 +237,7 @@ A password you choose to save goes to the OS keyring or, when there is none (or 
   (8+ characters, never stored) with Argon2id, 64 MiB of memory and 3 passes. Vaults made by
   earlier versions (19 MiB, 2 passes) are re-encrypted with these settings when unlocked, and a
   vault file asking for more than 1 GiB, 10 passes or 8 lanes is refused. Creating a vault never
-  replaces an existing one, for example one another dbtui instance has just created, and
+  replaces an existing one, such as a vault that another dbtui instance has just created, and
   pressing `Esc` while it is being created leaves no vault behind.
 - **In memory**: password fields and decrypted passwords are wiped once used, including the key
   derivation's working memory, and core dumps are disabled on Unix. The database driver keeps

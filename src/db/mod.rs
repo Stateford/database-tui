@@ -543,15 +543,27 @@ impl Database {
         self.run_query_limited(query, QUERY_ROW_LIMIT, read_only).await
     }
 
-    /// With `read_only`, the database itself refuses writes: the SQL runs in
-    /// a read-only transaction started just for it and always rolled back
-    /// (PostgreSQL, MySQL), or with `PRAGMA query_only` (SQLite). This does
-    /// not depend on session defaults that the SQL could change; it relies on
-    /// `sql::write_keyword` refusing text that ends the transaction.
+    /// With `read_only`, writes are refused here by `sql::write_keyword`, as
+    /// the app already does, and then by the database itself
+    /// ([`run_read_only`](Self::run_read_only)).
     async fn run_query_limited(&self, query: &str, limit: usize, read_only: bool) -> Result<ResultSet> {
         if !read_only {
             return self.run_raw(query, limit).await;
         }
+        // The transaction cannot stop text that ends it, so don't rely on
+        // every caller having checked.
+        if let Some(keyword) = sql::write_keyword(self.driver(), query) {
+            bail!("refused {keyword}: read-only session");
+        }
+        self.run_read_only(query, limit).await
+    }
+
+    /// The SQL runs in a read-only transaction started just for it and
+    /// always rolled back (PostgreSQL, MySQL), or with `PRAGMA query_only`
+    /// (SQLite). This does not depend on session defaults that the SQL could
+    /// change; it relies on `sql::write_keyword` refusing text that ends the
+    /// transaction.
+    async fn run_read_only(&self, query: &str, limit: usize) -> Result<ResultSet> {
         match self {
             Database::Postgres(p) => {
                 run_guarded(p.acquire().await?, "START TRANSACTION READ ONLY", "ROLLBACK", query, limit).await

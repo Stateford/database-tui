@@ -84,12 +84,17 @@ async fn read_only_page_loads_cannot_write() {
     let payload = r"name='\'); DELETE FROM people; --";
     assert!(sql::validate_filter(Driver::Sqlite, payload).is_err());
 
-    // Even a filter that got past validation cannot write.
+    // Even a filter that got past validation cannot write: the database layer
+    // checks the statement again...
     let injected = "1=1); DELETE FROM people; --";
     let req = PageRequest { filter: Some(injected.into()), limit: 10, ..Default::default() };
     let err = db.fetch_page(&table, &req, true).await.unwrap_err().to_string();
+    assert!(err.contains("refused DELETE: read-only session"), "{err}");
+    let err = db.count_rows(&table, Some(injected), true).await.unwrap_err().to_string();
+    assert!(err.contains("refused DELETE: read-only session"), "{err}");
+    // ...and the database refuses it too.
+    let err = db.run_read_only(&sql::select_page(Driver::Sqlite, &table, &req), 10).await.unwrap_err().to_string();
     assert!(err.contains("readonly"), "{err}");
-    assert!(db.count_rows(&table, Some(injected), true).await.is_err());
     assert_eq!(db.count_rows(&table, None, false).await.unwrap(), 3);
 
     // The guard is lifted afterwards: the pooled connections still write.
@@ -137,8 +142,12 @@ async fn read_only_sessions_are_enforced_by_the_database() {
 #[tokio::test]
 async fn read_only_query_mode_rolls_back_writes() {
     let (_dir, _profile, db) = setup(false).await;
-    // `read_only = true` runs inside a query_only / read-only transaction.
-    assert!(db.run_query("UPDATE people SET name = 'x'", true).await.is_err());
+    // `read_only = true` refuses writes, and runs the rest inside a
+    // query_only / read-only transaction that refuses them as well.
+    let err = db.run_query("UPDATE people SET name = 'x'", true).await.unwrap_err().to_string();
+    assert!(err.contains("refused UPDATE: read-only session"), "{err}");
+    let err = db.run_read_only("UPDATE people SET name = 'x'", QUERY_ROW_LIMIT).await.unwrap_err().to_string();
+    assert!(err.contains("readonly"), "{err}");
     let rs = db.run_query("SELECT count(*) FROM people WHERE name = 'x'", false).await.unwrap();
     assert_eq!(rs.rows[0][0].as_deref(), Some("0"));
 }
