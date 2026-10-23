@@ -18,7 +18,7 @@ use crate::app::browser::{Focus, Tab};
 use crate::app::query::{EditorFocus, VimMode};
 use crate::app::{App, Level, Screen};
 use crate::config::KeymapMode;
-use crate::db::{AccessLevel, Privileges};
+use crate::db::{AccessLevel, Privileges, TransportTrust};
 use crate::keymap::{self, Context};
 use theme::*;
 
@@ -207,6 +207,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         let icon = if level == AccessLevel::ReadOnly { "🔒" } else { "●" };
         left.push(Span::styled(format!(" {icon} {} ", level.label()), pill(color)));
         left.push(Span::styled(format!(" {} ", b.session.user), Style::default().fg(FG)));
+        if let Some((label, trust)) = b.session.transport.summary(&b.profile) {
+            left.push(match trust {
+                TransportTrust::Local => Span::styled(format!("{label} "), dim()),
+                TransportTrust::Verified => Span::styled(format!("✓ {label} "), Style::default().fg(GREEN)),
+                TransportTrust::Unverified => Span::styled(format!(" ⚠ {label} "), pill(YELLOW)),
+                TransportTrust::Exposed => Span::styled(format!(" ⚠ {label} "), pill(RED)),
+            });
+            left.push(Span::raw(" "));
+        }
         if let Some(t) = &b.table {
             left.push(Span::styled("│ ", Style::default().fg(BORDER)));
             left.push(Span::styled(format!("{} ", t.info.table.name), Style::default().fg(CYAN)));
@@ -241,8 +250,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(busy) = &app.busy {
         right.insert(0, Span::styled(format!("{} {busy}… ", spinner(app)), Style::default().fg(CYAN)));
     }
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
-    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+    // The right part yields to the left one (access level, transport).
+    let left = Line::from(left);
+    let left_width = (left.width() as u16).min(area.width);
+    frame.render_widget(Paragraph::new(left), area);
+    let right_area = Rect { x: area.x + left_width, width: area.width - left_width, ..area };
+    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), right_area);
 }
 
 /// Rounded panel with a title that lights up when focused.

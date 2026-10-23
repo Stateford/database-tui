@@ -267,19 +267,20 @@ fn draw_labeled_input(frame: &mut Frame, area: Rect, label: &str, input: &Input,
 
 fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: SecretBackend) {
     let fields = form.fields();
-    let height = fields.len() as u16 * 2 + 7;
+    // One spacer row under each field, unless the terminal is too short.
+    let step = if area.height >= fields.len() as u16 * 2 + 9 { 2 } else { 1 };
+    let height = fields.len() as u16 * step as u16 + 7;
     let r = centered(area, 76, height);
     let title = if form.is_new { "New connection" } else { "Edit connection" };
     let inner = modal(frame, r, title, MAGENTA).inner(Margin { horizontal: 2, vertical: 1 });
-    let mut constraints: Vec<Constraint> =
-        fields.iter().flat_map(|_| [Constraint::Length(1), Constraint::Length(1)]).collect();
+    let mut constraints: Vec<Constraint> = fields.iter().flat_map(|_| vec![Constraint::Length(1); step]).collect();
     constraints.push(Constraint::Min(1));
     constraints.push(Constraint::Length(1));
     let rows = Layout::vertical(constraints).split(inner);
     let focused = form.focused();
 
     for (i, field) in fields.iter().enumerate() {
-        let area = rows[i * 2];
+        let area = rows[i * step];
         let is_focused = *field == focused;
         let [label_area, value_area] = Layout::horizontal([Constraint::Length(17), Constraint::Min(10)]).areas(area);
         let label_style = if is_focused { Style::default().fg(CYAN).add_modifier(Modifier::BOLD) } else { dim() };
@@ -345,6 +346,7 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
                         Field::Path => " path to the .db / .sqlite file",
                         Field::Database => " optional",
                         Field::Port => " default",
+                        Field::SslCa => " optional: PEM file of a private CA",
                         _ => "",
                     };
                     frame.render_widget(
@@ -357,13 +359,23 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
             }
         }
     }
-    let msg_area = rows[fields.len() * 2];
-    if let Some(e) = &form.error {
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!("✖ {e}"), Style::default().fg(RED))).wrap(Wrap { trim: true }),
-            msg_area,
-        );
+    // Why the SSL mode does not protect the password: under the field, or
+    // above the error when there is no room.
+    let mut messages = Vec::new();
+    if let (Some(i), Some(warning)) = (fields.iter().position(|f| *f == Field::Ssl), form.tls_warning()) {
+        let warning = Line::styled(format!("⚠ {warning}"), Style::default().fg(YELLOW));
+        if step == 2 {
+            let [_, value_area] =
+                Layout::horizontal([Constraint::Length(17), Constraint::Min(10)]).areas(rows[i * 2 + 1]);
+            frame.render_widget(Paragraph::new(warning), value_area);
+        } else {
+            messages.push(warning);
+        }
     }
+    if let Some(e) = &form.error {
+        messages.push(Line::styled(format!("✖ {e}"), Style::default().fg(RED)));
+    }
+    frame.render_widget(Paragraph::new(messages).wrap(Wrap { trim: true }), rows[fields.len() * step]);
     frame.render_widget(
         footer(&[
             ("Tab/↑↓", "move"),
@@ -372,6 +384,6 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
             ("Ctrl-S", "save"),
             ("Esc", "cancel"),
         ]),
-        rows[fields.len() * 2 + 1],
+        rows[fields.len() * step + 1],
     );
 }

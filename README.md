@@ -31,6 +31,9 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
   with a master password.
 - **Permission-aware**: the status bar always shows your access level and your privileges on the
   open table. Read-only users can browse and query, but cannot even start an edit. See below.
+- **Verified connections**: new profiles for remote servers check the server's certificate and
+  host name (`verify-full`). The status bar shows the TLS version actually negotiated, and dbtui
+  warns whenever a remote server is not authenticated. See [Connection security](#connection-security).
 
 ## Permissions
 
@@ -80,6 +83,54 @@ transaction: advisory locks (`pg_advisory_lock`, MySQL `GET_LOCK`), functions th
 another connection (`dblink`) or outside the database (untrusted procedural languages), and
 anything else a server-side function may do. Those are governed by the account's privileges.
 For a hard guarantee, connect with an account that can only read.
+
+## Connection security
+
+The SSL mode of a profile uses the libpq names. With dbtui's driver (sqlx), only `verify-full`
+proves that you are talking to the right server:
+
+| Mode          | Encrypted            | Server authenticated                                        |
+|---------------|----------------------|-------------------------------------------------------------|
+| `disable`     | no                   | no                                                          |
+| `prefer`      | if the server agrees | no: any certificate is accepted, and TLS can be refused     |
+| `require`     | yes                  | no: any certificate is accepted                             |
+| `verify-ca`   | yes                  | partly: the certificate chain is checked, not the host name |
+| `verify-full` | yes                  | yes: a trusted certificate for the host name you typed      |
+
+Without authentication, anyone who can intercept or redirect the connection (shared Wi-Fi, a
+spoofed DNS name, a compromised router) can pose as the server and receive the password,
+including one saved in the keyring or vault. So:
+
+- **Defaults**: a new profile uses `verify-full`, or `prefer` when the host is `localhost`, a
+  loopback address or a Unix socket directory. A profile written without `ssl_mode` gets the
+  same default. Saved modes are kept as they are.
+- **Warnings**: the connection form, the connection list, the connect message and the status
+  bar warn when a remote profile uses `disable`, `prefer`, `require` or `verify-ca`.
+- **What was negotiated**: the status bar shows the transport the server reports (`pg_stat_ssl`
+  on PostgreSQL, `Ssl_version` / `Ssl_cipher` on MySQL): `✓ TLSv1.3 verified`,
+  `⚠ TLSv1.3 unverified`, `⚠ NOT ENCRYPTED`, or a plain `no TLS` / `socket` for local
+  connections. `Ctrl-T` in the form reports it too.
+- **Private CAs**: certificates are checked against the Mozilla root set built into the driver,
+  not the operating system's store. For a server with a private CA (company CA, AWS RDS, Cloud
+  SQL, MySQL's self-generated certificates), set **CA file** (`ssl_ca`) to a PEM file. It is
+  trusted in addition to the public roots.
+- **`verify-ca`** needs a CA file, as in libpq; a profile saved with `verify-ca` and no CA file
+  no longer connects. Even then, the public roots stay trusted and the host name is not
+  checked, so any publicly trusted certificate passes: prefer `verify-full`. A CA file with
+  `disable`, `prefer` or `require` is refused, because those modes ignore it.
+- **MySQL cleartext passwords**: sqlx 0.9 sends the password in clear text when the server's
+  first packet asks for the `mysql_clear_password` plugin (an upstream bug: its own
+  cleartext-plugin setting is not applied there). With `disable` or `prefer`, an attacker on the
+  network can therefore read the password. `verify-full` refuses a server that does not
+  complete TLS with a valid certificate, so the password only ever goes to the real server.
+- **No implicit settings**: connection settings come from the profile only. sqlx would read
+  PostgreSQL defaults from `PG*` environment variables (`PGPASSWORD`, `PGSSLCERT` / `PGSSLKEY`,
+  `PGSSLROOTCERT`, `PGOPTIONS`, `PGUSER`…), so dbtui removes every `PG*` variable at start-up,
+  and it does not read `~/.pgpass`. Client certificates are not supported.
+- **SQLite files from elsewhere** are opened with `PRAGMA trusted_schema = OFF` (SQL stored in
+  the file, such as views and triggers, may only use functions and virtual tables that SQLite
+  marks as safe) and `PRAGMA cell_size_check = ON`. A path starting with `file:` is a file
+  name, never an SQLite URI, and extensions cannot be loaded.
 
 ## Screenshots
 
@@ -151,7 +202,9 @@ host = "localhost"
 port = 5432
 user = "app"
 database = "app"
-ssl_mode = "prefer"       # disable, prefer, require, verify-ca, verify-full
+ssl_mode = "prefer"       # disable, prefer, require, verify-ca, verify-full; if left out:
+                          # verify-full, or prefer for localhost and sockets
+# ssl_ca = "~/certs/db-ca.pem"   # optional: PEM file of a private CA
 read_only = false
 credential = "keyring"    # where the password is stored: none, keyring or vault
 ```

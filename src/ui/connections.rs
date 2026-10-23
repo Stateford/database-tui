@@ -114,9 +114,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(row("User", p.user.clone()));
         lines.push(row("Database", if p.database.is_empty() { "(default)".into() } else { p.database.clone() }));
         lines.push(row("SSL", p.ssl_mode.label().to_string()));
+        if !p.ssl_ca.is_empty() {
+            lines.push(row("CA file", p.ssl_ca.clone()));
+        }
         lines.push(row("Password", p.credential.label().to_string()));
     }
     lines.push(row("Access", if p.read_only { "forced read-only".into() } else { "from database privileges".into() }));
+    if let Some(warning) = p.tls_warning() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(format!("⚠ {}: {warning}", p.ssl_mode.label()), Style::default().fg(YELLOW)));
+    }
     lines.push(Line::from(""));
     if app.busy.is_some() {
         lines.push(Line::styled(

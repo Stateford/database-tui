@@ -11,7 +11,10 @@ pub mod sql;
 mod sqlite;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transport_tests;
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -214,6 +217,72 @@ pub struct SessionInfo {
     pub superuser: bool,
     /// Set when nothing can be written in this session, with the reason why.
     pub read_only_reason: Option<String>,
+    /// How the session reaches the server, as the server reports it.
+    pub transport: Transport,
+}
+
+/// Transport of a session, as reported by the server (`pg_stat_ssl`, MySQL
+/// `Ssl_version` / `Ssl_cipher`): with `prefer`, nothing else tells whether
+/// TLS was actually negotiated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Transport {
+    /// The server did not say.
+    #[default]
+    Unknown,
+    /// SQLite: a local file.
+    File,
+    /// Unix-domain socket.
+    Socket,
+    /// TCP without encryption.
+    Plain,
+    /// TLS; either part may be empty when the server leaves it out.
+    Tls { version: String, cipher: String },
+}
+
+/// How much a session's transport can be trusted, for the status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportTrust {
+    /// Stays on this machine.
+    Local,
+    /// TLS with the server's certificate and host name verified.
+    Verified,
+    /// Encrypted, but the server was not authenticated.
+    Unverified,
+    /// Not encrypted, over a network.
+    Exposed,
+}
+
+impl Transport {
+    /// Summary of `self` for a session opened with `profile`: a short label
+    /// and how far it can be trusted. `None` for SQLite files.
+    pub fn summary(&self, profile: &ConnectionProfile) -> Option<(String, TransportTrust)> {
+        let tls = |version: &str| {
+            let version = if version.is_empty() { "TLS" } else { version };
+            match profile.ssl_mode {
+                SslMode::VerifyFull => (format!("{version} verified"), TransportTrust::Verified),
+                SslMode::VerifyCa => (format!("{version} host unchecked"), TransportTrust::Unverified),
+                _ => (format!("{version} unverified"), TransportTrust::Unverified),
+            }
+        };
+        let plain = || ("NOT ENCRYPTED".to_string(), TransportTrust::Exposed);
+        let (label, trust) = match self {
+            Transport::File => return None,
+            Transport::Socket => ("socket".to_string(), TransportTrust::Local),
+            Transport::Plain => plain(),
+            Transport::Tls { version, .. } => tls(version),
+            // sqlx refuses plain TCP from `require` on; `disable` never tries TLS.
+            Transport::Unknown => match profile.ssl_mode {
+                SslMode::Disable => plain(),
+                SslMode::Prefer => ("TLS unknown".to_string(), TransportTrust::Unverified),
+                _ => tls(""),
+            },
+        };
+        if profile.is_local() && trust != TransportTrust::Verified {
+            let label = if trust == TransportTrust::Exposed { "no TLS".to_string() } else { label };
+            return Some((label, TransportTrust::Local));
+        }
+        Some((label, trust))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -243,8 +312,19 @@ impl Database {
         }
     }
 
+    /// Connects with the profile's settings only. `password` is always sent
+    /// as given (empty when `None`). sqlx also reads PostgreSQL defaults from
+    /// `PG*` environment variables, which `main` removes at start-up (see
+    /// [`clear_client_environment`]).
     pub async fn connect(profile: &ConnectionProfile, password: Option<&str>) -> Result<Database> {
         let timeout = Duration::from_secs(10);
+        let ssl_ca = match profile.driver {
+            Driver::Sqlite => None,
+            _ => {
+                profile.check_tls().map_err(anyhow::Error::msg)?;
+                non_empty(&profile.ssl_ca).map(ca_file).transpose()?
+            }
+        };
         match profile.driver {
             Driver::Postgres => {
                 let mut opts = PgConnectOptions::new_without_pgpass()
@@ -257,12 +337,14 @@ impl Database {
                         SslMode::Require => PgSslMode::Require,
                         SslMode::VerifyCa => PgSslMode::VerifyCa,
                         SslMode::VerifyFull => PgSslMode::VerifyFull,
-                    });
+                    })
+                    // Even when empty, so that PGPASSWORD is never sent.
+                    .password(password.unwrap_or_default());
+                if let Some(ca) = &ssl_ca {
+                    opts = opts.ssl_root_cert(ca);
+                }
                 if let Some(user) = non_empty(&profile.user) {
                     opts = opts.username(user);
-                }
-                if let Some(pw) = password {
-                    opts = opts.password(pw);
                 }
                 if let Some(db) = non_empty(&profile.database) {
                     opts = opts.database(db);
@@ -290,6 +372,9 @@ impl Database {
                         SslMode::VerifyCa => MySqlSslMode::VerifyCa,
                         SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
                     });
+                if let Some(ca) = &ssl_ca {
+                    opts = opts.ssl_ca(ca);
+                }
                 if let Some(user) = non_empty(&profile.user) {
                     opts = opts.username(user);
                 }
@@ -317,17 +402,23 @@ impl Database {
                 Ok(Database::MySql(pool))
             }
             Driver::Sqlite => {
-                let path = PathBuf::from(expand_tilde(profile.path.trim()));
                 if profile.path.trim().is_empty() {
                     bail!("no database file configured");
                 }
+                let path = sqlite_file(&profile.path)?;
                 if !path.exists() {
                     bail!("database file {} does not exist", path.display());
                 }
                 let opts = SqliteConnectOptions::new()
                     .filename(&path)
                     .read_only(profile.read_only || !sqlite::file_is_writable(&path))
-                    .busy_timeout(Duration::from_secs(5));
+                    .busy_timeout(Duration::from_secs(5))
+                    // The file may come from anywhere. SQL stored in its schema
+                    // (views, triggers, defaults…) may then only call functions
+                    // SQLite marks as harmless, and corrupt pages are detected
+                    // before use.
+                    .pragma("trusted_schema", "OFF")
+                    .pragma("cell_size_check", "ON");
                 let pool = SqlitePoolOptions::new()
                     .max_connections(2)
                     .acquire_timeout(timeout)
@@ -630,6 +721,47 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// The database file of a SQLite profile, made absolute. SQLite reads a
+/// name starting with `file:` as a URI whose parameters (`nolock`,
+/// `immutable`, `vfs`…) change how the file is opened; an absolute path
+/// never starts with it, so the name always means a file.
+fn sqlite_file(path: &str) -> Result<PathBuf> {
+    let path = expand_tilde(path.trim());
+    std::path::absolute(&path).with_context(|| format!("invalid database file {path:?}"))
+}
+
+/// The CA certificate file of a profile, which must exist.
+fn ca_file(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(expand_tilde(path));
+    if !path.is_file() {
+        bail!("CA certificate file {} not found", path.display());
+    }
+    Ok(path)
+}
+
+/// Removes the environment variables that sqlx reads as PostgreSQL
+/// connection defaults (every name starting with `PG`): `PGPASSWORD`,
+/// a client certificate and key (`PGSSLCERT`/`PGSSLKEY`), extra CA roots
+/// (`PGSSLROOTCERT`), `PGOPTIONS`, `PGUSER`… Variables exported for psql
+/// would otherwise be used for whatever server a profile names, and sqlx
+/// offers no way to unset some of them per connection.
+///
+/// # Safety
+///
+/// No other thread may exist yet (see [`std::env::remove_var`]).
+pub unsafe fn clear_client_environment() {
+    let names: Vec<_> = std::env::vars_os().map(|(name, _)| name).filter(|n| is_client_variable(n)).collect();
+    for name in names {
+        // SAFETY: the caller guarantees the process is single-threaded.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+/// Environment variable names are case-insensitive on Windows.
+fn is_client_variable(name: &OsStr) -> bool {
+    name.as_encoded_bytes().get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"PG"))
 }
 
 fn non_empty(s: &str) -> Option<&str> {

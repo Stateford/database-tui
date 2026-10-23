@@ -7,7 +7,7 @@ use sqlx::{Row, ValueRef};
 use super::grants::Grants;
 use super::{
     ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
-    TableStructure, hex_bytes, run_raw_on, text_col, truthy,
+    TableStructure, Transport, hex_bytes, run_raw_on, text_col, truthy,
 };
 
 const SYSTEM_SCHEMAS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
@@ -79,7 +79,32 @@ pub(super) async fn session_info(pool: &MySqlPool) -> Result<SessionInfo> {
         database: get(2),
         superuser,
         read_only_reason,
+        transport: transport(pool).await,
     })
+}
+
+/// TLS state of a pooled connection (they all use the same options).
+async fn transport(pool: &MySqlPool) -> Transport {
+    match run_raw_on(pool, "SHOW SESSION STATUS WHERE Variable_name IN ('Ssl_version', 'Ssl_cipher')", 10).await {
+        Ok(rs) => transport_from(&rs.rows),
+        Err(_) => Transport::Unknown,
+    }
+}
+
+/// From `Variable_name, Value` rows; both values are empty without TLS.
+fn transport_from(rows: &[Vec<Option<String>>]) -> Transport {
+    let get = |name: &str| {
+        rows.iter()
+            .find(|r| r.first().cloned().flatten().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            .and_then(|r| r.get(1).cloned().flatten())
+            .unwrap_or_default()
+    };
+    let (version, cipher) = (get("Ssl_version"), get("Ssl_cipher"));
+    match (rows.is_empty(), version.is_empty() && cipher.is_empty()) {
+        (true, _) => Transport::Unknown,
+        (false, true) => Transport::Plain,
+        (false, false) => Transport::Tls { version, cipher },
+    }
 }
 
 pub(super) async fn schemas(pool: &MySqlPool) -> Result<Vec<SchemaInfo>> {
@@ -198,7 +223,19 @@ fn non_transactional(engine: Option<String>, transactions: Option<&str>) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::non_transactional;
+    use super::{Transport, non_transactional, transport_from};
+
+    #[test]
+    fn transport_from_session_status() {
+        let row = |n: &str, v: &str| vec![Some(n.to_string()), Some(v.to_string())];
+        let tls = [row("Ssl_cipher", "TLS_AES_128_GCM_SHA256"), row("Ssl_version", "TLSv1.3")];
+        assert_eq!(
+            transport_from(&tls),
+            Transport::Tls { version: "TLSv1.3".into(), cipher: "TLS_AES_128_GCM_SHA256".into() }
+        );
+        assert_eq!(transport_from(&[row("Ssl_cipher", ""), row("Ssl_version", "")]), Transport::Plain);
+        assert_eq!(transport_from(&[]), Transport::Unknown);
+    }
 
     #[test]
     fn engines_without_transactions() {

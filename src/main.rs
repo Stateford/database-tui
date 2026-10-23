@@ -39,7 +39,8 @@ OPTIONS:
 
 Configuration lives in the platform config directory (override with
 DBTUI_CONFIG_DIR). Passwords are kept in the OS keyring or an encrypted vault,
-never in the config file.";
+never in the config file. Connection settings come from the profile only:
+PG* environment variables (PGPASSWORD, PGSSLCERT, PGOPTIONS...) are ignored.";
 
 struct Args {
     keymap: Option<KeymapMode>,
@@ -69,8 +70,15 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(args))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Changing the environment is only sound while no other thread can read
+    // it, so this happens before the async runtime starts its threads.
+    // SAFETY: nothing has spawned a thread yet.
+    unsafe { db::clear_client_environment() };
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let Some(args) = parse_args()? else { return Ok(()) };
     let mut config = Config::load().context("loading configuration")?;
     if let Some(mode) = args.keymap {

@@ -9,7 +9,8 @@ use ratatui::backend::TestBackend;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use super::*;
-use crate::config::Config;
+use crate::config::{Config, SslMode};
+use crate::db::Transport;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -237,4 +238,122 @@ async fn non_transactional_tables_need_explicit_confirmation() {
     wait_for(&mut app, &mut rx, |a| a.busy.is_none() && !table(a).loading && !table(a).grid.has_pending()).await;
     let rs = db.run_query("SELECT name FROM people ORDER BY id", false).await.unwrap();
     assert_eq!(rs.rows, vec![vec![None]]);
+}
+
+fn form(app: &App) -> &ConnectionForm {
+    match &app.popup {
+        Some(Popup::Form(f)) => f,
+        _ => panic!("expected the connection form"),
+    }
+}
+
+/// Moves the form's focus to `field`.
+fn focus(app: &mut App, field: form::Field) {
+    while form(app).focused() != field {
+        app.on_key(key(KeyCode::Tab));
+    }
+}
+
+/// Audit M1/M2: a new profile for a remote host verifies the server unless
+/// the user picks another mode, which the form then warns about; verify-ca
+/// needs a CA file. Nothing here saves the configuration.
+#[tokio::test]
+async fn new_remote_profiles_verify_the_server() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    app.on_key(key(KeyCode::Char('n')));
+    assert_eq!(form(&app).ssl, SslMode::Prefer, "localhost");
+    focus(&mut app, form::Field::Host);
+    for _ in 0.."localhost".len() {
+        app.on_key(key(KeyCode::Backspace));
+    }
+    type_str(&mut app, "db.example.com");
+    assert_eq!(form(&app).ssl, SslMode::VerifyFull);
+    let screen = render(&mut app, 120, 40);
+    assert!(screen.contains("verify-full") && screen.contains("CA file") && !screen.contains('⚠'), "{screen}");
+
+    // Choosing a weaker mode by hand sticks, and is flagged.
+    focus(&mut app, form::Field::Ssl);
+    for _ in 0..3 {
+        app.on_key(key(KeyCode::Left));
+    }
+    assert_eq!(form(&app).ssl, SslMode::Prefer);
+    assert!(render(&mut app, 120, 40).contains("⚠ server not verified, TLS optional: use verify-full"));
+    focus(&mut app, form::Field::Host);
+    type_str(&mut app, "x");
+    assert_eq!(form(&app).ssl, SslMode::Prefer);
+
+    // verify-ca only with a CA file: Ctrl-S keeps the form open.
+    focus(&mut app, form::Field::Name);
+    type_str(&mut app, "prod");
+    focus(&mut app, form::Field::Ssl);
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Right));
+    assert_eq!(form(&app).ssl, SslMode::VerifyCa);
+    app.on_key(ctrl('s'));
+    assert!(form(&app).error.as_ref().unwrap().contains("verify-ca needs a CA file"));
+    assert!(render(&mut app, 120, 40).contains("verify-ca needs a CA file"));
+    assert!(app.config.connections.is_empty());
+    focus(&mut app, form::Field::SslCa);
+    type_str(&mut app, "/etc/ssl/db-ca.pem");
+    let p = form(&app).to_profile().unwrap();
+    assert_eq!(
+        (p.host.as_str(), p.ssl_mode, p.ssl_ca.as_str()),
+        ("db.example.comx", SslMode::VerifyCa, "/etc/ssl/db-ca.pem")
+    );
+    assert!(render(&mut app, 120, 40).contains("⚠ server host name not checked"));
+}
+
+/// A saved profile keeps its explicit mode, and the connection list and
+/// form warn when it does not authenticate a remote server.
+#[tokio::test]
+async fn saved_profiles_keep_their_mode_with_a_warning() {
+    let mut p = ConnectionProfile::new(Driver::Postgres);
+    p.name = "legacy".into();
+    p.host = "db.example.com".into();
+    p.ssl_mode = SslMode::Require;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config { connections: vec![p], ..Config::default() }, tx);
+    let screen = render(&mut app, 120, 40);
+    assert!(screen.contains("⚠ require: server not verified"), "{screen}");
+
+    app.on_key(key(KeyCode::Char('e')));
+    focus(&mut app, form::Field::Host);
+    type_str(&mut app, ".internal");
+    assert_eq!(form(&app).ssl, SslMode::Require);
+    assert!(render(&mut app, 120, 40).contains("⚠ server not verified: use verify-full"));
+    focus(&mut app, form::Field::Ssl);
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Right));
+    assert_eq!(form(&app).ssl, SslMode::VerifyFull);
+    assert!(!render(&mut app, 120, 40).contains('⚠'));
+}
+
+/// The status bar shows the transport the server reports, and flags a
+/// remote session whose server was not authenticated.
+#[tokio::test]
+async fn status_bar_shows_transport_security() {
+    let (_dir, mut app, _rx) = open_people(KeymapMode::Standard, false).await;
+    assert_eq!(app.browser.as_ref().unwrap().session.transport, Transport::File);
+    let screen = render(&mut app, 120, 30);
+    assert!(!screen.contains("TLS") && !screen.contains("ENCRYPTED"), "{screen}");
+
+    // The same session presented as a remote PostgreSQL one.
+    let b = app.browser.as_mut().unwrap();
+    b.profile.driver = Driver::Postgres;
+    b.profile.host = "db.example.com".into();
+    let tls = Transport::Tls { version: "TLSv1.3".into(), cipher: String::new() };
+    let cases = [
+        (SslMode::Prefer, Transport::Plain, "⚠ NOT ENCRYPTED"),
+        (SslMode::Require, tls.clone(), "⚠ TLSv1.3 unverified"),
+        (SslMode::VerifyFull, tls, "✓ TLSv1.3 verified"),
+    ];
+    for (mode, transport, expected) in cases {
+        let b = app.browser.as_mut().unwrap();
+        b.profile.ssl_mode = mode;
+        b.session.transport = transport;
+        let screen = render(&mut app, 120, 30);
+        let status = screen.lines().last().unwrap();
+        assert!(status.contains(expected), "{status}");
+    }
 }

@@ -153,3 +153,39 @@ async fn query_results_and_affected_rows() {
     assert_eq!(rs.columns, vec!["b", "c"]);
     assert_eq!(rs.rows, vec![vec![Some("x".into()), None]]);
 }
+
+/// Audit (SQLite hardening): a file may come from anywhere. SQL stored in
+/// its schema may only use what SQLite marks as harmless (here a view over
+/// the `dbstat` virtual table), on every connection and in both open modes.
+#[tokio::test]
+async fn sqlite_files_are_opened_defensively() {
+    let (_dir, profile, db) = setup(false).await;
+    db.run_query("CREATE VIEW pages AS SELECT name FROM dbstat", false).await.unwrap();
+    db.close().await;
+    for read_only in [false, true] {
+        let p = ConnectionProfile { read_only, ..profile.clone() };
+        let db = Database::connect(&p, None).await.unwrap();
+        assert_eq!(db.session_info(&p).await.unwrap().transport, Transport::File);
+        for _ in 0..3 {
+            let pragma = |rs: ResultSet| rs.rows[0][0].clone();
+            assert_eq!(pragma(db.run_query("PRAGMA trusted_schema", false).await.unwrap()).as_deref(), Some("0"));
+            assert_eq!(pragma(db.run_query("PRAGMA cell_size_check", false).await.unwrap()).as_deref(), Some("1"));
+            // Typed by the user it runs; stored in the file it does not.
+            assert!(db.run_query("SELECT count(*) FROM dbstat", false).await.is_ok());
+            let err = db.run_query("SELECT * FROM pages", false).await.unwrap_err().to_string();
+            assert!(err.contains("unsafe use of virtual table"), "{err}");
+        }
+        db.close().await;
+    }
+}
+
+/// SQLite reads a file name starting with `file:` as a URI whose
+/// parameters change how it is opened; profile paths are made absolute.
+#[test]
+fn sqlite_file_names_are_never_uris() {
+    for name in ["file:data.db?nolock=1", "file:///tmp/x.db?immutable=1", " data.db "] {
+        let path = sqlite_file(name).unwrap();
+        assert!(path.is_absolute() && path.ends_with(name.trim()), "{name}: {}", path.display());
+        assert!(!path.to_string_lossy().starts_with("file:"), "{name}");
+    }
+}

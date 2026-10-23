@@ -32,7 +32,7 @@ pub enum AppEvent {
     Connected {
         profile: ConnectionProfile,
         db: Database,
-        session: SessionInfo,
+        session: Box<SessionInfo>,
         schemas: Vec<SchemaInfo>,
         remember: Option<Zeroizing<String>>,
     },
@@ -41,7 +41,8 @@ pub enum AppEvent {
         error: String,
         needs_password: bool,
     },
-    TestResult(Result<String, String>),
+    /// The level is a warning when the server was not authenticated.
+    TestResult(Result<(Level, String), String>),
     Schemas(Result<Vec<SchemaInfo>, String>),
     Page {
         seq: u64,
@@ -1318,7 +1319,9 @@ impl App {
             }
             .await;
             let event = match result {
-                Ok((db, session, schemas)) => AppEvent::Connected { profile, db, session, schemas, remember },
+                Ok((db, session, schemas)) => {
+                    AppEvent::Connected { profile, db, session: Box::new(session), schemas, remember }
+                }
                 Err(e) => AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: false },
             };
             let _ = tx.send(event);
@@ -1350,7 +1353,18 @@ impl App {
                 let info = db.session_info(&profile).await;
                 db.close().await;
                 let info = info?;
-                anyhow::Ok(format!("Connected to {} as {}", info.server_version, info.user))
+                let mut msg = format!("Connected to {} as {}", info.server_version, info.user);
+                if let Some((transport, _)) = info.transport.summary(&profile) {
+                    msg.push_str(&format!(" · {transport}"));
+                }
+                let level = match profile.tls_warning() {
+                    Some(warning) => {
+                        msg.push_str(&format!(" · ⚠ {}: {warning}", profile.ssl_mode.label()));
+                        Level::Warning
+                    }
+                    None => Level::Success,
+                };
+                anyhow::Ok((level, msg))
             }
             .await;
             let _ = tx.send(AppEvent::TestResult(result.map_err(err_text)));
@@ -1695,13 +1709,18 @@ impl App {
                 if let Some(pw) = remember {
                     self.store_password(&profile.id, &pw);
                 }
-                let browser = Browser::new(profile, db, session, schemas);
+                let browser = Browser::new(profile, db, *session, schemas);
                 let level = browser.access_level();
                 let mut msg = format!("Connected as {} · {}", browser.session.user, level.label());
                 if let Some(reason) = &browser.session.read_only_reason {
                     msg.push_str(&format!(" ({reason})"));
                 }
-                self.notify(Level::Success, msg);
+                let mut level = Level::Success;
+                if let Some(warning) = browser.profile.tls_warning() {
+                    msg.push_str(&format!(" · ⚠ {}: {warning}", browser.profile.ssl_mode.label()));
+                    level = Level::Warning;
+                }
+                self.notify(level, msg);
                 self.browser = Some(browser);
                 self.screen = Screen::Browser;
             }
@@ -1727,7 +1746,7 @@ impl App {
             AppEvent::TestResult(result) => {
                 self.busy = None;
                 match result {
-                    Ok(msg) => self.notify(Level::Success, msg),
+                    Ok((level, msg)) => self.notify(level, msg),
                     Err(e) => {
                         if let Some(Popup::Form(form)) = &mut self.popup {
                             form.error = Some(e.clone());

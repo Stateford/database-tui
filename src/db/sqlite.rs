@@ -6,7 +6,7 @@ use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::{
     ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    hex_bytes, truthy,
+    Transport, hex_bytes, truthy,
 };
 
 pub(super) fn cell_text(row: &SqliteRow, idx: usize) -> Option<String> {
@@ -51,6 +51,7 @@ pub(super) async fn session_info(pool: &SqlitePool, path: &Path) -> Result<Sessi
         // SQLite has no users: whoever can write the file can do anything.
         superuser: false,
         read_only_reason,
+        transport: Transport::File,
     })
 }
 

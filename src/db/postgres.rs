@@ -6,7 +6,7 @@ use sqlx::{Row, ValueRef};
 
 use super::{
     ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    hex_bytes, text_col, truthy,
+    Transport, hex_bytes, text_col, truthy,
 };
 
 pub(super) fn cell_text(row: &PgRow, idx: usize) -> Option<String> {
@@ -49,7 +49,38 @@ pub(super) async fn session_info(pool: &PgPool) -> Result<SessionInfo> {
         database: text_col(&row, 2).unwrap_or_default(),
         superuser: truthy(text_col(&row, 5).as_deref()),
         read_only_reason,
+        transport: transport(pool).await,
     })
+}
+
+/// TLS state of a pooled connection (they all use the same options).
+/// Servers without `pg_stat_ssl` (PostgreSQL-compatible ones) give `Unknown`.
+async fn transport(pool: &PgPool) -> Transport {
+    let row = sqlx::query(
+        "SELECT s.ssl::text, s.version::text, s.cipher::text, (inet_server_addr() IS NULL)::text
+         FROM pg_catalog.pg_stat_ssl s WHERE s.pid = pg_catalog.pg_backend_pid()",
+    )
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some(row)) => transport_from(
+            truthy(text_col(&row, 0).as_deref()),
+            text_col(&row, 1),
+            text_col(&row, 2),
+            truthy(text_col(&row, 3).as_deref()),
+        ),
+        _ => Transport::Unknown,
+    }
+}
+
+/// `socket`: the server has no address for the session, which happens only
+/// on a Unix socket.
+fn transport_from(ssl: bool, version: Option<String>, cipher: Option<String>, socket: bool) -> Transport {
+    match (ssl, socket) {
+        (true, _) => Transport::Tls { version: version.unwrap_or_default(), cipher: cipher.unwrap_or_default() },
+        (false, true) => Transport::Socket,
+        (false, false) => Transport::Plain,
+    }
 }
 
 const SYSTEM_SCHEMA_FILTER: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -175,4 +206,17 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
         })
         .collect();
     Ok(TableStructure { columns, indexes, non_transactional_engine: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_from_pg_stat_ssl() {
+        let tls = transport_from(true, Some("TLSv1.3".into()), Some("TLS_AES_256_GCM_SHA384".into()), false);
+        assert_eq!(tls, Transport::Tls { version: "TLSv1.3".into(), cipher: "TLS_AES_256_GCM_SHA384".into() });
+        assert_eq!(transport_from(false, None, None, false), Transport::Plain);
+        assert_eq!(transport_from(false, None, None, true), Transport::Socket);
+    }
 }
