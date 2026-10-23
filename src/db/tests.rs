@@ -249,3 +249,44 @@ async fn keys_match_the_row_they_were_read_from() {
     let err = grid.build_statements(Driver::Sqlite, &table, &structure).unwrap_err();
     assert!(err.contains("cannot be matched exactly"), "{err}");
 }
+
+/// Audit L7: values are cut when they are loaded, and marked as such: one at
+/// a time, and more so past a budget for the whole page. The rest of each
+/// row is kept, and a cut value is never used to find a row.
+#[tokio::test]
+async fn large_values_are_cut_when_loaded() {
+    let (_dir, _profile, db) = setup(false).await;
+    // A view makes values of any size, stored nowhere.
+    db.run_query(
+        "CREATE VIEW fat AS SELECT id, replace(hex(zeroblob(800000)), '0', 'é') AS body, zeroblob(300000) AS data, name
+         FROM people",
+        false,
+    )
+    .await
+    .unwrap();
+    let fat = TableRef::new("main", "fat");
+    let rs = db.fetch_page(&fat, &PageRequest { limit: 10, ..Default::default() }, false).await.unwrap();
+    assert_eq!(rs.rows.len(), 3);
+    let (row, kinds) = (&rs.rows[0], &rs.kinds[0]);
+    let body = row[1].as_deref().unwrap();
+    assert_eq!((body.len(), kinds[1]), (CELL_BYTES, CellKind::Truncated(3_200_000)));
+    assert!(body.chars().all(|c| c == 'é'));
+    let data = row[2].as_deref().unwrap();
+    assert_eq!((data.len(), kinds[2]), (CELL_BYTES, CellKind::Truncated(600_002)));
+    assert!(data.starts_with("0x0000"));
+    assert_eq!((row[3].as_deref(), kinds[0], kinds[3]), (Some("Ann"), CellKind::Integer, CellKind::Text));
+    assert_eq!(Value::from_cell(body, kinds[1]), None);
+
+    // Past the budget of the result, values keep only what fills a column.
+    let Database::Sqlite(pool, _) = &db else { unreachable!() };
+    let limits = Limits { rows: 10, cell: 1000, result: 2000 };
+    let rs = run_raw_with(pool, "SELECT body, name FROM fat ORDER BY id", limits).await.unwrap();
+    let lens: Vec<(usize, Option<&str>)> =
+        rs.rows.iter().map(|r| (r[0].as_ref().unwrap().len(), r[1].as_deref())).collect();
+    assert_eq!(lens, vec![(1000, Some("Ann")), (1000, Some("Bob")), (CELL_BYTES_PAST_BUDGET, Some("Cy"))]);
+    assert!(rs.kinds.iter().all(|k| k[0] == CellKind::Truncated(3_200_000)));
+    // Small values are left as they are.
+    let people = TableRef::new("main", "people");
+    let rs = db.fetch_page(&people, &PageRequest { limit: 10, ..Default::default() }, false).await.unwrap();
+    assert!(rs.kinds.iter().flatten().all(|k| k.truncated().is_none()));
+}

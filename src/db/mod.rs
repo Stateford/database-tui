@@ -33,6 +33,19 @@ pub use sql::{Statement, Value};
 /// Maximum number of rows kept from an ad-hoc query.
 pub const QUERY_ROW_LIMIT: usize = 2_000;
 
+/// Most bytes of a value's text kept when rows are loaded: a larger value
+/// is cut, and its cell marked as such ([`CellKind::Truncated`]). A view
+/// can produce values of any size at no cost to whoever created it.
+pub const CELL_BYTES: usize = 256 * 1024;
+
+/// Most bytes of values kept for one page or query result. Past it, each
+/// value is cut to [`CELL_BYTES_PAST_BUDGET`], which still fills a column
+/// of the grid.
+pub const RESULT_BYTES: usize = 32 * 1024 * 1024;
+
+/// See [`RESULT_BYTES`].
+pub const CELL_BYTES_PAST_BUDGET: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Driver {
@@ -190,6 +203,7 @@ pub struct ResultSet {
     /// plain text (see [`CellKind`]).
     pub kinds: Vec<Vec<CellKind>>,
     pub rows_affected: u64,
+    /// Rows were left out (past the row limit).
     pub truncated: bool,
     pub elapsed: Duration,
 }
@@ -213,12 +227,24 @@ pub enum CellKind {
     /// Text that does not give the value back exactly (text that is not
     /// UTF-8, a MySQL BIT value…): never used to find a row.
     Inexact,
+    /// Only the start of a value too large to keep (see [`CELL_BYTES`]):
+    /// the size of its whole text, in bytes. Never used to find a row, and
+    /// never edited, as that would store the start alone.
+    Truncated(u64),
 }
 
 impl CellKind {
     /// Binary data, shown as `0x…`: editing that text would store the text.
     pub fn is_binary(self) -> bool {
         matches!(self, CellKind::Bytes | CellKind::Inexact)
+    }
+
+    /// The size of the whole value's text, when only its start was kept.
+    pub fn truncated(self) -> Option<u64> {
+        match self {
+            CellKind::Truncated(len) => Some(len),
+            _ => None,
+        }
     }
 }
 
@@ -652,32 +678,80 @@ where
 }
 
 /// Decodes a single value to display text, and what that text stands for.
-/// Implemented per driver because the wire formats differ.
+/// Implemented per driver because the wire formats differ. Text longer than
+/// `max` bytes is cut (see [`CELL_BYTES`]).
 trait CellText: Row {
-    fn cell(&self, idx: usize) -> (Option<String>, CellKind);
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind);
 }
 
 impl CellText for sqlx::postgres::PgRow {
-    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
-        postgres::cell(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        postgres::cell(self, idx, max)
     }
 }
 
 impl CellText for sqlx::mysql::MySqlRow {
-    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
-        mysql::cell(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        mysql::cell(self, idx, max)
     }
 }
 
 impl CellText for sqlx::sqlite::SqliteRow {
-    fn cell(&self, idx: usize) -> (Option<String>, CellKind) {
-        sqlite::cell(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        sqlite::cell(self, idx, max)
+    }
+}
+
+/// A value's text, or its start when longer than `max` bytes.
+fn capped_text(text: &str, kind: CellKind, max: usize) -> (Option<String>, CellKind) {
+    match crate::util::clip(text, max) {
+        (all, false) => (Some(all.to_string()), kind),
+        (start, true) => (Some(start.to_string()), CellKind::Truncated(text.len() as u64)),
+    }
+}
+
+/// Bytes shown as `0x` and hex, or the start of that when longer than
+/// `max` bytes.
+fn capped_hex(bytes: &[u8], kind: CellKind, max: usize) -> (Option<String>, CellKind) {
+    let len = 2 + 2 * bytes.len();
+    if len <= max {
+        return (Some(hex_bytes(bytes)), kind);
+    }
+    let keep = max.saturating_sub(2) / 2;
+    (Some(hex_bytes(&bytes[..keep])), CellKind::Truncated(len as u64))
+}
+
+/// How much of a result is kept: rows, and bytes of value text.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    rows: usize,
+    /// Per value (see [`CELL_BYTES`]).
+    cell: usize,
+    /// For all values of the result (see [`RESULT_BYTES`]).
+    result: usize,
+}
+
+impl Limits {
+    fn rows(rows: usize) -> Limits {
+        Limits { rows, cell: CELL_BYTES, result: RESULT_BYTES }
     }
 }
 
 /// Run SQL through the simple/text protocol so that every column type can be
 /// rendered as text without knowing it up front.
 async fn run_raw_on<'e, E, DB>(executor: E, query: &str, limit: usize) -> Result<ResultSet>
+where
+    E: Executor<'e, Database = DB>,
+    DB: sqlx::Database,
+    DB::Row: CellText,
+    DB::QueryResult: QueryResultExt,
+{
+    run_raw_with(executor, query, Limits::rows(limit)).await
+}
+
+/// [`run_raw_on`], keeping no more than `limits`. The driver still reads
+/// each row whole; only what is kept of it is bounded.
+async fn run_raw_with<'e, E, DB>(executor: E, query: &str, limits: Limits) -> Result<ResultSet>
 where
     E: Executor<'e, Database = DB>,
     DB: sqlx::Database,
@@ -691,6 +765,8 @@ where
     let mut current_kinds: Vec<Vec<CellKind>> = Vec::new();
     let mut current_cols: Vec<String> = Vec::new();
     let mut truncated = false;
+    // Bytes of value text kept for the current result.
+    let mut kept = 0;
     while let Some(item) = stream.try_next().await? {
         match item {
             Either::Left(done) => {
@@ -700,17 +776,26 @@ where
                     result.rows = std::mem::take(&mut current);
                     result.kinds = std::mem::take(&mut current_kinds);
                     result.truncated = std::mem::take(&mut truncated);
+                    kept = 0;
                 }
             }
             Either::Right(row) => {
                 if current_cols.is_empty() {
                     current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                if current.len() >= limit {
+                if current.len() >= limits.rows {
                     truncated = true;
                     continue;
                 }
-                let (cells, kinds): (Vec<_>, Vec<_>) = (0..row.len()).map(|i| row.cell(i)).unzip();
+                let mut cells = Vec::with_capacity(row.len());
+                let mut kinds = Vec::with_capacity(row.len());
+                for i in 0..row.len() {
+                    let max = if kept < limits.result { limits.cell } else { limits.cell.min(CELL_BYTES_PAST_BUDGET) };
+                    let (text, kind) = row.cell(i, max);
+                    kept += text.as_ref().map_or(0, String::len);
+                    cells.push(text);
+                    kinds.push(kind);
+                }
                 current.push(cells);
                 current_kinds.push(if kinds.iter().all(|k| *k == CellKind::Text) { Vec::new() } else { kinds });
             }

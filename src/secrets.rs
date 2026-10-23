@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -271,7 +270,7 @@ impl Keyring {
 /// Runs a keyring call, turning a panic in the platform backend into an
 /// error so that its caller always hears back.
 fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(anyhow!("the OS keyring failed")))
+    crate::terminal::catch_panic_blocking(f).unwrap_or_else(|panic| Err(anyhow!("the OS keyring failed: {panic}")))
 }
 
 // ---------------------------------------------------------------------------

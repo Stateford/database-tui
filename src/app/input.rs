@@ -1,7 +1,7 @@
 //! Single-line text input used by forms, prompts and the command line.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Inputs may hold passwords, so they are wiped when dropped or replaced,
 /// leave no copies behind when they grow, and are not printed by `Debug`.
@@ -70,11 +70,18 @@ impl Input {
         self.cursor += 1;
     }
 
+    /// Inserts `s` at the cursor, without its control characters, in one
+    /// go: a character at a time takes time quadratic in its length, which
+    /// freezes the UI for a large paste.
     pub fn insert_str(&mut self, s: &str) {
-        self.reserve(s.len());
-        for c in s.chars().filter(|c| !c.is_control()) {
-            self.insert(c);
-        }
+        // Sized up front: a `String` that grows leaves copies of a pasted
+        // password behind.
+        let mut text = Zeroizing::new(String::with_capacity(s.len()));
+        text.extend(s.chars().filter(|c| !c.is_control()));
+        self.reserve(text.len());
+        let idx = self.byte_index(self.cursor);
+        self.value.insert_str(idx, &text);
+        self.cursor += text.chars().count();
     }
 
     /// Returns true when the key was consumed.
@@ -172,5 +179,13 @@ mod tests {
         i.insert_str(" world");
         i.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(i.value(), ">hélo ");
+        i.handle_key(key(KeyCode::Home));
+        i.handle_key(key(KeyCode::Right));
+        i.insert_str("a\x1bb\nç");
+        assert_eq!((i.value(), i.cursor()), (">abçhélo ", 4));
+        // A large paste goes in at once.
+        let large = "x".repeat(1 << 20);
+        i.insert_str(&large);
+        assert_eq!((i.value().len(), i.cursor()), ((1 << 20) + 11, (1 << 20) + 4));
     }
 }

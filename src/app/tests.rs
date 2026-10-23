@@ -1192,3 +1192,214 @@ async fn sql_writes_reload_the_open_table() {
     assert!(toast(&app).contains("The SQL may have changed people"), "{}", toast(&app));
     assert_eq!(table(&app).grid.pending_count(), 1);
 }
+
+/// What the terminal is sent for one frame (see [`render`] for the text).
+fn terminal_bytes(app: &mut App, w: u16, h: u16) -> String {
+    use ratatui::backend::{Backend, CrosstermBackend};
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut bytes = Vec::new();
+    let mut out = CrosstermBackend::new(&mut bytes);
+    let cells = buf.content().iter().enumerate().map(|(i, c)| ((i as u16) % w, (i as u16) / w, c));
+    out.draw(cells).unwrap();
+    Backend::flush(&mut out).unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Audit L5: names and values from the database are drawn with their
+/// hidden characters made visible, and names holding them are flagged.
+/// Nothing in them reaches the terminal as a control or bidi character.
+#[tokio::test]
+async fn hidden_characters_are_shown_and_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let evil = "a\x1b]0;pwned\x07\u{9b}2J\u{202E}gnp.exe";
+    let setup = format!(
+        "CREATE TABLE \"{evil}\" (id INTEGER PRIMARY KEY, \"c\x1b[2J\u{202E}x\" TEXT DEFAULT 'd\x1b]52;c;ZXZpbA==\x07');
+         INSERT INTO \"{evil}\" VALUES (1, 'v\x1b]52;c;ZXZpbA==\x07\u{202E}abc');
+         CREATE TABLE accounts (id INTEGER PRIMARY KEY);
+         CREATE TABLE \"accounts\u{200B}\" (id INTEGER PRIMARY KEY);
+         CREATE TABLE \"accounts\x01\" (id INTEGER PRIMARY KEY);"
+    );
+    let profile = sqlite_db(dir.path(), "t.db", &setup).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile).await;
+    assert_eq!(table(&app).info.table.name, evil);
+
+    let screen = render(&mut app, 160, 30);
+    for shown in
+        ["│   ▦ accounts ", "│   ▦ ⚠ accounts⟨U+200B⟩", "│   ▦ ⚠ accounts␁", "⚠ a␛]0;pwned␇⟨U+009B⟩2J⟨U+202E⟩gnp.exe"]
+    {
+        assert!(screen.contains(shown), "{shown} in\n{screen}");
+    }
+    assert!(screen.contains("v␛]52;c;ZXZpbA==␇⟨U+202E⟩abc"), "{screen}");
+
+    // Every screen that shows them: data, structure, the viewer, the commit
+    // preview (values and names).
+    let mut sent = terminal_bytes(&mut app, 160, 30);
+    app.on_key(key(KeyCode::Char('2')));
+    let structure = render(&mut app, 160, 30);
+    assert!(structure.contains("⚠ c␛[2J⟨U+202E⟩x") && structure.contains("'d␛]52;c;ZXZpbA==␇'"), "{structure}");
+    sent.push_str(&terminal_bytes(&mut app, 160, 30));
+    app.on_key(key(KeyCode::Char('1')));
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::F(3)));
+    sent.push_str(&terminal_bytes(&mut app, 160, 30));
+    app.on_key(key(KeyCode::Esc));
+    app.register = Some("new\u{202E}\x1b]0;x\x07".into());
+    app.on_key(ctrl('v'));
+    app.on_key(ctrl('s'));
+    let preview = render(&mut app, 160, 30);
+    assert!(preview.contains("hold characters that would not show"), "{preview}");
+    assert!(preview.contains("SET \"c␛[2J⟨U+202E⟩x\" = ?") && preview.contains("'new⟨U+202E⟩␛]0;x␇'"), "{preview}");
+    sent.push_str(&terminal_bytes(&mut app, 160, 30));
+    for (bad, what) in [("\x1b]", "OSC"), ("\x07", "BEL"), ("\u{9b}", "C1 CSI"), ("\u{202E}", "RLO"), ("\x01", "SOH")] {
+        assert!(!sent.contains(bad), "{what} reached the terminal");
+    }
+}
+
+/// Audit L4: what goes on the system clipboard cannot act as keystrokes
+/// when pasted (`ESC [201~` would end a bracketed paste); pasting into a
+/// cell in dbtui keeps the value exactly.
+#[tokio::test]
+async fn copied_values_cannot_type_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, w TEXT);
+         INSERT INTO t VALUES (1, 'x' || char(27) || '[201~; DROP TABLE t; --' || char(27) || '[15~', 'line' || char(10) || 'two');",
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile).await;
+    let value = "x\x1b[201~; DROP TABLE t; --\x1b[15~";
+    app.on_key(key(KeyCode::Right));
+    app.on_key(ctrl('c'));
+    assert_eq!(crate::clipboard::sent().as_deref(), Some("x␛[201~; DROP TABLE t; --␛[15~"));
+    assert_eq!(app.register.as_deref(), Some(value));
+    assert!(toast(&app).contains("2 control character(s) are shown as symbols"), "{}", toast(&app));
+    assert_eq!(app.toast.as_ref().unwrap().level, Level::Warning);
+    // The viewer copies the same way.
+    app.on_key(key(KeyCode::F(3)));
+    app.on_key(key(KeyCode::Char('y')));
+    assert_eq!(crate::clipboard::sent().as_deref(), Some("x␛[201~; DROP TABLE t; --␛[15~"));
+    app.on_key(key(KeyCode::Esc));
+    // Line breaks are text, not keys to escape.
+    app.on_key(key(KeyCode::Right));
+    app.on_key(ctrl('c'));
+    assert_eq!(crate::clipboard::sent().as_deref(), Some("line\ntwo"));
+    assert_eq!((toast(&app), app.toast.as_ref().unwrap().level), ("Copied “line\ntwo”", Level::Success));
+    app.on_key(key(KeyCode::Left));
+    app.register = Some(value.into());
+    app.on_key(ctrl('v'));
+    assert_eq!(table(&app).grid.pending_count(), 0, "pasting the value back changes nothing");
+}
+
+/// Audit L7: a value too large to keep is loaded cut, which the grid, the
+/// viewer and a copy say; it is never edited or pasted as if whole, nor
+/// used as a key. The viewer wraps it once, not on every frame.
+#[tokio::test]
+async fn large_values_are_cut_and_never_edited() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = "replace(hex(zeroblob(300000)), '0', 'x')"; // 600,000 bytes
+    let profile = sqlite_db(
+        dir.path(),
+        "t.db",
+        &format!(
+            "CREATE TABLE a_docs (id INTEGER PRIMARY KEY, body TEXT, note TEXT);
+             INSERT INTO a_docs VALUES (1, {big}, 'n');
+             CREATE TABLE b_keys (body TEXT PRIMARY KEY, note TEXT);
+             INSERT INTO b_keys VALUES ({big}, 'n');"
+        ),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config::default(), tx);
+    connect_and_open(&mut app, &mut rx, profile.clone()).await;
+    let screen = render(&mut app, 120, 30);
+    assert!(screen.contains("1 large value(s) only partly loaded"), "{screen}");
+    assert_eq!(table(&app).grid.rows[0][1].as_ref().unwrap().len(), crate::db::CELL_BYTES);
+    // Results of the SQL editor too.
+    app.on_key(key(KeyCode::Char('3')));
+    type_str(&mut app, "SELECT body FROM a_docs");
+    app.on_key(key(KeyCode::F(5)));
+    wait_for(&mut app, &mut rx, |a| !a.browser.as_ref().unwrap().query.running).await;
+    let message = &app.browser.as_ref().unwrap().query.message.as_ref().unwrap().0;
+    assert!(message.contains("1 large value(s) only partly loaded"), "{message}");
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(app.popup, Some(Popup::CellView { cut: Some(600_000), .. })));
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Char('1')));
+
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::F(2)));
+    assert!(app.popup.is_none());
+    assert_eq!(toast(&app), "🔒 Only the first 256 KiB of this 585.9 KiB value were loaded: edit it with SQL");
+    app.on_key(key(KeyCode::Enter)); // views it instead
+    render(&mut app, 120, 30);
+    let wrapped = |app: &App| match &app.popup {
+        Some(Popup::CellView { wrapped: Some((_, lines)), .. }) => lines.as_ptr(),
+        _ => panic!("expected the viewer"),
+    };
+    let first = wrapped(&app);
+    app.on_key(key(KeyCode::End));
+    let screen = render(&mut app, 120, 30);
+    assert_eq!(wrapped(&app), first, "wrapped once");
+    assert!(
+        screen.contains("only the first 256 KiB of 585.9 KiB are shown") && screen.contains("… (not loaded)"),
+        "{screen}"
+    );
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(toast(&app).starts_with("Copied the first 256 KiB of “xxx"), "{}", toast(&app));
+    assert_eq!(crate::clipboard::sent().map(|s| s.len()), Some(crate::db::CELL_BYTES));
+    assert_eq!(app.register, None, "a cut value is not pasted into cells");
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Right));
+    app.on_key(ctrl('v'));
+    assert_eq!(toast(&app), "Nothing to paste — copy a cell first");
+    // Replacing it as a whole is fine.
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(ctrl('s'));
+    app.on_key(key(KeyCode::Char('y')));
+    wait_for(&mut app, &mut rx, |a| !table(a).loading && !table(a).grid.has_pending()).await;
+    assert_eq!(rows_of(&profile, "SELECT body FROM a_docs").await, vec![vec![None]]);
+
+    // A cut key cannot find its row.
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| table(a).info.table.name == "b_keys" && table(a).loaded && !table(a).loading).await;
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(ctrl('s'));
+    let Some(Popup::Message { body, .. }) = &app.popup else { panic!("expected an error") };
+    assert!(body.contains("a value too large to load in full"), "{body}");
+}
+
+/// Audit L6: a panic in background work (here sqlx reading a row by the
+/// columns of a table another program has just changed) ends the request
+/// with an error, instead of leaving the table loading forever.
+#[tokio::test]
+async fn panics_in_background_work_end_the_request() {
+    let (dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    let mut other = ConnectionProfile::new(Driver::Sqlite);
+    other.path = dir.path().join("t.db").to_string_lossy().into_owned();
+    let other = Database::connect(&other, None).await.unwrap();
+    other.run_query("ALTER TABLE people DROP COLUMN name", false).await.unwrap();
+    other.close().await;
+    app.on_key(ctrl('r'));
+    assert!(table(&app).loading);
+    wait_for(&mut app, &mut rx, |a| !table(a).loading).await;
+    // The panic is in sqlx; should a later version not panic, the reload
+    // simply works.
+    if let Some(error) = &table(&app).error {
+        assert!(error.starts_with("internal error: index out of bounds"), "{error}");
+    }
+    let screen = render(&mut app, 120, 30);
+    assert!(!screen.contains("Loading"), "{screen}");
+}

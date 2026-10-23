@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::theme::*;
-use super::{panel, spinner};
+use super::{panel, safe_line, spinner};
 use crate::app::App;
 use crate::config::CredentialStore;
 
@@ -49,7 +49,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let mut top = vec![
                 bar.clone(),
                 Span::styled(format!(" {} ", p.driver.short()), pill(driver_color(p.driver))),
-                Span::styled(format!(" {}", p.name), Style::default().fg(FG).bg(bg).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" {}", crate::util::fit(&p.name, width.saturating_sub(6))),
+                    Style::default().fg(FG).bg(bg).add_modifier(Modifier::BOLD),
+                ),
             ];
             if p.read_only {
                 top.push(Span::styled("  read-only", Style::default().fg(YELLOW).bg(bg)));
@@ -60,7 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 CredentialStore::None if p.needs_password() => Span::styled("  ○ ask", dim().bg(bg)),
                 CredentialStore::None => Span::raw(""),
             });
-            let target = crate::util::truncate(&p.target(), width.saturating_sub(6));
+            let target = crate::util::fit(&p.target(), width.saturating_sub(6));
             let mut bottom = vec![bar, Span::styled(format!("     {target}"), dim().bg(bg))];
             for spans in [&mut top, &mut bottom] {
                 let used: usize = spans.iter().map(|s| s.width()).sum();
@@ -103,19 +106,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", p.driver.label()), pill(driver_color(p.driver))),
-            Span::styled(format!("  {}", p.name), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}", safe_line(&p.name)), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
     ];
     if p.driver.is_file_based() {
-        lines.push(row("File", p.path.clone()));
+        lines.push(row("File", safe_line(&p.path)));
     } else {
-        lines.push(row("Host", format!("{}:{}", p.host, p.port.map(|p| p.to_string()).unwrap_or_default())));
-        lines.push(row("User", p.user.clone()));
-        lines.push(row("Database", if p.database.is_empty() { "(default)".into() } else { p.database.clone() }));
+        lines
+            .push(row("Host", format!("{}:{}", safe_line(&p.host), p.port.map(|p| p.to_string()).unwrap_or_default())));
+        lines.push(row("User", safe_line(&p.user)));
+        lines.push(row("Database", if p.database.is_empty() { "(default)".into() } else { safe_line(&p.database) }));
         lines.push(row("SSL", p.ssl_mode.label().to_string()));
         if !p.ssl_ca.is_empty() {
-            lines.push(row("CA file", p.ssl_ca.clone()));
+            lines.push(row("CA file", safe_line(&p.ssl_ca)));
         }
         lines.push(row("Password", p.credential.label().to_string()));
     }
@@ -127,7 +131,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     if app.busy.is_some() {
         lines.push(Line::styled(
-            format!("{} {}…", spinner(app), app.busy.as_deref().unwrap_or("")),
+            format!("{} {}…", spinner(app), safe_line(app.busy.as_deref().unwrap_or(""))),
             Style::default().fg(CYAN),
         ));
     } else {

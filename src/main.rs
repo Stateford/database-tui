@@ -6,13 +6,16 @@ mod config;
 mod db;
 mod keymap;
 mod secrets;
+mod terminal;
 mod ui;
 mod util;
 
+use std::io::Write as _;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -70,7 +73,7 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(args))
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     // Changing the environment is only sound while no other thread can read
     // it, so this happens before the async runtime starts its threads.
     // SAFETY: nothing has spawned a thread yet.
@@ -90,8 +93,8 @@ fn disable_core_dumps() {
     }
 }
 
-async fn async_main() -> Result<()> {
-    let Some(args) = parse_args()? else { return Ok(()) };
+async fn async_main() -> Result<ExitCode> {
+    let Some(args) = parse_args()? else { return Ok(ExitCode::SUCCESS) };
     let mut config = Config::load().context("loading configuration")?;
     if let Some(mode) = args.keymap {
         match Config::update(|c| c.keymap = mode) {
@@ -109,12 +112,25 @@ async fn async_main() -> Result<()> {
         app.start(profile);
     }
 
-    let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), EnableBracketedPaste).ok();
-    let result = run(&mut terminal, app, rx).await;
-    crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
-    ratatui::restore();
-    result
+    let mut signals = terminal::Signals::new().context("listening for signals")?;
+    let mut terminal = terminal::init().context("setting up the terminal")?;
+    let result = run(&mut terminal, app, rx, &mut signals).await;
+    terminal::restore();
+    match result? {
+        Exit::Quit => Ok(ExitCode::SUCCESS),
+        Exit::Stopped(stop) => {
+            // The terminal may be gone (SIGHUP): never fail over this.
+            let _ = writeln!(std::io::stderr(), "dbtui: stopped by {}", stop.name);
+            Ok(ExitCode::from(stop.exit_code()))
+        }
+    }
+}
+
+/// How the UI loop ended.
+enum Exit {
+    Quit,
+    /// A signal asked dbtui to stop: it does so at once.
+    Stopped(terminal::Stop),
 }
 
 /// The saved connection or SQLite file named on the command line.
@@ -148,7 +164,8 @@ async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
     mut rx: mpsc::UnboundedReceiver<app::AppEvent>,
-) -> Result<()> {
+    signals: &mut terminal::Signals,
+) -> Result<Exit> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
@@ -163,6 +180,7 @@ async fn run(
             },
             Some(event) = rx.recv() => app.on_app_event(event),
             _ = tick.tick() => app.on_tick(),
+            stop = signals.recv() => return Ok(Exit::Stopped(stop)),
         }
         if app.should_quit {
             break;
@@ -182,7 +200,7 @@ async fn run(
     if let Some(b) = &app.browser {
         b.db.close().await;
     }
-    Ok(())
+    Ok(Exit::Quit)
 }
 
 #[cfg(test)]

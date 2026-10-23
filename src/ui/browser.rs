@@ -8,12 +8,13 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Wrap};
 
 use super::grid::{self, GridView};
 use super::theme::*;
-use super::{panel, privilege_spans, spinner};
+use super::{panel, privilege_spans, safe_line, safe_text, spinner, table_label};
 use crate::app::App;
 use crate::app::browser::{Browser, Focus, Tab, TreeItem};
 use crate::app::query::{EditorFocus, VimMode};
 use crate::config::KeymapMode;
 use crate::db::TableKind;
+use crate::util::{display_safe, fit, has_hidden, ident};
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let mode = app.keymap_mode();
@@ -36,7 +37,7 @@ fn draw_sidebar(frame: &mut Frame, b: &mut Browser, area: Rect) {
     let focused = b.focus == Focus::Sidebar;
     let mut title = vec![Span::raw(" Explorer ")];
     if !b.tree_filter.is_empty() {
-        title.push(Span::styled(format!("/{} ", b.tree_filter), Style::default().fg(YELLOW)));
+        title.push(Span::styled(format!("/{} ", display_safe(&b.tree_filter)), Style::default().fg(YELLOW)));
     }
     let block = panel(Line::from(title), focused);
     let inner = block.inner(area);
@@ -67,10 +68,16 @@ fn draw_sidebar(frame: &mut Frame, b: &mut Browser, area: Rect) {
                 TreeItem::Schema(s) => {
                     let schema = &b.schemas[s];
                     let expanded = !b.tree_filter.is_empty() || b.expanded.contains(&schema.name);
+                    let color = if has_hidden(&schema.name) { ORANGE } else { MAGENTA };
+                    let count = format!(" {}", schema.tables.len());
+                    let max = width.saturating_sub(3 + count.len());
                     vec![
                         Span::styled(if expanded { " ▾ " } else { " ▸ " }, Style::default().fg(MUTED)),
-                        Span::styled(schema.name.clone(), Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!(" {}", schema.tables.len()), dim()),
+                        Span::styled(
+                            fit(&ident(&schema.name), max),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(count, dim()),
                     ]
                 }
                 TreeItem::Table(s, t) => {
@@ -82,17 +89,20 @@ fn draw_sidebar(frame: &mut Frame, b: &mut Browser, area: Rect) {
                         TableKind::Foreign => ("◌", ORANGE),
                     };
                     let is_open = open.as_ref() == Some(&info.table);
-                    let name_style = if is_open {
-                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(FG)
+                    // A name with hidden characters stands out from the one
+                    // it looks like.
+                    let name_style = match (is_open, has_hidden(&info.table.name)) {
+                        (true, false) => Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                        (true, true) => Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+                        (false, true) => Style::default().fg(ORANGE),
+                        (false, false) => Style::default().fg(FG),
                     };
                     let writable = b.effective(info.privileges).can_write();
                     let tag = if writable { "" } else { " ro" };
                     let max = width.saturating_sub(6 + tag.len());
                     let mut spans = vec![
                         Span::styled(format!("   {icon} "), Style::default().fg(color)),
-                        Span::styled(crate::util::truncate(&info.table.name, max), name_style),
+                        Span::styled(fit(&ident(&info.table.name), max), name_style),
                     ];
                     if !writable {
                         spans.push(Span::styled(tag, Style::default().fg(YELLOW)));
@@ -137,18 +147,15 @@ fn draw_tabs(frame: &mut Frame, b: &Browser, area: Rect, spin: &str) {
             right.push(Span::styled(format!("{spin} loading "), Style::default().fg(CYAN)));
         }
         if let Some(f) = &t.filter {
-            right.push(Span::styled(
-                format!(" where {} ", crate::util::truncate(&crate::util::one_line(f), 40)),
-                Style::default().fg(YELLOW),
-            ));
+            right.push(Span::styled(format!(" where {} ", fit(f, 40)), Style::default().fg(YELLOW)));
         }
         if let Some((c, asc)) = &t.order_by {
             right.push(Span::styled(
-                format!(" sort {c} {} ", if *asc { "▲" } else { "▼" }),
+                format!(" sort {} {} ", fit(&ident(c), 40), if *asc { "▲" } else { "▼" }),
                 Style::default().fg(MAGENTA),
             ));
         }
-        right.push(Span::styled(format!(" {} ", t.info.table), Style::default().fg(CYAN)));
+        right.push(Span::styled(format!(" {} ", table_label(&t.info.table)), Style::default().fg(CYAN)));
         right.push(Span::styled(format!("{} ", t.info.kind.label()), dim()));
     }
     // Drop leading parts until the info fits next to the tabs.
@@ -196,13 +203,17 @@ fn draw_data(frame: &mut Frame, b: &mut Browser, area: Rect, spin: &str) {
     if let Some(p) = pages {
         bottom.push(Span::styled(format!("· page {}/{} ", t.page + 1, p), dim()));
     }
+    let cut = t.grid.cut_count();
+    if cut > 0 {
+        bottom.push(Span::styled(format!("· ⚠ {cut} large value(s) only partly loaded "), Style::default().fg(ORANGE)));
+    }
     if !t.can_write() {
         bottom.push(Span::styled("· 🔒 read-only ", Style::default().fg(YELLOW)));
     } else if !t.has_primary_key() && t.structure.is_some() {
         bottom.push(Span::styled("· no primary key: insert only ", Style::default().fg(ORANGE)));
     }
 
-    let title = Line::from(vec![Span::raw(format!(" {} ", t.info.table.name))]);
+    let title = Line::from(vec![Span::raw(format!(" {} ", ident(&t.info.table.name)))]);
     let block = panel(title, focused).title_bottom(Line::from(bottom));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -211,7 +222,7 @@ fn draw_data(frame: &mut Frame, b: &mut Browser, area: Rect, spin: &str) {
         Some(err) if t.loaded => {
             let [msg, rest] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
             frame.render_widget(
-                Paragraph::new(Line::styled(format!(" ✖ {}", crate::util::one_line(err)), Style::default().fg(RED)))
+                Paragraph::new(Line::styled(format!(" ✖ {}", safe_line(err)), Style::default().fg(RED)))
                     .wrap(Wrap { trim: true }),
                 msg,
             );
@@ -222,13 +233,13 @@ fn draw_data(frame: &mut Frame, b: &mut Browser, area: Rect, spin: &str) {
     if let Some(err) = &t.error
         && !t.loaded
     {
+        let mut lines = vec![
+            Line::styled("Could not load data", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Line::from(""),
+        ];
+        lines.extend(safe_text(err).lines().map(|l| Line::styled(l.to_string(), Style::default().fg(FG))));
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled("Could not load data", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-                Line::from(""),
-                Line::styled(err.clone(), Style::default().fg(FG)),
-            ])
-            .wrap(Wrap { trim: false }),
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
             inner.inner(Margin { horizontal: 1, vertical: 1 }),
         );
         return;
@@ -257,7 +268,7 @@ fn draw_structure(frame: &mut Frame, b: &mut Browser, area: Rect) {
         return;
     };
     let Some(s) = &t.structure else {
-        let msg = t.error.clone().unwrap_or_else(|| "Loading…".into());
+        let msg = t.error.as_deref().map_or_else(|| "Loading…".into(), safe_line);
         empty_state(frame, inner, vec![Line::styled(msg, dim())]);
         return;
     };
@@ -265,11 +276,11 @@ fn draw_structure(frame: &mut Frame, b: &mut Browser, area: Rect) {
     let mut privs = vec![Span::styled("Your privileges  ", dim())];
     privs.extend(privilege_spans(t.privileges()));
     if let Some(reason) = &b.session.read_only_reason {
-        privs.push(Span::styled(format!("  (session read-only: {reason})"), Style::default().fg(YELLOW)));
+        privs.push(Span::styled(format!("  (session read-only: {})", safe_line(reason)), Style::default().fg(YELLOW)));
     }
     if let Some(engine) = &s.non_transactional_engine {
         privs.push(Span::styled(
-            format!("  ⚠ {engine}: no transactions, commits cannot roll back"),
+            format!("  ⚠ {}: no transactions, commits cannot roll back", display_safe(engine)),
             Style::default().fg(ORANGE),
         ));
     }
@@ -286,16 +297,22 @@ fn draw_structure(frame: &mut Frame, b: &mut Browser, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(Span::styled(format!("{}", i + 1), dim())),
-                Cell::from(Span::styled(c.name.clone(), Style::default().fg(FG).add_modifier(Modifier::BOLD))),
-                Cell::from(Span::styled(c.data_type.clone(), Style::default().fg(CYAN))),
+                Cell::from(Span::styled(
+                    ident(&c.name),
+                    Style::default().fg(if has_hidden(&c.name) { ORANGE } else { FG }).add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(display_safe(&c.data_type), Style::default().fg(CYAN))),
                 Cell::from(if c.nullable {
                     Span::styled("yes", dim())
                 } else {
                     Span::styled("NOT NULL", Style::default().fg(ORANGE))
                 }),
                 Cell::from(key),
-                Cell::from(Span::styled(c.default.clone().unwrap_or_default(), Style::default().fg(GREEN))),
-                Cell::from(Span::styled(c.extra.clone().unwrap_or_default(), dim())),
+                Cell::from(Span::styled(
+                    safe_line(c.default.as_deref().unwrap_or_default()),
+                    Style::default().fg(GREEN),
+                )),
+                Cell::from(Span::styled(safe_line(c.extra.as_deref().unwrap_or_default()), dim())),
             ])
         })
         .collect();
@@ -311,9 +328,12 @@ fn draw_structure(frame: &mut Frame, b: &mut Browser, area: Rect) {
                 Span::styled("INDEX", dim())
             };
             Row::new(vec![
-                Cell::from(Span::styled(ix.name.clone(), Style::default().fg(FG))),
+                Cell::from(Span::styled(
+                    ident(&ix.name),
+                    Style::default().fg(if has_hidden(&ix.name) { ORANGE } else { FG }),
+                )),
                 Cell::from(kind),
-                Cell::from(Span::styled(ix.definition.clone(), dim())),
+                Cell::from(Span::styled(safe_line(&ix.definition), dim())),
             ])
         })
         .collect();
@@ -404,8 +424,8 @@ fn draw_query(frame: &mut Frame, b: &mut Browser, area: Rect, mode: KeymapMode, 
 
     let msg = match (&b.query.message, b.query.running) {
         (_, true) => Line::styled(format!(" {spin} Running…"), Style::default().fg(CYAN)),
-        (Some((m, true)), _) => Line::styled(format!(" {}", crate::util::one_line(m)), Style::default().fg(RED)),
-        (Some((m, false)), _) => Line::styled(format!(" {m}"), Style::default().fg(GREEN)),
+        (Some((m, true)), _) => Line::styled(format!(" {}", safe_line(m)), Style::default().fg(RED)),
+        (Some((m, false)), _) => Line::styled(format!(" {}", safe_line(m)), Style::default().fg(GREEN)),
         (None, _) => Line::styled(" Results appear below", dim()),
     };
     frame.render_widget(Paragraph::new(msg), msg_area);

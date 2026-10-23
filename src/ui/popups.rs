@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::theme::*;
-use super::{centered, help, modal};
+use super::{centered, help, modal, safe_line, safe_text};
 use crate::app::form::{ConnectionForm, Field};
 use crate::app::input::Input;
 use crate::app::{App, Popup, commit_needs_force};
@@ -31,23 +31,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             let r = centered(area, 80, 14);
             let inner = modal(frame, r, title, color).inner(Margin { horizontal: 2, vertical: 1 });
             let [text, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-            frame.render_widget(Paragraph::new(body.as_str()).wrap(Wrap { trim: false }).scroll((*scroll, 0)), text);
+            frame.render_widget(Paragraph::new(safe_text(body)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), text);
             frame.render_widget(footer(&[("Enter", "close"), ("↑↓", "scroll")]), foot);
         }
         Popup::Confirm { title, message, .. } => {
             let r = centered(area, 60, 8);
             let inner = modal(frame, r, title, YELLOW).inner(Margin { horizontal: 2, vertical: 1 });
             let [text, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-            frame.render_widget(Paragraph::new(message.as_str()).wrap(Wrap { trim: false }), text);
+            frame.render_widget(Paragraph::new(safe_text(message)).wrap(Wrap { trim: false }), text);
             frame.render_widget(footer(&[("y / Enter", "yes"), ("n / Esc", "no")]), foot);
         }
-        Popup::Commit { statements, scroll, non_transactional, .. } => {
+        Popup::Commit { statements, previews, hidden, scroll, non_transactional, .. } => {
             let force = commit_needs_force(statements, non_transactional.as_ref());
             let mut head = match non_transactional {
                 None => vec![Line::styled("These statements run in a single transaction:", dim())],
                 Some(engine) => vec![
                     Line::styled(
-                        format!("⚠ {engine} tables do not support transactions."),
+                        format!("⚠ {} tables do not support transactions.", safe_line(engine)),
                         Style::default().fg(RED).add_modifier(Modifier::BOLD),
                     ),
                     Line::styled(
@@ -56,6 +56,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                 ],
             };
+            if *hidden {
+                head.push(Line::styled(
+                    "⚠ Names or values hold characters that would not show: they are shown as ␛, ⟨U+200B⟩…",
+                    Style::default().fg(ORANGE),
+                ));
+            }
             if force {
                 head.push(Line::styled(
                     "Press ! to commit anyway, or Esc to commit fewer changes at a time.",
@@ -65,8 +71,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             let head_height = head.len() as u16 + 1;
             // Each statement wraps over several lines, plus a blank separator.
             let text_width = (area.width.min(100).saturating_sub(8)).max(10) as usize;
-            let body: usize =
-                statements.iter().map(|s| (s.preview().chars().count() + 2).div_ceil(text_width) + 1).sum();
+            let body: usize = previews.iter().map(|p| (p.chars().count() + 2).div_ceil(text_width) + 1).sum();
             let r = centered(area, 100, (body as u16 + head_height + 5).min(area.height.saturating_sub(4)));
             let inner = modal(frame, r, &format!("Commit {} change(s)", statements.len()), ORANGE)
                 .inner(Margin { horizontal: 2, vertical: 1 });
@@ -76,7 +81,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), head_area);
             let lines: Vec<Line> = statements
                 .iter()
-                .flat_map(|s| {
+                .zip(previews.iter())
+                .flat_map(|(s, preview)| {
                     let color = if s.sql.starts_with("DELETE") {
                         RED
                     } else if s.sql.starts_with("INSERT") {
@@ -85,7 +91,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                         YELLOW
                     };
                     vec![
-                        Line::from(vec![Span::styled("› ", Style::default().fg(color)), Span::raw(s.preview())]),
+                        Line::from(vec![Span::styled("› ", Style::default().fg(color)), Span::raw(preview.as_str())]),
                         Line::from(""),
                     ]
                 })
@@ -98,17 +104,44 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             frame.render_widget(footer(keys), foot);
         }
-        Popup::CellView { title, text, value, scroll } => {
+        Popup::CellView { title, text, value, cut, scroll, wrapped } => {
             let r = centered(area, 90, area.height.saturating_sub(6));
             let inner = modal(frame, r, title, CYAN).inner(Margin { horizontal: 2, vertical: 1 });
-            let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            let notice = if cut.is_some() { 1 } else { 0 };
+            let [notice_area, body, foot] =
+                Layout::vertical([Constraint::Length(notice), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            if let (Some(full), Some(v)) = (*cut, value.as_ref()) {
+                let notice = format!(
+                    "⚠ Too large to load in full: only the first {} of {} are shown",
+                    crate::util::size(v.len() as u64),
+                    crate::util::size(full)
+                );
+                frame.render_widget(Paragraph::new(Line::styled(notice, Style::default().fg(ORANGE))), notice_area);
+            }
+            // Wrapped once per width: wrapping a large value on every frame
+            // would freeze the screen. Only the lines in view are drawn.
+            let width = body.width as usize;
+            if wrapped.as_ref().is_none_or(|(w, _)| *w != width) {
+                *wrapped = Some((width, crate::util::wrap(text, width)));
+            }
+            let lines = wrapped.as_ref().map(|(_, lines)| lines.as_slice()).unwrap_or_default();
+            // A cut value ends with a line that says so.
+            let marker = cut.map(|_| Line::styled("… (not loaded)", Style::default().fg(ORANGE)));
+            let total = lines.len() + usize::from(marker.is_some());
+            *scroll = (*scroll).min(total.saturating_sub(body.height as usize));
+            let end = (*scroll + body.height as usize).min(total);
+            let mut shown: Vec<Line> =
+                lines[(*scroll).min(lines.len())..end.min(lines.len())].iter().map(|l| Line::raw(l.as_str())).collect();
+            if let Some(marker) = marker.filter(|_| end > lines.len()) {
+                shown.push(marker);
+            }
             // A stored text 'NULL' is not shown as SQL NULL.
             let style = if value.is_none() { null() } else { Style::default().fg(FG) };
+            frame.render_widget(Paragraph::new(shown).style(style), body);
             frame.render_widget(
-                Paragraph::new(text.as_str()).style(style).wrap(Wrap { trim: false }).scroll((*scroll, 0)),
-                body,
+                footer(&[("Esc", "close"), ("y", "copy"), ("↑↓ PgUp PgDn", "scroll"), ("Home End", "top / end")]),
+                foot,
             );
-            frame.render_widget(footer(&[("Esc", "close"), ("y", "copy"), ("↑↓", "scroll")]), foot);
         }
         Popup::Prompt(p) => {
             let r = centered(area, 72, 7);
@@ -116,12 +149,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             let [field, hint, _] =
                 Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
             draw_input(frame, field, &p.input, true, false);
-            frame.render_widget(Paragraph::new(Line::styled(p.hint.as_str(), dim())), hint);
+            frame.render_widget(Paragraph::new(Line::styled(safe_line(&p.hint), dim())), hint);
         }
         Popup::Password(p) => {
             // Room for the error (such as why the saved password is not used):
             // wrapped between long words, a line holds 40 characters or more.
-            let error_lines = p.error.as_ref().map_or(1, |e| e.chars().count().div_ceil(40).clamp(1, 6)) as u16;
+            let error = p.error.as_deref().map(safe_line);
+            let error_lines = error.as_ref().map_or(1, |e| e.chars().count().div_ceil(40).clamp(1, 6)) as u16;
             let r = centered(area, 64, 9 + error_lines);
             let inner = modal(frame, r, "Password", BLUE).inner(Margin { horizontal: 2, vertical: 1 });
             let [who, field, remember, err, foot] = Layout::vertical([
@@ -134,8 +168,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             .areas(inner);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(p.profile.name.clone(), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", p.profile.target()), dim()),
+                    Span::styled(safe_line(&p.profile.name), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {}", safe_line(&p.profile.target())), dim()),
                 ])),
                 who,
             );
@@ -153,9 +187,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 ])),
                 remember,
             );
-            if let Some(e) = &p.error {
+            if let Some(e) = error {
                 frame.render_widget(
-                    Paragraph::new(Line::styled(e.as_str(), Style::default().fg(RED))).wrap(Wrap { trim: true }),
+                    Paragraph::new(Line::styled(e, Style::default().fg(RED))).wrap(Wrap { trim: true }),
                     err,
                 );
             }
@@ -193,7 +227,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 if let Some(e) = &v.error {
                     frame.render_widget(
-                        Paragraph::new(Line::styled(e.as_str(), Style::default().fg(RED))).wrap(Wrap { trim: true }),
+                        Paragraph::new(Line::styled(safe_line(e), Style::default().fg(RED))).wrap(Wrap { trim: true }),
                         err,
                     );
                 }
@@ -206,12 +240,18 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal(frame, r, &title, YELLOW).inner(Margin { horizontal: 1, vertical: 0 });
             let [meta, editor, foot] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(inner);
-            let mut info = vec![Span::styled(c.data_type.clone(), Style::default().fg(CYAN))];
+            let mut info = vec![Span::styled(safe_line(&c.data_type), Style::default().fg(CYAN))];
             if !c.nullable {
                 info.push(Span::styled("  NOT NULL", Style::default().fg(ORANGE)));
             }
             if c.new_row {
                 info.push(Span::styled("  new row", Style::default().fg(GREEN)));
+            }
+            if c.hidden {
+                info.push(Span::styled(
+                    "  ⚠ holds characters not shown here: see the viewer",
+                    Style::default().fg(ORANGE),
+                ));
             }
             frame.render_widget(Paragraph::new(Line::from(info)), meta);
             c.editor.set_block(
@@ -388,7 +428,7 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
         }
     }
     if let Some(e) = &form.error {
-        messages.push(Line::styled(format!("✖ {e}"), Style::default().fg(RED)));
+        messages.push(Line::styled(format!("✖ {}", safe_line(e)), Style::default().fg(RED)));
     }
     frame.render_widget(Paragraph::new(messages).wrap(Wrap { trim: true }), rows[fields.len() * step]);
     frame.render_widget(

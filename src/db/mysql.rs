@@ -7,12 +7,12 @@ use sqlx::{Row, TypeInfo, ValueRef};
 use super::grants::Grants;
 use super::{
     CellKind, ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind,
-    TableRef, TableStructure, Transport, hex_bytes, run_raw_on, text_col, truthy,
+    TableRef, TableStructure, Transport, capped_hex, capped_text, run_raw_on, text_col, truthy,
 };
 
 const SYSTEM_SCHEMAS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
 
-pub(super) fn cell(row: &MySqlRow, idx: usize) -> (Option<String>, CellKind) {
+pub(super) fn cell(row: &MySqlRow, idx: usize, max: usize) -> (Option<String>, CellKind) {
     let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
         return (None, CellKind::Text);
@@ -21,11 +21,11 @@ pub(super) fn cell(row: &MySqlRow, idx: usize) -> (Option<String>, CellKind) {
     // or bytes given back to the server would surely match it alone.
     let bit = raw.type_info().name() == "BIT";
     // Text protocol: numbers, dates, etc. all arrive as strings.
-    let Ok(bytes) = row.try_get_unchecked::<Vec<u8>, _>(idx) else { return (None, CellKind::Inexact) };
-    match String::from_utf8(bytes) {
-        Ok(s) => (Some(s), if bit { CellKind::Inexact } else { CellKind::Text }),
+    let Ok(bytes) = row.try_get_unchecked::<&[u8], _>(idx) else { return (None, CellKind::Inexact) };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => capped_text(s, if bit { CellKind::Inexact } else { CellKind::Text }, max),
         // Only binary strings are not UTF-8 (sqlx asks for utf8mb4).
-        Err(e) => (Some(hex_bytes(e.as_bytes())), if bit { CellKind::Inexact } else { CellKind::Bytes }),
+        Err(_) => capped_hex(bytes, if bit { CellKind::Inexact } else { CellKind::Bytes }, max),
     }
 }
 

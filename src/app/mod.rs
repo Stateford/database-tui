@@ -9,6 +9,7 @@ pub mod query;
 mod tests;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -255,6 +256,9 @@ pub struct CellEditor {
     pub data_type: String,
     pub nullable: bool,
     pub new_row: bool,
+    /// The value holds characters the editor cannot show (see
+    /// [`crate::util::has_hidden`]); the viewer shows them.
+    pub hidden: bool,
 }
 
 impl CellEditor {
@@ -294,20 +298,68 @@ pub struct Prompt {
 }
 
 pub enum Popup {
-    Help { scroll: u16 },
-    Confirm { title: String, message: String, action: ConfirmAction },
-    Message { title: String, body: String, error: bool, scroll: u16 },
+    Help {
+        scroll: u16,
+    },
+    Confirm {
+        title: String,
+        message: String,
+        action: ConfirmAction,
+    },
+    Message {
+        title: String,
+        body: String,
+        error: bool,
+        scroll: u16,
+    },
     Form(Box<ConnectionForm>),
     Password(PasswordPrompt),
     Vault(VaultPrompt),
     CellEditor(Box<CellEditor>),
-    // `text` is what is shown (JSON re-indented); `value` is the cell's
-    // value, which is what gets copied (`None`: NULL or the default).
-    CellView { title: String, text: String, value: Option<String>, scroll: u16 },
+    // `text` is what is shown: the value made safe to display (JSON
+    // re-indented); `value` is the cell's value, which is what gets copied
+    // (`None`: NULL or the default); `cut`: only the start of the value was
+    // loaded, and the size of all of it. `wrapped`: `text` wrapped to a
+    // width, kept until the width changes, as a large value takes a while.
+    CellView {
+        title: String,
+        text: String,
+        value: Option<String>,
+        cut: Option<u64>,
+        scroll: usize,
+        wrapped: Option<(usize, Vec<String>)>,
+    },
     Prompt(Prompt),
+    // `previews`: the statements as shown (see `commit_preview`); `hidden`:
+    // they hold characters that would not show as themselves;
     // `non_transactional`: engine of a MySQL table that cannot roll back;
     // `snapshot`: what the statements were built from (see `CommitSnapshot`).
-    Commit { statements: Vec<Statement>, scroll: u16, non_transactional: Option<String>, snapshot: Box<CommitSnapshot> },
+    Commit {
+        statements: Vec<Statement>,
+        previews: Vec<String>,
+        hidden: bool,
+        scroll: u16,
+        non_transactional: Option<String>,
+        snapshot: Box<CommitSnapshot>,
+    },
+}
+
+/// Most bytes of a statement shown in the commit preview: its values can be
+/// large (a pasted document, say).
+const PREVIEW_BYTES: usize = 4096;
+
+/// A statement as the commit preview shows it: made safe to display, and
+/// cut if very long.
+fn commit_preview(statement: &Statement) -> String {
+    let full = statement.preview();
+    match crate::util::clip(&full, PREVIEW_BYTES) {
+        (all, false) => crate::util::display_safe(all),
+        (start, true) => format!(
+            "{} … ({} more)",
+            crate::util::display_safe(start),
+            crate::util::size((full.len() - start.len()) as u64)
+        ),
+    }
 }
 
 /// A change a cell editor stages.
@@ -368,6 +420,13 @@ fn err_text(e: anyhow::Error) -> String {
     out
 }
 
+/// Runs background work whose result the app waits for, turning a panic in
+/// it (a bug in a database driver, say) into an error: the request then
+/// ends like a failed one, rather than leaving the app loading forever.
+async fn guarded<T>(work: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+    crate::terminal::catch_panic(work).await.unwrap_or_else(|panic| Err(format!("internal error: {panic}")))
+}
+
 impl App {
     pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
         Self {
@@ -411,6 +470,11 @@ impl App {
         self.tick = self.tick.wrapping_add(1);
         if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
             self.toast = None;
+        }
+        // A panic on a thread of its own (a database driver's, say): the
+        // work it was doing fails or is retried, and the app goes on.
+        if let Some(panic) = crate::terminal::take_background_panic() {
+            self.notify(Level::Error, format!("Internal error in a background thread: {panic}"));
         }
         // A slow keyring is not a failure: the write completes (or fails)
         // whenever the keyring answers, and is handled then.
@@ -841,7 +905,7 @@ impl App {
             // Enter edits when allowed, otherwise shows the value; while the
             // table is busy, it says why it cannot edit yet.
             Action::Select => match self.edit_permission(false) {
-                Ok(()) if !self.binary_cell() => self.edit_cell(),
+                Ok(()) if !self.binary_cell() && self.cut_cell().is_none() => self.edit_cell(),
                 Err(reason) if self.table_busy().is_some_and(|busy| reason == busy) => self.deny(reason),
                 _ => self.view_cell(),
             },
@@ -965,12 +1029,28 @@ impl App {
         t.grid.cell(row, col).1 == grid::CellState::Clean && t.grid.kind(row, col).is_binary()
     }
 
+    /// When the current cell shows only the start of a value too large to
+    /// load in full: the size of that start and of all of it. Editing the
+    /// start would store it alone.
+    fn cut_cell(&self) -> Option<(usize, u64)> {
+        let t = self.browser.as_ref()?.table.as_ref()?;
+        let full = t.grid.cut(t.grid.row, t.grid.col)?;
+        Some((t.grid.current_text().map_or(0, |s| s.len()), full))
+    }
+
     fn edit_cell(&mut self) {
         if let Err(reason) = self.edit_permission(false) {
             return self.deny(reason);
         }
         if self.binary_cell() {
             return self.deny("This is binary data, shown as hex: edit it with SQL".into());
+        }
+        if let Some((loaded, full)) = self.cut_cell() {
+            return self.deny(format!(
+                "Only the first {} of this {} value were loaded: edit it with SQL",
+                crate::util::size(loaded as u64),
+                crate::util::size(full)
+            ));
         }
         let Some(b) = self.browser.as_ref() else { return };
         let Some(t) = b.table.as_ref() else { return };
@@ -989,6 +1069,7 @@ impl App {
         };
         let info = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == column));
         let original = t.grid.cell_text(row, col);
+        let hidden = original.as_deref().is_some_and(crate::util::has_hidden);
         let (lines, newline) = editor_lines(original.as_deref().unwrap_or_default());
         let mut editor = TextArea::new(lines);
         editor.move_cursor(ratatui_textarea::CursorMove::Bottom);
@@ -1004,6 +1085,7 @@ impl App {
             data_type: info.map(|c| c.data_type.clone()).unwrap_or_default(),
             nullable: info.is_none_or(|c| c.nullable),
             new_row,
+            hidden,
             column,
         })));
     }
@@ -1079,28 +1161,66 @@ impl App {
         };
         let Some(grid) = grid.filter(|g| !g.is_empty()) else { return };
         let column = grid.columns.get(grid.col).cloned().unwrap_or_default();
+        let cut = grid.cut(grid.row, grid.col);
         let (value, text) = match grid.cell(grid.row, grid.col).0 {
             grid::CellValue::Value(v) => (Some(v.to_string()), None),
             grid::CellValue::Null => (None, Some("NULL".to_string())),
             grid::CellValue::Default => (None, Some("(default)".to_string())),
         };
-        let formatted = value.as_deref().and_then(pretty_value);
+        // The start of a document is not one.
+        let formatted = value.as_deref().filter(|_| cut.is_none()).and_then(pretty_value);
         let title = if formatted.is_some() { format!("{column} · JSON, re-indented") } else { column };
-        let text = formatted.or(text).or_else(|| value.clone()).unwrap_or_default();
-        self.popup = Some(Popup::CellView { title, text, value, scroll: 0 });
+        let shown = formatted.as_deref().or(text.as_deref()).or(value.as_deref()).unwrap_or_default();
+        let text = crate::util::display_safe_lines(shown);
+        self.popup = Some(Popup::CellView { title, text, value, cut, scroll: 0, wrapped: None });
     }
 
     fn copy_cell(&mut self) {
-        let text = self.active_grid().and_then(|g| g.current_text());
+        let Some(grid) = self.active_grid() else { return };
+        let (text, cut) = (grid.current_text(), grid.cut(grid.row, grid.col));
         match text {
-            Some(text) => {
-                crate::clipboard::copy(&text);
-                let preview: String = text.chars().take(40).collect();
-                self.register = Some(text);
-                self.notify(Level::Success, format!("Copied “{preview}”"));
-            }
+            Some(text) => self.copy_value(text, cut),
             None => self.notify(Level::Info, "Cell is NULL — nothing copied"),
         }
+    }
+
+    /// Copies a cell's value: to the system clipboard, made safe to paste
+    /// there (see [`crate::clipboard::clipboard_text`]), and as it is to the
+    /// register that pastes into cells, unless only its start was loaded
+    /// (`cut`: the size of all of it), which would store that start alone.
+    fn copy_value(&mut self, value: String, cut: Option<u64>) {
+        let preview: String = value.chars().take(40).collect();
+        let copied = crate::clipboard::copy(&value);
+        let mut level = Level::Success;
+        let mut message = format!("Copied “{preview}”");
+        if let Some(full) = cut {
+            level = Level::Warning;
+            message = format!(
+                "Copied the first {} of “{preview}”: only that much of its {} was loaded. \
+                 It cannot be pasted into a cell.",
+                crate::util::size(value.len() as u64),
+                crate::util::size(full)
+            );
+            self.register = None;
+        } else {
+            self.register = Some(value);
+        }
+        if copied.cut {
+            level = Level::Warning;
+            message.push_str(&format!(
+                " Only the first {} went to the clipboard.",
+                crate::util::size(crate::clipboard::COPY_LIMIT as u64)
+            ));
+        }
+        if copied.escaped > 0 {
+            level = Level::Warning;
+            message.push_str(&format!(
+                " {} control character(s) are shown as symbols (␛…) on the clipboard, so that pasting cannot \
+                 type keys; pasting into a cell here keeps them.",
+                copied.escaped
+            ));
+        }
+        self.notify(level, message);
     }
 
     fn change_page(&mut self, delta: isize) {
@@ -1188,29 +1308,33 @@ impl App {
                     scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                 }),
             },
-            Popup::CellView { title, text, value, scroll } => match key.code {
+            Popup::CellView { title, text, value, cut, mut scroll, wrapped } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') | KeyCode::Char('v') => None,
-                KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || key.code == KeyCode::Char('c') => {
-                    // The value itself, as the grid copies it: not the
-                    // re-indented text, and nothing for NULL (which would
-                    // otherwise be pasted back as the text 'NULL').
-                    match &value {
-                        Some(v) => {
-                            crate::clipboard::copy(v);
-                            self.register = Some(v.clone());
-                            self.notify(Level::Success, "Copied value");
+                code => {
+                    match code {
+                        KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || code == KeyCode::Char('c') => {
+                            // The value itself, as the grid copies it: not the
+                            // re-indented text, and nothing for NULL (which would
+                            // otherwise be pasted back as the text 'NULL').
+                            match &value {
+                                Some(v) => self.copy_value(v.clone(), cut),
+                                None if text == "NULL" => self.notify(Level::Info, "Cell is NULL — nothing copied"),
+                                None => self.notify(Level::Info, "Cell uses the column default — nothing copied"),
+                            }
                         }
-                        None if text == "NULL" => self.notify(Level::Info, "Cell is NULL — nothing copied"),
-                        None => self.notify(Level::Info, "Cell uses the column default — nothing copied"),
+                        // Scrolling stops at the end when drawn.
+                        KeyCode::Home => scroll = 0,
+                        KeyCode::Char('g') if vim => scroll = 0,
+                        KeyCode::End => scroll = usize::MAX,
+                        KeyCode::Char('G') if vim => scroll = usize::MAX,
+                        _ => {
+                            if let Some(d) = scroll_delta(&key) {
+                                scroll = scroll.saturating_add_signed(d as isize);
+                            }
+                        }
                     }
-                    Some(Popup::CellView { title, text, value, scroll })
+                    Some(Popup::CellView { title, text, value, cut, scroll, wrapped })
                 }
-                _ => Some(Popup::CellView {
-                    title,
-                    text,
-                    value,
-                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
-                }),
             },
             Popup::Confirm { title, message, action } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -1220,7 +1344,7 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => None,
                 _ => Some(Popup::Confirm { title, message, action }),
             },
-            Popup::Commit { statements, scroll, non_transactional, snapshot } => {
+            Popup::Commit { statements, previews, hidden, scroll, non_transactional, snapshot } => {
                 let force = commit_needs_force(&statements, non_transactional.as_ref());
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !force => {
@@ -1238,6 +1362,8 @@ impl App {
                         }
                         Some(Popup::Commit {
                             statements,
+                            previews,
+                            hidden,
                             scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                             non_transactional,
                             snapshot,
@@ -1715,23 +1841,24 @@ impl App {
         self.busy = Some(format!("Connecting to {}", profile.name));
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = async {
-                let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
+            let result = guarded(async {
+                let db =
+                    Database::connect(&profile, password.as_deref().map(String::as_str)).await.map_err(err_text)?;
                 let info = async { anyhow::Ok((db.session_info(&profile).await?, db.schemas().await?)) }.await;
                 match info {
-                    Ok((session, schemas)) => anyhow::Ok((db, session, schemas)),
+                    Ok((session, schemas)) => Ok((db, session, schemas)),
                     Err(e) => {
                         db.close().await;
-                        Err(e)
+                        Err(err_text(e))
                     }
                 }
-            }
+            })
             .await;
             let event = match result {
                 Ok((db, session, schemas)) => {
                     AppEvent::Connected { attempt, profile, db, session: Box::new(session), schemas, remember }
                 }
-                Err(e) => AppEvent::ConnectFailed { attempt, profile, error: err_text(e), needs_password: false },
+                Err(error) => AppEvent::ConnectFailed { attempt, profile, error, needs_password: false },
             };
             let _ = tx.send(event);
         });
@@ -1771,7 +1898,7 @@ impl App {
         self.busy = Some("Testing connection".into());
         let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
         tokio::spawn(async move {
-            let result = async {
+            let test = async {
                 let mut password = password;
                 if use_keyring {
                     let id = profile.id.clone();
@@ -1797,9 +1924,9 @@ impl App {
                     None => Level::Success,
                 };
                 anyhow::Ok((level, msg))
-            }
-            .await;
-            let _ = tx.send(AppEvent::TestResult(result.map_err(err_text)));
+            };
+            let result = guarded(async { test.await.map_err(err_text) }).await;
+            let _ = tx.send(AppEvent::TestResult(result));
         });
     }
 
@@ -2040,7 +2167,9 @@ impl App {
         self.vault_seq += 1;
         let (seq, create, tx) = (self.vault_seq, v.create, self.tx.clone());
         tokio::task::spawn_blocking(move || {
-            let result = if create { Vault::create(&path, &master) } else { Vault::unlock(&path, &master) };
+            let open = || if create { Vault::create(&path, &master) } else { Vault::unlock(&path, &master) };
+            let result = crate::terminal::catch_panic_blocking(open)
+                .unwrap_or_else(|panic| Err(anyhow::anyhow!("internal error: {panic}")));
             let _ = tx.send(AppEvent::VaultOpened { seq, result });
         });
         v.working = Some(seq);
@@ -2157,18 +2286,19 @@ impl App {
         tokio::spawn(async move {
             let structure = match &known_structure {
                 Some(_) => None,
-                None => Some(db.structure(&table).await.map_err(err_text)),
+                None => Some(guarded(async { db.structure(&table).await.map_err(err_text) }).await),
             };
             let columns = match (&known_structure, &structure) {
                 (Some(s), _) | (None, Some(Ok(s))) => s.columns.as_slice(),
                 _ => &[],
             };
             req.default_order = columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
-            let data = db.fetch_page(&table, &req, read_only).await.map_err(err_text);
+            let data = guarded(async { db.fetch_page(&table, &req, read_only).await.map_err(err_text) }).await;
             let ok = data.is_ok();
             let _ = tx.send(AppEvent::Page { generation, seq, structure, data });
             if ok {
-                let count = db.count_rows(&table, req.filter.as_deref(), read_only).await.map_err(err_text);
+                let filter = req.filter.as_deref();
+                let count = guarded(async { db.count_rows(&table, filter, read_only).await.map_err(err_text) }).await;
                 let _ = tx.send(AppEvent::Count { generation, seq, count });
             }
         });
@@ -2180,7 +2310,7 @@ impl App {
         let (generation, seq, db) = (b.generation, b.schema_seq, b.db.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = db.schemas().await.map_err(err_text);
+            let result = guarded(async { db.schemas().await.map_err(err_text) }).await;
             let _ = tx.send(AppEvent::Schemas { generation, seq, result });
         });
     }
@@ -2206,7 +2336,7 @@ impl App {
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = db.run_query(&sql, read_only).await.map_err(err_text);
+            let result = guarded(async { db.run_query(&sql, read_only).await.map_err(err_text) }).await;
             let _ = tx.send(AppEvent::Query { generation, seq, may_write, result });
         });
     }
@@ -2236,8 +2366,16 @@ impl App {
                     grid: t.grid.id,
                     edits: t.grid.edits.clone(),
                 };
-                self.popup =
-                    Some(Popup::Commit { statements, scroll: 0, non_transactional, snapshot: Box::new(snapshot) })
+                let previews = statements.iter().map(commit_preview).collect();
+                let hidden = statements.iter().any(|s| crate::util::has_hidden(&s.preview()));
+                self.popup = Some(Popup::Commit {
+                    statements,
+                    previews,
+                    hidden,
+                    scroll: 0,
+                    non_transactional,
+                    snapshot: Box::new(snapshot),
+                })
             }
             Err(e) => {
                 self.popup = Some(Popup::Message { title: "Cannot commit".into(), body: e, error: true, scroll: 0 })
@@ -2283,7 +2421,14 @@ impl App {
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = db.apply(&statements).await.map_err(|e| err_text(e) + note.as_deref().unwrap_or_default());
+            let result = match crate::terminal::catch_panic(db.apply(&statements)).await {
+                Ok(result) => result.map_err(|e| err_text(e) + note.as_deref().unwrap_or_default()),
+                // It may have happened before or after the commit itself.
+                Err(panic) => Err(format!(
+                    "internal error: {panic}\n\nThe changes may or may not have been committed: reload the table \
+                     to see."
+                )),
+            };
             let _ = tx.send(AppEvent::Committed { generation, seq, profile, result });
         });
     }
@@ -2442,18 +2587,24 @@ impl App {
                 match result {
                     Ok(rs) => {
                         let ms = rs.elapsed.as_secs_f64() * 1000.0;
-                        let msg = if rs.columns.is_empty() {
-                            format!("✓ {} row(s) affected · {ms:.1} ms", rs.rows_affected)
-                        } else {
-                            let more =
-                                if rs.truncated { format!(" (first {} shown)", rs.rows.len()) } else { String::new() };
-                            format!("✓ {} row(s){more} · {ms:.1} ms", rs.rows.len())
-                        };
-                        b.query.message = Some((msg, false));
                         // Statements may have changed the schema or the open table
                         // (PostgreSQL also counts the rows a SELECT returns).
                         let changed = may_write && (rs.rows_affected > 0 || rs.columns.is_empty());
-                        b.query.result = (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows));
+                        let (rows, columns, affected, truncated) =
+                            (rs.rows.len(), rs.columns.is_empty(), rs.rows_affected, rs.truncated);
+                        b.query.result =
+                            (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows).with_kinds(rs.kinds));
+                        let cut = b.query.result.as_ref().map_or(0, Grid::cut_count);
+                        let mut msg = if columns {
+                            format!("✓ {affected} row(s) affected · {ms:.1} ms")
+                        } else {
+                            let more = if truncated { format!(" (first {rows} shown)") } else { String::new() };
+                            format!("✓ {rows} row(s){more} · {ms:.1} ms")
+                        };
+                        if cut > 0 {
+                            msg.push_str(&format!(" · ⚠ {cut} large value(s) only partly loaded"));
+                        }
+                        b.query.message = Some((msg, false));
                         if changed {
                             self.refresh_schemas();
                             self.reload_after_sql();
@@ -2492,9 +2643,7 @@ impl App {
             // From a connection closed while the commit ran.
             return match result {
                 Ok(n) => self.notify(Level::Info, format!("The commit to {profile} finished: {n} row(s) affected")),
-                Err(e) => {
-                    self.notify(Level::Error, format!("The commit to {profile} failed: {}", crate::util::one_line(&e)))
-                }
+                Err(e) => self.notify(Level::Error, format!("The commit to {profile} failed: {e}")),
             };
         };
         let Some(commit) = b.commit.take_if(|c| c.seq == seq) else { return };

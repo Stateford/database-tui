@@ -12,6 +12,8 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
 - **Browse data**: a fast spreadsheet-style grid with paging, sorting, SQL `WHERE` filters,
   a full-value viewer (JSON is re-indented, nothing else about it changes) and copy to the
   system clipboard (OSC 52). Copying always copies the stored value; a `NULL` copies nothing.
+  Hidden characters in names and values are shown rather than dropped, and very large values
+  are loaded cut. See [Data from the database](#data-from-the-database).
 - **Edit data safely**: edit cells, set `NULL`, add rows and delete rows. Changes are *staged*
   and highlighted, and you can undo them. Committing first shows a preview of the generated SQL,
   then runs everything in **one transaction**. Each update or delete targets exactly one row by
@@ -115,6 +117,39 @@ Rows are identified by their primary key, never by where they are on screen:
 
 After a statement in the SQL editor that may have written, the open table is reloaded (or, with
 staged changes, dbtui warns that their rows may have changed).
+
+## Data from the database
+
+Names and values come from the database, and whoever can create a table or store a value there
+chooses them. dbtui shows them for what they are:
+
+- **Hidden characters are shown, never dropped.** Control characters appear as their symbols
+  (`␛` for ESC, `␇` for BEL, `␀`…), and invisible or reordering characters (zero-width spaces
+  and joiners, bidi marks and overrides, the byte order mark…) by code point, such as
+  `⟨U+202E⟩`. On one line, line breaks show as `↵` and tabs as `⇥`. This applies to names,
+  values, error messages, popup titles and the commit preview, so nothing from the database
+  reaches the terminal as a control or bidi character.
+- **Lookalike names are flagged.** A schema, table, column or index name that holds such
+  characters is drawn in orange behind `⚠`: `accounts` and `⚠ accounts⟨U+200B⟩` are two
+  different tables. The commit preview warns when its statements hold such characters, and the
+  cell editor when the value does (the viewer shows them).
+- **Copies are safe to paste.** `Ctrl-C` / `yy` and the viewer's `y` put the value on the system
+  clipboard with control characters other than tabs and line breaks replaced by their symbols:
+  pasted into a terminal, `ESC [201~` in a value would end the paste early and type the rest as
+  keys. dbtui says when it did this; pasting into a cell within dbtui keeps the value exactly.
+  At most 1 MiB goes to the clipboard.
+- **Large values are cut when loaded.** At most 256 KiB of each value is kept, and 32 MiB for a
+  whole page or query result; past that, values keep just enough to fill a column. A view can
+  produce values of any size without storing anything. Such a value ends in `…` in the grid, the
+  page footer counts them, and the viewer says how much was loaded. It cannot be edited, pasted
+  into another cell or used as a row's key; setting it to `NULL` or pasting a new value over it
+  works. The server still sends the whole value: use `substr()` / `left()` in the SQL editor to
+  read the rest.
+- **Failures stay contained.** A panic in background work (such as SQLite's driver reading a
+  table whose columns another program has just changed) ends that request with an
+  "internal error" instead of leaving it loading, and any other is reported on screen. If the UI
+  itself crashes, or dbtui gets SIGTERM or SIGHUP, the terminal is restored (raw mode, alternate
+  screen, bracketed paste) before it exits.
 
 ## Connection security
 
@@ -279,7 +314,15 @@ The encrypted vault (`vault.toml`) sits next to the config file.
 cargo test     # unit tests plus end-to-end tests against temporary SQLite databases
 cargo clippy --all-targets
 cargo fmt
+cargo audit    # known vulnerabilities in the locked dependencies
 ```
+
+CI runs these with `--locked` on Linux, macOS and Windows, plus `cargo audit` on every push and
+weekly. Its token can only read the repository, and its actions are pinned to commit SHAs.
+
+`docker compose -f dev/docker-compose.yml up -d` starts PostgreSQL and MySQL with sample data
+for manual testing. Their passwords are well known (`dbtui` / `dbtui`, `root` / `root`, `reader` /
+`reader`), so the ports are only published on `127.0.0.1`.
 
 The code is organised as:
 

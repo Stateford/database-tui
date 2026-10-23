@@ -37,7 +37,7 @@ const STANDARD: &[Section] = &[
             ("Home End  Ctrl-Home Ctrl-End", "first/last column, first/last row"),
             ("[  ]  Alt-← Alt-→", "previous / next page"),
             ("Space  F3", "view full value (JSON re-indented)"),
-            ("Ctrl-C", "copy cell (system clipboard via OSC 52)"),
+            ("Ctrl-C", "copy cell (system clipboard via OSC 52, controls as ␛…)"),
             ("/  Ctrl-F", "filter with a WHERE condition"),
             ("Ctrl-O  F6", "sort by column (asc → desc → off)"),
             ("F5  Ctrl-R", "reload"),
@@ -53,6 +53,15 @@ const STANDARD: &[Section] = &[
             ("Delete", "mark / unmark row for deletion"),
             ("Ctrl-Z", "undo last staged change"),
             ("Ctrl-S", "review & commit staged changes"),
+        ],
+    ),
+    (
+        "Value viewer",
+        &[
+            ("↑ ↓  PgUp PgDn", "scroll"),
+            ("Home  End", "top / end"),
+            ("y  c", "copy the value"),
+            ("Esc  q  Space", "close"),
         ],
     ),
     (
@@ -105,7 +114,7 @@ const VIM: &[Section] = &[
         "Data grid",
         &[
             ("v  Space", "view full value"),
-            ("yy", "yank (copy) cell"),
+            ("yy", "yank (copy) cell, controls as ␛…"),
             ("/", "filter with a WHERE condition"),
             ("s", "sort by column"),
             ("R  Ctrl-r", "reload"),
@@ -122,6 +131,10 @@ const VIM: &[Section] = &[
             ("u", "undo last staged change"),
             (":w  Ctrl-s", "review & commit staged changes"),
         ],
+    ),
+    (
+        "Value viewer",
+        &[("j k  Ctrl-d Ctrl-u", "scroll"), ("g  G", "top / end"), ("y  c", "copy the value"), ("Esc  q  v", "close")],
     ),
     (
         "Commit preview",
@@ -187,5 +200,16 @@ pub fn lines(mode: KeymapMode) -> Vec<Line<'static>> {
         Span::styled(format!("  {:<30}", "SEL INS UPD DEL"), Style::default().fg(GREEN)),
         Span::styled("privileges on the open table (crossed out = missing)", Style::default().fg(FG)),
     ]));
+    out.push(Line::from(""));
+    out.push(Line::styled("Symbols in data and names", Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD)));
+    for (k, d) in [
+        ("↵  ⇥", "line break, tab (on one line)"),
+        ("␛ ␀ ␇ …", "control character (ESC, NUL, BEL…)"),
+        ("⟨U+202E⟩", "invisible or bidi character, by code point"),
+        ("⚠ name", "a name holding such characters: not the name it looks like"),
+        ("…", "cut to fit; for a large value, only its start was loaded"),
+    ] {
+        out.push(Line::from(vec![Span::styled(format!("  {k:<30}"), key()), Span::styled(d, Style::default().fg(FG))]));
+    }
     out
 }

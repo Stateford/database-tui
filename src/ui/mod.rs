@@ -18,7 +18,7 @@ use crate::app::browser::{Focus, Tab};
 use crate::app::query::{EditorFocus, VimMode};
 use crate::app::{App, Level, Screen};
 use crate::config::KeymapMode;
-use crate::db::{AccessLevel, Privileges, TransportTrust};
+use crate::db::{AccessLevel, Privileges, TableRef, TransportTrust};
 use crate::keymap::{self, Context};
 use theme::*;
 
@@ -45,6 +45,31 @@ pub fn spinner(app: &App) -> &'static str {
     SPINNER[app.tick % SPINNER.len()]
 }
 
+/// Most bytes of a message (an error from the server, say) that are drawn.
+const MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Text from the database or a server, safe to draw on one line (see
+/// [`crate::util::display_safe`]); a long one is clipped first.
+pub fn safe_line(s: &str) -> String {
+    crate::util::display_safe(crate::util::clip(s, MESSAGE_BYTES).0)
+}
+
+/// As [`safe_line`], keeping line breaks.
+pub fn safe_text(s: &str) -> String {
+    match crate::util::clip(s, MESSAGE_BYTES) {
+        (all, false) => crate::util::display_safe_lines(all),
+        (start, true) => format!("{}…", crate::util::display_safe_lines(start)),
+    }
+}
+
+/// A table's `schema.name` as shown, behind a `⚠` when either part holds
+/// hidden characters (see [`crate::util::ident`]).
+pub fn table_label(table: &TableRef) -> String {
+    use crate::util::{display_safe, has_hidden};
+    let flag = if has_hidden(&table.schema) || has_hidden(&table.name) { "⚠ " } else { "" };
+    format!("{flag}{}.{}", display_safe(&table.schema), display_safe(&table.name))
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Block::default().style(Style::default().bg(BG_DARK)), area);
     let mut left = vec![Span::styled(" ◆ dbtui ", pill(MAGENTA)), Span::raw(" ")];
@@ -52,11 +77,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         (Some(b), Screen::Browser) => {
             left.push(Span::styled(format!(" {} ", b.profile.driver.short()), pill(driver_color(b.profile.driver))));
             left.push(Span::styled(
-                format!(" {} ", b.profile.name),
+                format!(" {} ", safe_line(&b.profile.name)),
                 Style::default().fg(FG).add_modifier(Modifier::BOLD),
             ));
-            left.push(Span::styled(format!("{} ", b.profile.target()), dim()));
-            left.push(Span::styled(format!("· {}", b.session.server_version), dim()));
+            left.push(Span::styled(format!("{} ", safe_line(&b.profile.target())), dim()));
+            left.push(Span::styled(format!("· {}", safe_line(&b.session.server_version)), dim()));
         }
         _ => left.push(Span::styled("Connections", Style::default().fg(FG).add_modifier(Modifier::BOLD))),
     }
@@ -64,7 +89,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(reason) =
         app.browser.as_ref().filter(|_| app.screen == Screen::Browser).and_then(|b| b.session.read_only_reason.as_ref())
     {
-        right.push(Span::styled(format!("⚠ read-only: {reason} "), Style::default().fg(YELLOW)));
+        right.push(Span::styled(format!("⚠ read-only: {} ", safe_line(reason)), Style::default().fg(YELLOW)));
     }
     let keys = match app.keymap_mode() {
         KeymapMode::Vim => Span::styled(" VIM ", pill(GREEN)),
@@ -111,7 +136,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         let line = Line::from(vec![
             Span::styled(format!(" {icon} "), pill(color)),
-            Span::styled(format!(" {}", crate::util::one_line(&toast.text)), Style::default().fg(color)),
+            Span::styled(format!(" {}", safe_line(&toast.text)), Style::default().fg(color)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -206,8 +231,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         };
         let icon = if level == AccessLevel::ReadOnly { "🔒" } else { "●" };
         left.push(Span::styled(format!(" {icon} {} ", level.label()), pill(color)));
-        left.push(Span::styled(format!(" {} ", b.session.user), Style::default().fg(FG)));
+        left.push(Span::styled(format!(" {} ", safe_line(&b.session.user)), Style::default().fg(FG)));
         if let Some((label, trust)) = b.session.transport.summary(&b.profile) {
+            // The TLS version is as the server reports it.
+            let label = safe_line(&label);
             left.push(match trust {
                 TransportTrust::Local => Span::styled(format!("{label} "), dim()),
                 TransportTrust::Verified => Span::styled(format!("✓ {label} "), Style::default().fg(GREEN)),
@@ -218,7 +245,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
         if let Some(t) = &b.table {
             left.push(Span::styled("│ ", Style::default().fg(BORDER)));
-            left.push(Span::styled(format!("{} ", t.info.table.name), Style::default().fg(CYAN)));
+            left.push(Span::styled(format!("{} ", crate::util::ident(&t.info.table.name)), Style::default().fg(CYAN)));
             left.extend(privilege_spans(t.privileges()));
             let pending = t.grid.pending_count();
             if pending > 0 {
@@ -248,7 +275,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         right.push(Span::styled(format!("passwords: {:?}{vault} ", app.config.secret_backend).to_lowercase(), dim()));
     }
     if let Some(busy) = &app.busy {
-        right.insert(0, Span::styled(format!("{} {busy}… ", spinner(app)), Style::default().fg(CYAN)));
+        right.insert(0, Span::styled(format!("{} {}… ", spinner(app), safe_line(busy)), Style::default().fg(CYAN)));
     }
     // The right part yields to the left one (access level, transport).
     let left = Line::from(left);
@@ -274,9 +301,11 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
 }
 
-/// Clears an area and draws a modal frame; returns the inner area.
+/// Clears an area and draws a modal frame; returns the inner area. The
+/// title may hold names from the database: it is made safe to draw.
 pub fn modal(frame: &mut Frame, area: Rect, title: &str, color: ratatui::style::Color) -> Rect {
     frame.render_widget(Clear, area);
+    let title = crate::util::fit(title, area.width.saturating_sub(4) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

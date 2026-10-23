@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_width::UnicodeWidthStr;
 
 use crate::db::{CellKind, Driver, Statement, TableRef, TableStructure, Value, sql};
+use crate::util::{ident, width_up_to};
 
 const MAX_COL_WIDTH: usize = 40;
 const MIN_COL_WIDTH: usize = 4;
@@ -144,6 +145,8 @@ impl Grid {
         self.clear_edits();
     }
 
+    /// Column widths from the names and the values, as shown; values are
+    /// only measured as far as a column can be wide.
     fn compute_widths(&mut self) {
         self.widths = self
             .columns
@@ -154,12 +157,26 @@ impl Grid {
                     .rows
                     .iter()
                     .take(500)
-                    .map(|r| r.get(i).and_then(|v| v.as_deref()).map(display_width).unwrap_or(4))
+                    .map(|r| r.get(i).and_then(|v| v.as_deref()).map_or(4, |v| width_up_to(v, MAX_COL_WIDTH)))
                     .max()
                     .unwrap_or(0);
-                content.max(name.width()).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+                content.max(ident(name).width()).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
             })
             .collect();
+    }
+
+    /// When cell (`row`, `col`) shows only the start of a value too large to
+    /// load in full: the size of the whole value's text.
+    pub fn cut(&self, row: usize, col: usize) -> Option<u64> {
+        match self.cell(row, col).1 {
+            CellState::Clean | CellState::Deleted => self.kind(row, col).truncated(),
+            CellState::Edited | CellState::Inserted => None,
+        }
+    }
+
+    /// How many fetched values were too large to load in full.
+    pub fn cut_count(&self) -> usize {
+        self.kinds.iter().flatten().filter(|k| k.truncated().is_some()).count()
     }
 
     pub fn total_rows(&self) -> usize {
@@ -424,9 +441,10 @@ impl Grid {
                         Some(value) => Ok((info, Some(value))),
                         None => Err(format!(
                             "The key {} = {} of a row cannot be matched exactly: it is not shown as stored \
-                             (binary data or text that is not UTF-8). Change this row with SQL instead.",
+                             (binary data, text that is not UTF-8, or a value too large to load in full). \
+                             Change this row with SQL instead.",
                             info.name,
-                            text.as_deref().unwrap_or("NULL")
+                            crate::util::fit(text.as_deref().unwrap_or("NULL"), 80)
                         )),
                     }
                 })
@@ -458,10 +476,6 @@ impl Grid {
         }
         Ok(out)
     }
-}
-
-pub fn display_width(s: &str) -> usize {
-    s.lines().next().map(|l| l.width()).unwrap_or(0) + usize::from(s.contains('\n'))
 }
 
 #[cfg(test)]

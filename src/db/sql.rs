@@ -38,7 +38,7 @@ impl Value {
             // Shown as Rust's shortest form that reads back as the same f64.
             CellKind::Real => text.parse().ok().map(Value::Real),
             CellKind::Bytes => parse_hex(text).map(Value::Bytes),
-            CellKind::Inexact => None,
+            CellKind::Inexact | CellKind::Truncated(_) => None,
         }
     }
 
