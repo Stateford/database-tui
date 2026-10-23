@@ -118,7 +118,16 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
                         WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey))::text,
                 CASE WHEN a.attidentity IN ('a', 'd') THEN 'identity'
                      WHEN a.attgenerated = 's' THEN 'generated'
-                     ELSE NULL END
+                     ELSE NULL END,
+                -- Cast target for bound values: domains resolved to their base
+                -- type, no typmod (-1 keeps bpchar from turning into char(1)).
+                (WITH RECURSIVE base(oid, typtype, typbasetype) AS (
+                     SELECT t.oid, t.typtype, t.typbasetype FROM pg_catalog.pg_type t WHERE t.oid = a.atttypid
+                     UNION ALL
+                     SELECT t.oid, t.typtype, t.typbasetype
+                     FROM pg_catalog.pg_type t JOIN base b ON t.oid = b.typbasetype
+                     WHERE b.typtype = 'd')
+                 SELECT format_type(base.oid, -1) FROM base WHERE base.typtype <> 'd')::text
          FROM pg_catalog.pg_attribute a
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -139,6 +148,7 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
             default: text_col(row, 3),
             primary_key: truthy(text_col(row, 4).as_deref()),
             extra: text_col(row, 5),
+            base_type: text_col(row, 6).unwrap_or_default(),
         })
         .collect();
 
@@ -164,5 +174,5 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
             primary: truthy(text_col(row, 3).as_deref()),
         })
         .collect();
-    Ok(TableStructure { columns, indexes })
+    Ok(TableStructure { columns, indexes, non_transactional_engine: None })
 }

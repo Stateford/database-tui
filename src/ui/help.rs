@@ -66,6 +66,14 @@ const STANDARD: &[Section] = &[
         ],
     ),
     (
+        "Commit preview",
+        &[
+            ("y  Enter", "commit"),
+            ("!", "commit anyway on tables that cannot roll back (MyISAM…)"),
+            ("Esc", "back to editing"),
+        ],
+    ),
+    (
         "SQL editor",
         &[("F5  Ctrl-E", "run (selection only, if any)"), ("Tab", "move to results"), ("Esc", "leave editor")],
     ),
@@ -113,6 +121,14 @@ const VIM: &[Section] = &[
             ("dd", "mark / unmark row for deletion"),
             ("u", "undo last staged change"),
             (":w  Ctrl-s", "review & commit staged changes"),
+        ],
+    ),
+    (
+        "Commit preview",
+        &[
+            ("y  Enter", "commit"),
+            ("!", "commit anyway on tables that cannot roll back (MyISAM…)"),
+            ("Esc", "back to editing"),
         ],
     ),
     (

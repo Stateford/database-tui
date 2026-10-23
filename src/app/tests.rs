@@ -173,3 +173,68 @@ async fn renders_at_any_size() {
         render(&mut app, 12, 5);
     }
 }
+
+/// Audit H1: text that ends a string early on the server must not get
+/// past the filter validator or the read-only SQL editor.
+#[tokio::test]
+async fn hidden_statements_are_refused() {
+    let (_dir, mut app, _rx) = open_people(KeymapMode::Standard, true).await;
+    app.on_key(key(KeyCode::Char('/')));
+    assert!(matches!(app.popup, Some(Popup::Prompt(_))));
+    type_str(&mut app, r"name='\'); DELETE FROM people; --");
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.toast.as_ref().unwrap().text.contains("Invalid filter"));
+    assert!(table(&app).filter.is_none());
+
+    app.on_key(key(KeyCode::Char('3')));
+    type_str(&mut app, r"SELECT 'x\'; COMMIT; DELETE FROM people; --'");
+    app.on_key(key(KeyCode::F(5)));
+    let b = app.browser.as_ref().unwrap();
+    assert!(!b.query.running);
+    assert!(b.query.message.as_ref().unwrap().0.contains("Refused COMMIT"), "{:?}", b.query.message);
+}
+
+/// Audit L10: MyISAM and similar engines cannot roll back, so committing
+/// several statements needs an explicit `!` and failures say what was kept.
+#[tokio::test]
+async fn non_transactional_tables_need_explicit_confirmation() {
+    let (_dir, mut app, mut rx) = open_people(KeymapMode::Standard, false).await;
+    let t = app.browser.as_mut().unwrap().table.as_mut().unwrap();
+    t.structure.as_mut().unwrap().non_transactional_engine = Some("MyISAM".into());
+    app.on_key(key(KeyCode::Char('2')));
+    assert!(render(&mut app, 120, 30).contains("MyISAM: no transactions"));
+    app.on_key(key(KeyCode::Char('1')));
+
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace)); // name of row 1 -> NULL
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Delete)); // delete row 2
+    app.on_key(ctrl('s'));
+    let screen = render(&mut app, 120, 30);
+    assert!(screen.contains("MyISAM tables do not support transactions"), "{screen}");
+    assert!(screen.contains("Press ! to commit anyway"), "{screen}");
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(app.popup, Some(Popup::Commit { .. })), "Enter alone must not commit");
+    assert!(app.busy.is_none());
+    assert!(app.toast.as_ref().unwrap().text.contains("press !"));
+
+    // Row 2 disappears before the commit: the delete matches nothing.
+    let db = app.browser.as_ref().unwrap().db.clone();
+    db.run_query("DELETE FROM people WHERE id = 2", false).await.unwrap();
+    app.on_key(key(KeyCode::Char('!')));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
+    let Some(Popup::Message { body, .. }) = &app.popup else { panic!("expected an error") };
+    assert!(body.contains("MyISAM tables do not support transactions"), "{body}");
+    app.on_key(key(KeyCode::Esc));
+
+    // A single statement cannot be half applied: plain `y` commits it.
+    app.on_key(ctrl('z'));
+    assert_eq!(table(&app).grid.pending_count(), 1);
+    app.on_key(ctrl('s'));
+    let screen = render(&mut app, 120, 30);
+    assert!(screen.contains("MyISAM tables do not support transactions") && !screen.contains("Press !"), "{screen}");
+    app.on_key(key(KeyCode::Char('y')));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none() && !table(a).loading && !table(a).grid.has_pending()).await;
+    let rs = db.run_query("SELECT name FROM people ORDER BY id", false).await.unwrap();
+    assert_eq!(rs.rows, vec![vec![None]]);
+}

@@ -105,6 +105,7 @@ pub(super) async fn structure(pool: &SqlitePool, table: &TableRef) -> Result<Tab
                 Some("2" | "3") => Some("generated".into()),
                 _ => None,
             },
+            base_type: String::new(),
         })
         .collect();
 
@@ -142,5 +143,5 @@ pub(super) async fn structure(pool: &SqlitePool, table: &TableRef) -> Result<Tab
             name,
         });
     }
-    Ok(TableStructure { columns, indexes })
+    Ok(TableStructure { columns, indexes, non_transactional_engine: None })
 }

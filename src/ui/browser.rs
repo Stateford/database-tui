@@ -267,6 +267,12 @@ fn draw_structure(frame: &mut Frame, b: &mut Browser, area: Rect) {
     if let Some(reason) = &b.session.read_only_reason {
         privs.push(Span::styled(format!("  (session read-only: {reason})"), Style::default().fg(YELLOW)));
     }
+    if let Some(engine) = &s.non_transactional_engine {
+        privs.push(Span::styled(
+            format!("  ⚠ {engine}: no transactions, commits cannot roll back"),
+            Style::default().fg(ORANGE),
+        ));
+    }
     let header_style = Style::default().fg(FG_DIM).bg(SURFACE).add_modifier(Modifier::BOLD);
     let rows: Vec<Row> = s
         .columns

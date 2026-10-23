@@ -147,7 +147,13 @@ pub struct SchemaInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ColumnInfo {
     pub name: String,
+    /// Type as shown to the user, e.g. `character varying(40)`.
     pub data_type: String,
+    /// PostgreSQL only: the type that bound values are cast to. It has no
+    /// length or precision modifier and domains are resolved to their base
+    /// type, because an explicit cast to `varchar(40)` silently truncates;
+    /// the server's assignment rules then reject values that do not fit.
+    pub base_type: String,
     pub nullable: bool,
     pub default: Option<String>,
     pub primary_key: bool,
@@ -167,6 +173,9 @@ pub struct IndexInfo {
 pub struct TableStructure {
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
+    /// MySQL storage engine of the table when it cannot roll back
+    /// (MyISAM, MEMORY…): a failed commit keeps the statements before it.
+    pub non_transactional_engine: Option<String>,
 }
 
 /// Rows returned by a query; every value is rendered as text, `None` is SQL NULL.
@@ -367,14 +376,16 @@ impl Database {
         }
     }
 
-    pub async fn fetch_page(&self, table: &TableRef, req: &PageRequest) -> Result<ResultSet> {
+    /// One page of a table. `read_only` runs it like a read-only
+    /// [`run_query`](Self::run_query), as the filter is user-supplied SQL.
+    pub async fn fetch_page(&self, table: &TableRef, req: &PageRequest, read_only: bool) -> Result<ResultSet> {
         let sql = sql::select_page(self.driver(), table, req);
-        self.run_raw(&sql, req.limit.max(1)).await
+        self.run_query_limited(&sql, req.limit.max(1), read_only).await
     }
 
-    pub async fn count_rows(&self, table: &TableRef, filter: Option<&str>) -> Result<u64> {
+    pub async fn count_rows(&self, table: &TableRef, filter: Option<&str>, read_only: bool) -> Result<u64> {
         let sql = sql::count_rows(self.driver(), table, filter);
-        let rs = self.run_raw(&sql, 1).await?;
+        let rs = self.run_query_limited(&sql, 1, read_only).await?;
         let value = rs.rows.first().and_then(|r| r.first().cloned().flatten()).unwrap_or_default();
         value.trim().parse::<u64>().with_context(|| format!("unexpected row count {value:?}"))
     }
@@ -382,30 +393,27 @@ impl Database {
     /// Run SQL typed by the user. When `read_only` is set the statement is
     /// executed inside a read-only transaction that is always rolled back.
     pub async fn run_query(&self, query: &str, read_only: bool) -> Result<ResultSet> {
+        self.run_query_limited(query, QUERY_ROW_LIMIT, read_only).await
+    }
+
+    /// With `read_only`, the database itself refuses writes: the SQL runs in
+    /// a read-only transaction started just for it and always rolled back
+    /// (PostgreSQL, MySQL), or with `PRAGMA query_only` (SQLite). This does
+    /// not depend on session defaults that the SQL could change; it relies on
+    /// `sql::write_keyword` refusing text that ends the transaction.
+    async fn run_query_limited(&self, query: &str, limit: usize, read_only: bool) -> Result<ResultSet> {
         if !read_only {
-            return self.run_raw(query, QUERY_ROW_LIMIT).await;
+            return self.run_raw(query, limit).await;
         }
         match self {
             Database::Postgres(p) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("START TRANSACTION READ ONLY").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("ROLLBACK").await;
-                result
+                run_guarded(p.acquire().await?, "START TRANSACTION READ ONLY", "ROLLBACK", query, limit).await
             }
             Database::MySql(p) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("START TRANSACTION READ ONLY").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("ROLLBACK").await;
-                result
+                run_guarded(p.acquire().await?, "START TRANSACTION READ ONLY", "ROLLBACK", query, limit).await
             }
             Database::Sqlite(p, _) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("PRAGMA query_only = ON").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("PRAGMA query_only = OFF").await;
-                result
+                run_guarded(p.acquire().await?, "PRAGMA query_only = ON", "PRAGMA query_only = OFF", query, limit).await
             }
         }
     }
@@ -467,13 +475,38 @@ impl Database {
 
 fn check_affected(st: &Statement, affected: u64) -> Result<u64> {
     if st.expect_one && affected != 1 {
+        // Not "all changes": non-transactional MySQL engines keep earlier
+        // statements; the app explains that case.
         bail!(
             "expected to change exactly 1 row but {affected} would be affected; \
-             the row may have been modified elsewhere. All changes were rolled back.\n{}",
+             the row may have been modified elsewhere. The transaction was rolled back.\n{}",
             st.sql
         );
     }
     Ok(affected)
+}
+
+/// Runs `query` on `conn` between `enter` and `leave`. A connection that
+/// could not be reset is closed instead of going back to the pool.
+async fn run_guarded<DB>(
+    mut conn: sqlx::pool::PoolConnection<DB>,
+    enter: &'static str,
+    leave: &'static str,
+    query: &str,
+    limit: usize,
+) -> Result<ResultSet>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Row: CellText,
+    DB::QueryResult: QueryResultExt,
+{
+    conn.execute(enter).await?;
+    let result = run_raw_on(&mut *conn, query, limit).await;
+    if conn.execute(leave).await.is_err() {
+        conn.close_on_drop();
+    }
+    result
 }
 
 /// Decodes a single value to display text. Implemented per driver because the

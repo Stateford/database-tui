@@ -15,7 +15,10 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
   and highlighted, and you can undo them. Committing first shows a preview of the generated SQL,
   then runs everything in **one transaction**. Each update or delete targets exactly one row by
   primary key, and if any statement would touch a different number of rows, the whole commit is
-  rolled back.
+  rolled back. Values go through the database's normal checks, so one that does not fit the
+  column (too long for `varchar(n)`, say) is rejected rather than cut short. MySQL tables on an
+  engine without transactions (MyISAM, MEMORY…) cannot be rolled back: the preview warns about
+  this, and committing several changes to them needs an explicit `!`.
 - **SQL editor**: a multi-line editor with a result grid. You can run the whole buffer or only
   the selection.
 - **Vim or standard keys**: arrows/F-keys/Ctrl shortcuts by default, or a vim-style scheme
@@ -51,9 +54,32 @@ The status bar shows the result:
 
 Without the right privilege, the edit, delete and insert keys do nothing except show a short
 explanation, and their hints disappear from the footer. Rows can only be edited or deleted when
-the table has a primary key. In the SQL editor, a fully read-only session refuses any statement
-that writes before sending it. Statements also run inside a read-only transaction as a second
-safeguard.
+the table has a primary key.
+
+### What read-only covers
+
+In a read-only session (a profile marked read-only, `--read-only`, a read-only server, or an
+account without write privileges):
+
+- edits cannot be staged or committed;
+- the SQL editor refuses, before sending anything, every statement that writes, changes
+  settings (`SET`, `set_config()`, `PRAGMA name = value`) or controls transactions (`BEGIN`,
+  `COMMIT`, `ROLLBACK`…), as well as text it cannot check reliably (an unterminated string or
+  comment, MySQL `/*! … */` comments);
+- as a second safeguard, everything that is sent (SQL editor queries, page loads and row counts,
+  including table filters) runs inside a read-only transaction that is always rolled back
+  (`PRAGMA query_only` on SQLite), so the database itself rejects writes.
+
+Table filters are checked in every session: a filter must be a single condition, without `;`,
+comments or unbalanced parentheses. The checks follow each database's quoting rules, including
+settings that change them (`standard_conforming_strings`, MySQL `NO_BACKSLASH_ESCAPES` and
+`ANSI_QUOTES`).
+
+Read-only mode does not stop side effects that a database allows inside a read-only
+transaction: advisory locks (`pg_advisory_lock`, MySQL `GET_LOCK`), functions that work through
+another connection (`dblink`) or outside the database (untrusted procedural languages), and
+anything else a server-side function may do. Those are governed by the account's privileges.
+For a hard guarantee, connect with an account that can only read.
 
 ## Screenshots
 
@@ -80,6 +106,7 @@ cargo build --release && ./target/release/dbtui
 ```sh
 dbtui                 # connection manager
 dbtui "prod replica"  # open a saved connection by name
+dbtui --read-only "prod replica"  # ...without allowing any change, whatever the profile says
 dbtui ./app.db        # open a SQLite file directly (add --read-only to be safe)
 dbtui --vim           # use (and remember) vim keys
 ```

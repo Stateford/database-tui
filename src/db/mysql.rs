@@ -141,6 +141,7 @@ pub(super) async fn structure(pool: &MySqlPool, table: &TableRef) -> Result<Tabl
             default: text_col(row, 3),
             primary_key: text_col(row, 4).as_deref() == Some("PRI"),
             extra: text_col(row, 5).filter(|s| !s.is_empty()),
+            base_type: String::new(),
         })
         .collect();
     let rows = sqlx::query(
@@ -167,5 +168,46 @@ pub(super) async fn structure(pool: &MySqlPool, table: &TableRef) -> Result<Tabl
             }
         })
         .collect();
-    Ok(TableStructure { columns, indexes })
+    let engine = sqlx::query(
+        "SELECT CAST(t.ENGINE AS CHAR), CAST(e.TRANSACTIONS AS CHAR)
+         FROM information_schema.TABLES t
+         LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE
+         WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?",
+    )
+    .bind(&table.schema)
+    .bind(&table.name)
+    .fetch_optional(pool)
+    .await?;
+    let non_transactional_engine =
+        engine.and_then(|row| non_transactional(text_col(&row, 0), text_col(&row, 1).as_deref()));
+    Ok(TableStructure { columns, indexes, non_transactional_engine })
+}
+
+/// Returns the engine's name when it cannot roll back a transaction.
+/// `transactions` is the `TRANSACTIONS` column of `information_schema.ENGINES`.
+fn non_transactional(engine: Option<String>, transactions: Option<&str>) -> Option<String> {
+    // Views have no engine of their own.
+    let engine = engine.filter(|e| !e.is_empty())?;
+    let transactional = match transactions {
+        Some(flag) => flag.eq_ignore_ascii_case("YES"),
+        // Not listed: only trust engines known to be transactional.
+        None => matches!(engine.to_ascii_lowercase().as_str(), "innodb" | "ndbcluster" | "ndb" | "rocksdb"),
+    };
+    (!transactional).then_some(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_transactional;
+
+    #[test]
+    fn engines_without_transactions() {
+        let check = |engine: Option<&str>, tx: Option<&str>| non_transactional(engine.map(Into::into), tx);
+        assert_eq!(check(Some("InnoDB"), Some("YES")), None);
+        assert_eq!(check(Some("MyISAM"), Some("NO")), Some("MyISAM".into()));
+        assert_eq!(check(Some("MEMORY"), Some("NO")), Some("MEMORY".into()));
+        assert_eq!(check(Some("InnoDB"), None), None);
+        assert_eq!(check(Some("Aria"), None), Some("Aria".into()));
+        assert_eq!(check(None, None), None);
+    }
 }

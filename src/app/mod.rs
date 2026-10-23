@@ -148,7 +148,14 @@ pub enum Popup {
     CellEditor(Box<CellEditor>),
     CellView { title: String, text: String, scroll: u16 },
     Prompt(Prompt),
-    Commit { statements: Vec<Statement>, scroll: u16 },
+    // `non_transactional`: engine of a MySQL table that cannot roll back.
+    Commit { statements: Vec<Statement>, scroll: u16, non_transactional: Option<String> },
+}
+
+/// Several statements on a table that cannot roll back are only committed
+/// after an explicit `!`: if one fails, the ones before it stay applied.
+pub fn commit_needs_force(statements: &[Statement], non_transactional: Option<&String>) -> bool {
+    non_transactional.is_some() && statements.len() > 1
 }
 
 pub struct App {
@@ -908,17 +915,30 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => None,
                 _ => Some(Popup::Confirm { title, message, action }),
             },
-            Popup::Commit { statements, scroll } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.apply_statements(statements);
-                    None
+            Popup::Commit { statements, scroll, non_transactional } => {
+                let force = commit_needs_force(&statements, non_transactional.as_ref());
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !force => {
+                        self.apply_statements(statements, non_transactional);
+                        None
+                    }
+                    KeyCode::Char('!') if force => {
+                        self.apply_statements(statements, non_transactional);
+                        None
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
+                    code => {
+                        if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
+                            self.notify(Level::Warning, "This table cannot roll back: press ! to commit anyway");
+                        }
+                        Some(Popup::Commit {
+                            statements,
+                            scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
+                            non_transactional,
+                        })
+                    }
                 }
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
-                _ => Some(Popup::Commit {
-                    statements,
-                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
-                }),
-            },
+            }
             Popup::Form(mut form) => match form.handle_key(key) {
                 FormOutcome::None => Some(Popup::Form(form)),
                 FormOutcome::Cancel => None,
@@ -1060,8 +1080,9 @@ impl App {
                 }
             }
             PromptKind::Filter => {
+                let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
                 let value = p.input.value().trim().to_string();
-                if let Err(e) = sql::validate_filter(&value) {
+                if let Err(e) = sql::validate_filter(driver, &value) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
                 }
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
@@ -1174,7 +1195,8 @@ impl App {
             }
             "run" if connected => self.run_query(),
             "filter" | "where" if connected => {
-                if let Err(e) = sql::validate_filter(arg) {
+                let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
+                if let Err(e) = sql::validate_filter(driver, arg) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
                 }
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
@@ -1544,6 +1566,8 @@ impl App {
         if b.tab == Tab::Query {
             return;
         }
+        // The filter is user SQL: same read-only guard as the SQL editor.
+        let read_only = b.fully_read_only();
         let Some(t) = &mut b.table else { return };
         if t.grid.has_pending() {
             let hint = match self.config.keymap {
@@ -1577,11 +1601,11 @@ impl App {
                 _ => &[],
             };
             req.default_order = columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
-            let data = db.fetch_page(&table, &req).await.map_err(err_text);
+            let data = db.fetch_page(&table, &req, read_only).await.map_err(err_text);
             let ok = data.is_ok();
             let _ = tx.send(AppEvent::Page { seq, structure, data });
             if ok {
-                let count = db.count_rows(&table, req.filter.as_deref()).await.map_err(err_text);
+                let count = db.count_rows(&table, req.filter.as_deref(), read_only).await.map_err(err_text);
                 let _ = tx.send(AppEvent::Count { seq, count });
             }
         });
@@ -1603,11 +1627,11 @@ impl App {
             return self.notify(Level::Info, "Nothing to run");
         }
         let read_only = b.fully_read_only();
-        if read_only && let Some(keyword) = sql::write_keyword(&sql) {
+        if read_only && let Some(keyword) = sql::write_keyword(b.db.driver(), &sql) {
             let reason =
                 b.session.read_only_reason.clone().unwrap_or_else(|| "your account has no write permissions".into());
             b.query.message = Some((format!("🔒 Refused {keyword}: read-only session ({reason})"), true));
-            return self.notify(Level::Warning, format!("🔒 Read-only: {keyword} statements are not allowed"));
+            return self.notify(Level::Warning, format!("🔒 Read-only: refused {keyword}"));
         }
         b.query.seq += 1;
         b.query.running = true;
@@ -1632,20 +1656,31 @@ impl App {
         }
         let Some(structure) = &t.structure else { return };
         match t.grid.build_statements(b.db.driver(), &t.info.table, structure) {
-            Ok(statements) => self.popup = Some(Popup::Commit { statements, scroll: 0 }),
+            Ok(statements) => {
+                let non_transactional = structure.non_transactional_engine.clone();
+                self.popup = Some(Popup::Commit { statements, scroll: 0, non_transactional })
+            }
             Err(e) => {
                 self.popup = Some(Popup::Message { title: "Cannot commit".into(), body: e, error: true, scroll: 0 })
             }
         }
     }
 
-    fn apply_statements(&mut self, statements: Vec<Statement>) {
+    fn apply_statements(&mut self, statements: Vec<Statement>, non_transactional: Option<String>) {
         let Some(b) = &self.browser else { return };
         self.busy = Some(format!("Committing {} statement(s)", statements.len()));
+        // The database's "rolled back" is not true for these engines.
+        let note = non_transactional.filter(|_| statements.len() > 1).map(|engine| {
+            format!(
+                "\n\n⚠ {engine} tables do not support transactions: statements that ran before the failing \
+                 one were kept. Reload the table to see what changed."
+            )
+        });
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(AppEvent::Committed(db.apply(&statements).await.map_err(err_text)));
+            let result = db.apply(&statements).await.map_err(|e| err_text(e) + note.as_deref().unwrap_or_default());
+            let _ = tx.send(AppEvent::Committed(result));
         });
     }
 

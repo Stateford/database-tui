@@ -33,7 +33,7 @@ ARGS:
 OPTIONS:
     --vim            use vim-style keys (saved as your preference)
     --standard       use standard keys (saved as your preference)
-    --read-only      open FILE.db read-only
+    --read-only      open the CONNECTION or FILE.db read-only
     -h, --help       show this help
     -V, --version    show the version
 
@@ -79,23 +79,7 @@ async fn main() -> Result<()> {
     }
 
     // Resolve what to open at start-up before touching the terminal.
-    let startup = match &args.target {
-        None => None,
-        Some(target) => match config.connections.iter().find(|p| p.name == *target) {
-            Some(p) => Some(p.clone()),
-            None if std::path::Path::new(target).is_file() => {
-                let mut p = ConnectionProfile::new(Driver::Sqlite);
-                p.name = std::path::Path::new(target)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| target.clone());
-                p.path = std::fs::canonicalize(target)?.to_string_lossy().into_owned();
-                p.read_only = args.read_only;
-                Some(p)
-            }
-            None => anyhow::bail!("no saved connection or file named {target:?}"),
-        },
-    };
+    let startup = startup_profile(&config, &args)?;
 
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(config, tx);
@@ -109,6 +93,33 @@ async fn main() -> Result<()> {
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
     result
+}
+
+/// The saved connection or SQLite file named on the command line.
+fn startup_profile(config: &Config, args: &Args) -> Result<Option<ConnectionProfile>> {
+    let Some(target) = &args.target else {
+        if args.read_only {
+            // Don't let the flag look like it protects connections opened later.
+            anyhow::bail!("--read-only needs a CONNECTION or FILE.db to open\n\n{USAGE}");
+        }
+        return Ok(None);
+    };
+    let mut profile = match config.connections.iter().find(|p| p.name == *target) {
+        Some(p) => p.clone(),
+        None if std::path::Path::new(target).is_file() => {
+            let mut p = ConnectionProfile::new(Driver::Sqlite);
+            p.name = std::path::Path::new(target)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| target.clone());
+            p.path = std::fs::canonicalize(target)?.to_string_lossy().into_owned();
+            p
+        }
+        None => anyhow::bail!("no saved connection or file named {target:?}"),
+    };
+    // The flag can only make a saved profile stricter, never looser.
+    profile.read_only |= args.read_only;
+    Ok(Some(profile))
 }
 
 async fn run(
@@ -139,4 +150,42 @@ async fn run(
         b.db.close().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(target: Option<&str>, read_only: bool) -> Args {
+        Args { keymap: None, read_only, target: target.map(Into::into) }
+    }
+
+    #[test]
+    fn read_only_flag_applies_to_saved_connections_and_files() {
+        let mut config = Config::default();
+        let mut saved = ConnectionProfile::new(Driver::Postgres);
+        saved.name = "prod".into();
+        config.connections.push(saved.clone());
+        saved.name = "locked".into();
+        saved.read_only = true;
+        config.connections.push(saved);
+
+        let open = |target, read_only| startup_profile(&config, &args(Some(target), read_only)).unwrap().unwrap();
+        assert!(open("prod", true).read_only);
+        assert!(!open("prod", false).read_only);
+        // A profile marked read-only stays read-only without the flag.
+        assert!(open("locked", false).read_only);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.db");
+        std::fs::File::create(&file).unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let p = open(&file, true);
+        assert_eq!((p.driver, p.name.as_str(), p.read_only), (Driver::Sqlite, "app.db", true));
+        assert!(!open(&file, false).read_only);
+
+        assert!(startup_profile(&config, &args(None, false)).unwrap().is_none());
+        assert!(startup_profile(&config, &args(None, true)).is_err());
+        assert!(startup_profile(&config, &args(Some("missing"), true)).is_err());
+    }
 }

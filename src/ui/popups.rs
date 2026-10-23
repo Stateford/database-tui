@@ -10,7 +10,7 @@ use super::theme::*;
 use super::{centered, help, modal};
 use crate::app::form::{ConnectionForm, Field};
 use crate::app::input::Input;
-use crate::app::{App, Popup};
+use crate::app::{App, Popup, commit_needs_force};
 use crate::config::SecretBackend;
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -41,20 +41,39 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Paragraph::new(message.as_str()).wrap(Wrap { trim: false }), text);
             frame.render_widget(footer(&[("y / Enter", "yes"), ("n / Esc", "no")]), foot);
         }
-        Popup::Commit { statements, scroll } => {
+        Popup::Commit { statements, scroll, non_transactional } => {
+            let force = commit_needs_force(statements, non_transactional.as_ref());
+            let mut head = match non_transactional {
+                None => vec![Line::styled("These statements run in a single transaction:", dim())],
+                Some(engine) => vec![
+                    Line::styled(
+                        format!("⚠ {engine} tables do not support transactions."),
+                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::styled(
+                        "If a statement fails, the ones before it stay applied and cannot be rolled back.",
+                        Style::default().fg(YELLOW),
+                    ),
+                ],
+            };
+            if force {
+                head.push(Line::styled(
+                    "Press ! to commit anyway, or Esc to commit fewer changes at a time.",
+                    Style::default().fg(YELLOW),
+                ));
+            }
+            let head_height = head.len() as u16 + 1;
             // Each statement wraps over several lines, plus a blank separator.
             let text_width = (area.width.min(100).saturating_sub(8)).max(10) as usize;
             let body: usize =
                 statements.iter().map(|s| (s.preview().chars().count() + 2).div_ceil(text_width) + 1).sum();
-            let r = centered(area, 100, (body as u16 + 7).min(area.height.saturating_sub(4)));
+            let r = centered(area, 100, (body as u16 + head_height + 5).min(area.height.saturating_sub(4)));
             let inner = modal(frame, r, &format!("Commit {} change(s)", statements.len()), ORANGE)
                 .inner(Margin { horizontal: 2, vertical: 1 });
-            let [head, text, foot] =
-                Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-            frame.render_widget(
-                Paragraph::new(Line::styled("These statements run in a single transaction:", dim())),
-                head,
-            );
+            let [head_area, text, foot] =
+                Layout::vertical([Constraint::Length(head_height), Constraint::Min(1), Constraint::Length(1)])
+                    .areas(inner);
+            frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), head_area);
             let lines: Vec<Line> = statements
                 .iter()
                 .flat_map(|s| {
@@ -72,7 +91,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((*scroll, 0)), text);
-            frame.render_widget(footer(&[("y / Enter", "commit"), ("Esc", "back to editing")]), foot);
+            let keys: &[(&str, &str)] = if force {
+                &[("!", "commit anyway"), ("Esc", "back to editing")]
+            } else {
+                &[("y / Enter", "commit"), ("Esc", "back to editing")]
+            };
+            frame.render_widget(footer(keys), foot);
         }
         Popup::CellView { title, text, scroll } => {
             let r = centered(area, 90, area.height.saturating_sub(6));

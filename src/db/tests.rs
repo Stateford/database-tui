@@ -60,16 +60,42 @@ async fn paging_values_and_counts() {
     let (_dir, _profile, db) = setup(false).await;
     let table = TableRef::new("main", "people");
     let req = PageRequest { default_order: vec!["id".into()], limit: 2, ..Default::default() };
-    let rs = db.fetch_page(&table, &req).await.unwrap();
+    let rs = db.fetch_page(&table, &req, false).await.unwrap();
     assert_eq!(rs.columns, vec!["id", "name", "score", "photo"]);
     assert_eq!(rs.rows[0], vec![Some("1".into()), Some("Ann".into()), Some("3.5".into()), None]);
     assert_eq!(rs.rows[1], vec![Some("2".into()), Some("Bob".into()), Some("7.0".into()), Some("0xcafe".into())]);
     assert_eq!(rs.rows.len(), 2);
 
     let req = PageRequest { filter: Some("score IS NULL".into()), limit: 10, ..Default::default() };
-    assert_eq!(db.fetch_page(&table, &req).await.unwrap().rows.len(), 1);
-    assert_eq!(db.count_rows(&table, None).await.unwrap(), 3);
-    assert_eq!(db.count_rows(&table, Some("score > 1")).await.unwrap(), 2);
+    for read_only in [false, true] {
+        assert_eq!(db.fetch_page(&table, &req, read_only).await.unwrap().rows.len(), 1);
+        assert_eq!(db.count_rows(&table, None, read_only).await.unwrap(), 3);
+        assert_eq!(db.count_rows(&table, Some("score > 1"), read_only).await.unwrap(), 2);
+    }
+}
+
+/// Audit H1: filters are pasted into the page and count queries, so in a
+/// read-only session they run under the same guard as the SQL editor, and
+/// the validator no longer lets a statement through.
+#[tokio::test]
+async fn read_only_page_loads_cannot_write() {
+    let (_dir, _profile, db) = setup(false).await;
+    let table = TableRef::new("main", "people");
+    let payload = r"name='\'); DELETE FROM people; --";
+    assert!(sql::validate_filter(Driver::Sqlite, payload).is_err());
+
+    // Even a filter that got past validation cannot write.
+    let injected = "1=1); DELETE FROM people; --";
+    let req = PageRequest { filter: Some(injected.into()), limit: 10, ..Default::default() };
+    let err = db.fetch_page(&table, &req, true).await.unwrap_err().to_string();
+    assert!(err.contains("readonly"), "{err}");
+    assert!(db.count_rows(&table, Some(injected), true).await.is_err());
+    assert_eq!(db.count_rows(&table, None, false).await.unwrap(), 3);
+
+    // The guard is lifted afterwards: the pooled connections still write.
+    for _ in 0..3 {
+        db.run_query("UPDATE people SET score = 1 WHERE id = 1", false).await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -361,7 +361,7 @@ mod tests {
             primary_key: pk,
             ..Default::default()
         };
-        TableStructure { columns: vec![col("id", true), col("name", false), col("note", false)], indexes: vec![] }
+        TableStructure { columns: vec![col("id", true), col("name", false), col("note", false)], ..Default::default() }
     }
 
     fn grid() -> Grid {
