@@ -1,0 +1,38 @@
+# Local test databases for dbtui: docker compose -f dev/docker-compose.yml up -d
+name: dbtui-dev
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: dbtui
+      POSTGRES_PASSWORD: dbtui
+      POSTGRES_DB: dbtui
+    ports: ["5432:5432"]
+    volumes:
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbtui"]
+      interval: 2s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: dbtui
+      MYSQL_PASSWORD: dbtui
+      MYSQL_DATABASE: dbtui
+    ports: ["3306:3306"]
+    volumes:
+      - ./mysql:/docker-entrypoint-initdb.d:ro
+      - mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
+      retries: 30
+
+volumes:
+  pgdata:
+  mysqldata:

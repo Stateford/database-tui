@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -23,10 +25,23 @@ use crate::config::write_private;
 
 const KEYRING_SERVICE: &str = "dbtui";
 
+/// How long to wait for the OS keyring. A locked Secret Service keyring can
+/// block forever waiting for an unlock prompt nobody can see (e.g. on WSL).
+const KEYRING_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Runs a keyring operation on a dedicated thread: some platform backends
-/// drive their own executor and must not run on the async runtime.
-fn on_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::spawn(f).join().expect("keyring thread panicked")
+/// drive their own executor and must not run on the async runtime. Gives up
+/// after `KEYRING_TIMEOUT`, leaving the stuck thread behind.
+fn on_thread<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(KEYRING_TIMEOUT) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => bail!("the OS keyring did not respond (is it locked?)"),
+        Err(RecvTimeoutError::Disconnected) => bail!("keyring thread panicked"),
+    }
 }
 
 pub fn keyring_set(id: &str, password: &str) -> Result<()> {

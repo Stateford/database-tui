@@ -57,6 +57,12 @@ pub enum AppEvent {
         result: Result<ResultSet, String>,
     },
     Committed(Result<u64, String>),
+    KeyringStored {
+        id: String,
+        password: Zeroizing<String>,
+        result: Result<(), String>,
+    },
+    KeyringRemoved(Result<(), String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1373,22 +1379,35 @@ impl App {
 
     /// Saves a password using the configured backend (keyring first, vault as fallback).
     fn store_password(&mut self, id: &str, password: &str) {
-        let backend = self.config.secret_backend;
-        if backend != SecretBackend::Vault {
-            match secrets::keyring_set(id, password) {
-                Ok(()) => {
-                    self.set_credential(id, CredentialStore::Keyring);
-                    self.notify(Level::Success, "Password saved in the OS keyring");
-                    return;
-                }
-                Err(e) if backend == SecretBackend::Keyring => {
-                    self.notify(Level::Error, format!("Could not save password: {}", err_text(e)));
-                    return;
-                }
-                Err(_) => {}
-            }
+        if self.config.secret_backend == SecretBackend::Vault {
+            return self.store_in_vault(id, password);
         }
-        self.store_in_vault(id, password);
+        // The keyring can block for a long time (e.g. waiting to be unlocked),
+        // so it is never called on the UI thread; the result comes back as
+        // `AppEvent::KeyringStored`.
+        let (id, password) = (id.to_string(), Zeroizing::new(password.to_string()));
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = secrets::keyring_set(&id, &password).map_err(err_text);
+            let _ = tx.send(AppEvent::KeyringStored { id, password, result });
+        });
+    }
+
+    fn keyring_stored(&mut self, id: &str, password: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.set_credential(id, CredentialStore::Keyring);
+                self.notify(Level::Success, "Password saved in the OS keyring");
+            }
+            // Don't replace whatever dialog the user opened in the meantime with the vault prompt.
+            Err(e)
+                if self.config.secret_backend == SecretBackend::Keyring
+                    || (self.vault.is_none() && self.popup.is_some()) =>
+            {
+                self.notify(Level::Error, format!("Could not save password: {e}"));
+            }
+            Err(_) => self.store_in_vault(id, password),
+        }
     }
 
     fn store_in_vault(&mut self, id: &str, password: &str) {
@@ -1410,7 +1429,13 @@ impl App {
     fn forget_password(&mut self, profile: &ConnectionProfile) {
         let result = match profile.credential {
             CredentialStore::None => Ok(()),
-            CredentialStore::Keyring => secrets::keyring_delete(&profile.id),
+            CredentialStore::Keyring => {
+                let (id, tx) = (profile.id.clone(), self.tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(AppEvent::KeyringRemoved(secrets::keyring_delete(&id).map_err(err_text)));
+                });
+                Ok(())
+            }
             CredentialStore::Vault => match self.vault.as_mut() {
                 Some(v) => v.remove(&profile.id),
                 None => Vault::default_path().and_then(|p| Vault::remove_locked(&p, &profile.id)),
@@ -1656,6 +1681,12 @@ impl App {
                         error: true,
                         scroll: 0,
                     });
+                }
+            }
+            AppEvent::KeyringStored { id, password, result } => self.keyring_stored(&id, &password, result),
+            AppEvent::KeyringRemoved(result) => {
+                if let Err(e) = result {
+                    self.notify(Level::Warning, format!("Could not remove saved password: {e}"));
                 }
             }
             AppEvent::TestResult(result) => {
