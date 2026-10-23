@@ -1,0 +1,1783 @@
+//! Application state and event handling.
+
+pub mod browser;
+pub mod form;
+pub mod grid;
+pub mod input;
+pub mod query;
+#[cfg(test)]
+mod tests;
+
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui_textarea::TextArea;
+use tokio::sync::mpsc::UnboundedSender;
+use zeroize::Zeroizing;
+
+use self::browser::{Browser, Focus, OpenTable, Tab, TreeItem};
+use self::form::{ConnectionForm, FormOutcome};
+use self::grid::Grid;
+use self::input::Input;
+use self::query::{EditorFocus, EditorOutcome, VimMode};
+use crate::config::{Config, ConnectionProfile, CredentialStore, KeymapMode, SecretBackend};
+use crate::db::{
+    Database, Driver, PageRequest, ResultSet, SchemaInfo, SessionInfo, Statement, TableRef, TableStructure, sql,
+};
+use crate::keymap::{Action, Context, Keymap};
+use crate::secrets::{self, Vault};
+
+/// Results of background work, delivered to the UI loop.
+pub enum AppEvent {
+    Connected {
+        profile: ConnectionProfile,
+        db: Database,
+        session: SessionInfo,
+        schemas: Vec<SchemaInfo>,
+        remember: Option<Zeroizing<String>>,
+    },
+    ConnectFailed {
+        profile: ConnectionProfile,
+        error: String,
+        needs_password: bool,
+    },
+    TestResult(Result<String, String>),
+    Schemas(Result<Vec<SchemaInfo>, String>),
+    Page {
+        seq: u64,
+        structure: Option<Result<TableStructure, String>>,
+        data: Result<ResultSet, String>,
+    },
+    Count {
+        seq: u64,
+        count: Result<u64, String>,
+    },
+    Query {
+        seq: u64,
+        result: Result<ResultSet, String>,
+    },
+    Committed(Result<u64, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Connections,
+    Browser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+pub struct Toast {
+    pub text: String,
+    pub level: Level,
+    pub until: Instant,
+}
+
+pub enum ConfirmAction {
+    DeleteProfile(String),
+    Disconnect,
+    Quit,
+    DiscardAndOpen(TableRef),
+    DiscardEdits,
+}
+
+pub enum AfterUnlock {
+    Connect(ConnectionProfile),
+    Store { id: String, password: Zeroizing<String> },
+}
+
+pub struct PasswordPrompt {
+    pub profile: ConnectionProfile,
+    pub input: Input,
+    pub remember: bool,
+    pub focus_remember: bool,
+    pub error: Option<String>,
+}
+
+pub struct VaultPrompt {
+    pub create: bool,
+    pub input: Input,
+    pub confirm: Input,
+    pub focus: usize,
+    pub error: Option<String>,
+    pub then: AfterUnlock,
+}
+
+pub struct CellEditor {
+    pub editor: TextArea<'static>,
+    pub row: usize,
+    pub col: usize,
+    pub column: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub new_row: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Filter,
+    TreeFilter,
+}
+
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub title: String,
+    pub hint: String,
+    pub input: Input,
+}
+
+pub enum Popup {
+    Help { scroll: u16 },
+    Confirm { title: String, message: String, action: ConfirmAction },
+    Message { title: String, body: String, error: bool, scroll: u16 },
+    Form(Box<ConnectionForm>),
+    Password(PasswordPrompt),
+    Vault(VaultPrompt),
+    CellEditor(Box<CellEditor>),
+    CellView { title: String, text: String, scroll: u16 },
+    Prompt(Prompt),
+    Commit { statements: Vec<Statement>, scroll: u16 },
+}
+
+pub struct App {
+    pub config: Config,
+    pub screen: Screen,
+    pub selected_conn: usize,
+    pub browser: Option<Browser>,
+    pub popup: Option<Popup>,
+    /// Vim `:` command line, when open.
+    pub command: Option<Input>,
+    pub toast: Option<Toast>,
+    pub keymap: Keymap,
+    pub vault: Option<Vault>,
+    pub busy: Option<String>,
+    pub tick: usize,
+    pub should_quit: bool,
+    /// Internal register for copy / paste of cell values.
+    pub register: Option<String>,
+    tx: UnboundedSender<AppEvent>,
+}
+
+/// Formats an error with its causes, skipping causes whose text is already
+/// part of the message (sqlx repeats the driver error in its source).
+fn err_text(e: anyhow::Error) -> String {
+    let mut out = String::new();
+    for cause in e.chain() {
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            if !out.is_empty() {
+                out.push_str(": ");
+            }
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
+impl App {
+    pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
+        Self {
+            config,
+            screen: Screen::Connections,
+            selected_conn: 0,
+            browser: None,
+            popup: None,
+            command: None,
+            toast: None,
+            keymap: Keymap::default(),
+            vault: None,
+            busy: None,
+            tick: 0,
+            should_quit: false,
+            register: None,
+            tx,
+        }
+    }
+
+    pub fn keymap_mode(&self) -> KeymapMode {
+        self.config.keymap
+    }
+
+    pub fn notify(&mut self, level: Level, text: impl Into<String>) {
+        let secs = match level {
+            Level::Error => 8,
+            Level::Warning => 5,
+            _ => 3,
+        };
+        self.toast = Some(Toast { text: text.into(), level, until: Instant::now() + Duration::from_secs(secs) });
+    }
+
+    pub fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
+            self.toast = None;
+        }
+    }
+
+    fn save_config(&mut self) {
+        if let Err(e) = self.config.save() {
+            self.notify(Level::Error, format!("Could not save configuration: {}", err_text(e)));
+        }
+    }
+
+    fn set_keymap(&mut self, mode: KeymapMode) {
+        self.config.keymap = mode;
+        self.keymap.clear();
+        if let Some(b) = &mut self.browser {
+            b.query.vim_mode = VimMode::Normal;
+        }
+        self.save_config();
+        let how = match mode {
+            KeymapMode::Vim => "Vim keys enabled (hjkl, gg/G, dd, :w …)",
+            KeymapMode::Standard => "Standard keys enabled (arrows, Enter, Del, Ctrl-S …)",
+        };
+        self.notify(Level::Info, how);
+    }
+
+    // ------------------------------------------------------------------
+    // Input
+    // ------------------------------------------------------------------
+
+    pub fn on_paste(&mut self, text: String) {
+        match &mut self.popup {
+            Some(Popup::Form(form)) => form.paste(&text),
+            Some(Popup::Password(p)) => p.input.insert_str(text.lines().next().unwrap_or_default()),
+            Some(Popup::Vault(v)) => {
+                let target = if v.focus == 0 { &mut v.input } else { &mut v.confirm };
+                target.insert_str(text.lines().next().unwrap_or_default());
+            }
+            Some(Popup::Prompt(p)) => p.input.insert_str(&text.replace('\n', " ")),
+            Some(Popup::CellEditor(c)) => {
+                c.editor.insert_str(text);
+            }
+            Some(_) => {}
+            None => {
+                if let Some(cmd) = &mut self.command {
+                    cmd.insert_str(&text.replace('\n', " "));
+                } else if let Some(b) = &mut self.browser
+                    && b.tab == Tab::Query
+                    && b.focus == Focus::Main
+                    && b.query.focus == EditorFocus::Editor
+                {
+                    b.query.editor.insert_str(text);
+                }
+            }
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        if self.popup.is_some() {
+            self.popup_key(key);
+            return;
+        }
+        if self.command.is_some() {
+            self.command_key(key);
+            return;
+        }
+        match self.screen {
+            Screen::Connections => self.connections_key(key),
+            Screen::Browser => self.browser_key(key),
+        }
+    }
+
+    fn command_key(&mut self, key: KeyEvent) {
+        let Some(cmd) = &mut self.command else { return };
+        match key.code {
+            KeyCode::Esc => self.command = None,
+            KeyCode::Enter => {
+                let text = cmd.value().trim().to_string();
+                self.command = None;
+                self.run_command(&text);
+            }
+            KeyCode::Backspace if cmd.value().is_empty() => self.command = None,
+            _ => {
+                cmd.handle_key(key);
+            }
+        }
+    }
+
+    fn connections_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.keymap.resolve(self.keymap_mode(), Context::Connections, key) else { return };
+        let n = self.config.connections.len();
+        match action {
+            Action::Up => self.selected_conn = self.selected_conn.saturating_sub(1),
+            Action::Down => self.selected_conn = (self.selected_conn + 1).min(n.saturating_sub(1)),
+            Action::Top => self.selected_conn = 0,
+            Action::Bottom => self.selected_conn = n.saturating_sub(1),
+            Action::Select | Action::Right => self.connect_selected(),
+            Action::New => {
+                let profile = ConnectionProfile::new(Driver::Postgres);
+                self.popup = Some(Popup::Form(Box::new(ConnectionForm::new(profile, true))));
+            }
+            Action::EditItem => {
+                if let Some(p) = self.config.connections.get(self.selected_conn).cloned() {
+                    self.popup = Some(Popup::Form(Box::new(ConnectionForm::new(p, false))));
+                }
+            }
+            Action::DeleteItem => {
+                if let Some(p) = self.config.connections.get(self.selected_conn) {
+                    self.popup = Some(Popup::Confirm {
+                        title: "Delete connection".into(),
+                        message: format!("Delete \"{}\" and its saved password?", p.name),
+                        action: ConfirmAction::DeleteProfile(p.id.clone()),
+                    });
+                }
+            }
+            Action::Quit | Action::Back => self.should_quit = true,
+            Action::Help => self.popup = Some(Popup::Help { scroll: 0 }),
+            Action::ToggleKeymap => self.set_keymap(self.keymap_mode().toggled()),
+            Action::CommandLine if self.keymap_mode() == KeymapMode::Vim => self.command = Some(Input::default()),
+            _ => {}
+        }
+    }
+
+    fn browser_key(&mut self, key: KeyEvent) {
+        let mode = self.keymap_mode();
+        let Some(b) = &mut self.browser else { return };
+
+        // The SQL editor consumes most keys itself.
+        if b.focus == Focus::Main && b.tab == Tab::Query && b.query.focus == EditorFocus::Editor {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if key.code == KeyCode::F(5) || (ctrl && key.code == KeyCode::Char('e')) {
+                self.run_query();
+                return;
+            }
+            match b.query.handle_key(key, mode) {
+                EditorOutcome::Handled => {}
+                EditorOutcome::CommandLine => self.command = Some(Input::default()),
+                EditorOutcome::Action(action) => self.browser_action(action),
+            }
+            return;
+        }
+
+        let ctx = match (b.focus, b.tab) {
+            (Focus::Sidebar, _) => Context::Sidebar,
+            (Focus::Main, Tab::Structure) => Context::Structure,
+            (Focus::Main, _) => Context::Grid,
+        };
+        if b.tab == Tab::Query && b.focus == Focus::Main && key.code == KeyCode::F(5) {
+            self.run_query();
+            return;
+        }
+        if let Some(action) = self.keymap.resolve(mode, ctx, key) {
+            self.browser_action(action);
+        }
+    }
+
+    fn browser_action(&mut self, action: Action) {
+        let Some(b) = &mut self.browser else { return };
+        // Actions available everywhere in the browser.
+        match action {
+            Action::Quit => return self.request_quit(),
+            Action::Help => {
+                self.popup = Some(Popup::Help { scroll: 0 });
+                return;
+            }
+            Action::ToggleKeymap => return self.set_keymap(self.keymap_mode().toggled()),
+            Action::CommandLine => {
+                self.command = Some(Input::default());
+                return;
+            }
+            Action::TabData | Action::TabStructure | Action::TabQuery | Action::NextTab | Action::PrevTab => {
+                let idx = b.tab.index();
+                b.tab = match action {
+                    Action::TabData => Tab::Data,
+                    Action::TabStructure => Tab::Structure,
+                    Action::TabQuery => Tab::Query,
+                    Action::NextTab => Tab::ALL[(idx + 1) % 3],
+                    _ => Tab::ALL[(idx + 2) % 3],
+                };
+                b.focus = Focus::Main;
+                if b.tab == Tab::Query {
+                    b.query.focus = EditorFocus::Editor;
+                }
+                return;
+            }
+            Action::FocusNext | Action::FocusPrev => {
+                // Sidebar -> main (-> results on the SQL tab) -> sidebar.
+                let forward = action == Action::FocusNext;
+                match (b.focus, b.tab, b.query.focus) {
+                    (Focus::Sidebar, Tab::Query, _) => {
+                        b.focus = Focus::Main;
+                        b.query.focus = if forward { EditorFocus::Editor } else { EditorFocus::Results };
+                    }
+                    (Focus::Sidebar, _, _) => b.focus = Focus::Main,
+                    (Focus::Main, Tab::Query, EditorFocus::Editor) if forward => b.query.focus = EditorFocus::Results,
+                    (Focus::Main, Tab::Query, EditorFocus::Results) if !forward => b.query.focus = EditorFocus::Editor,
+                    (Focus::Main, _, _) => b.focus = Focus::Sidebar,
+                }
+                return;
+            }
+            Action::FocusSidebar => {
+                b.focus = Focus::Sidebar;
+                return;
+            }
+            Action::FocusMain => {
+                b.focus = Focus::Main;
+                return;
+            }
+            Action::Commit => return self.begin_commit(),
+            _ => {}
+        }
+        match b.focus {
+            Focus::Sidebar => self.sidebar_action(action),
+            Focus::Main => match b.tab {
+                Tab::Structure => self.structure_action(action),
+                Tab::Data | Tab::Query => self.grid_action(action),
+            },
+        }
+    }
+
+    fn sidebar_action(&mut self, action: Action) {
+        let Some(b) = &mut self.browser else { return };
+        let page = 10;
+        match action {
+            Action::Up => b.move_tree(-1),
+            Action::Down => b.move_tree(1),
+            Action::PageUp | Action::HalfPageUp => b.move_tree(-page),
+            Action::PageDown | Action::HalfPageDown => b.move_tree(page),
+            Action::Top => b.tree_selected = 0,
+            Action::Bottom => b.tree_selected = b.tree_items().len().saturating_sub(1),
+            Action::Right => match b.selected_item() {
+                Some(TreeItem::Schema(s)) => b.set_expanded(s, true),
+                Some(TreeItem::Table(..)) => self.open_selected_table(),
+                None => {}
+            },
+            Action::Left => match b.selected_item() {
+                Some(TreeItem::Schema(s)) => b.set_expanded(s, false),
+                Some(TreeItem::Table(s, _)) => b.set_expanded(s, false),
+                None => {}
+            },
+            Action::Select => match b.selected_item() {
+                Some(TreeItem::Schema(s)) => {
+                    let open = b.expanded.contains(&b.schemas[s].name);
+                    b.set_expanded(s, !open);
+                }
+                Some(TreeItem::Table(..)) => self.open_selected_table(),
+                None => {}
+            },
+            Action::Filter => {
+                let current = b.tree_filter.clone();
+                self.popup = Some(Popup::Prompt(Prompt {
+                    kind: PromptKind::TreeFilter,
+                    title: "Find table".into(),
+                    hint: "Type to filter tables by name".into(),
+                    input: Input::new(current),
+                }));
+            }
+            Action::Back => {
+                if !b.tree_filter.is_empty() {
+                    b.tree_filter.clear();
+                    b.clamp_tree();
+                } else {
+                    self.request_disconnect();
+                }
+            }
+            Action::Refresh => self.refresh_schemas(),
+            _ => {}
+        }
+    }
+
+    fn structure_action(&mut self, action: Action) {
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else {
+            if action == Action::Back
+                && let Some(b) = &mut self.browser
+            {
+                b.focus = Focus::Sidebar;
+            }
+            return;
+        };
+        match action {
+            Action::Up => t.structure_scroll = t.structure_scroll.saturating_sub(1),
+            Action::Down => t.structure_scroll = t.structure_scroll.saturating_add(1),
+            Action::PageUp | Action::HalfPageUp => t.structure_scroll = t.structure_scroll.saturating_sub(10),
+            Action::PageDown | Action::HalfPageDown => t.structure_scroll = t.structure_scroll.saturating_add(10),
+            Action::Top => t.structure_scroll = 0,
+            Action::Refresh => {
+                if !t.grid.has_pending() {
+                    t.structure = None;
+                }
+                self.request_page();
+            }
+            Action::Back => {
+                if let Some(b) = &mut self.browser {
+                    b.focus = Focus::Sidebar;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns the grid that currently has focus (table data or query results).
+    fn active_grid(&mut self) -> Option<&mut Grid> {
+        let b = self.browser.as_mut()?;
+        match b.tab {
+            Tab::Data => b.table.as_mut().map(|t| &mut t.grid),
+            Tab::Query => b.query.result.as_mut(),
+            Tab::Structure => None,
+        }
+    }
+
+    fn grid_action(&mut self, action: Action) {
+        let on_query = self.browser.as_ref().is_some_and(|b| b.tab == Tab::Query);
+        // Navigation and read-only actions.
+        if let Some(grid) = self.active_grid() {
+            let handled = match action {
+                Action::Up => {
+                    grid.move_row(-1);
+                    true
+                }
+                Action::Down => {
+                    grid.move_row(1);
+                    true
+                }
+                Action::Left => {
+                    grid.move_col(-1);
+                    true
+                }
+                Action::Right => {
+                    grid.move_col(1);
+                    true
+                }
+                Action::PageUp => {
+                    grid.page(-1.0);
+                    true
+                }
+                Action::PageDown => {
+                    grid.page(1.0);
+                    true
+                }
+                Action::HalfPageUp => {
+                    grid.page(-0.5);
+                    true
+                }
+                Action::HalfPageDown => {
+                    grid.page(0.5);
+                    true
+                }
+                Action::Top => {
+                    grid.top();
+                    true
+                }
+                Action::Bottom => {
+                    grid.bottom();
+                    true
+                }
+                Action::Home => {
+                    grid.home();
+                    true
+                }
+                Action::End => {
+                    grid.end();
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                return;
+            }
+        }
+        match action {
+            Action::View => self.view_cell(),
+            Action::Copy => self.copy_cell(),
+            Action::Back => {
+                if let Some(b) = &mut self.browser {
+                    if b.tab == Tab::Query {
+                        b.query.focus = EditorFocus::Editor;
+                    } else {
+                        b.focus = Focus::Sidebar;
+                    }
+                }
+            }
+            _ if on_query => {
+                if matches!(action, Action::Select | Action::Edit) {
+                    self.view_cell();
+                } else if matches!(action, Action::Refresh) {
+                    self.run_query();
+                }
+            }
+            Action::Select => {
+                // Enter edits when allowed, otherwise shows the value.
+                if self.edit_permission(false).is_ok() {
+                    self.edit_cell();
+                } else {
+                    self.view_cell();
+                }
+            }
+            Action::Edit => self.edit_cell(),
+            Action::SetNull => self.set_current_cell(None),
+            Action::Paste => {
+                let value = self.register.clone();
+                match value {
+                    Some(v) => self.set_current_cell(Some(v)),
+                    None => self.notify(Level::Info, "Nothing to paste — copy a cell first"),
+                }
+            }
+            Action::DeleteRow => self.delete_row(),
+            Action::InsertRow => self.insert_row(),
+            Action::Undo => {
+                if let Some(grid) = self.active_grid()
+                    && !grid.undo()
+                {
+                    self.notify(Level::Info, "Nothing to undo");
+                }
+            }
+            Action::Refresh => self.request_page(),
+            Action::NextPage => self.change_page(1),
+            Action::PrevPage => self.change_page(-1),
+            Action::Filter => self.open_filter_prompt(),
+            Action::Sort => self.toggle_sort(),
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Permissions
+    // ------------------------------------------------------------------
+
+    /// Checks whether the current cell may be edited. `Err` carries the reason.
+    fn edit_permission(&self, set_null: bool) -> Result<(), String> {
+        let b = self.browser.as_ref().ok_or("not connected")?;
+        let t = b.table.as_ref().ok_or("no table open")?;
+        if t.grid.is_empty() {
+            return Err("no rows".into());
+        }
+        let row = t.grid.row;
+        if let Some(reason) = &b.session.read_only_reason {
+            return Err(format!("Read-only session: {reason}"));
+        }
+        if t.grid.is_inserted(row) {
+            return if t.privileges().insert {
+                Ok(())
+            } else {
+                Err(format!("Read-only: no INSERT permission on {}", t.info.table))
+            };
+        }
+        if !t.privileges().update {
+            return Err(format!("Read-only: no UPDATE permission on {}", t.info.table));
+        }
+        if !t.has_primary_key() {
+            return Err(format!("{} has no primary key, so rows cannot be edited safely", t.info.table));
+        }
+        if t.grid.edits.deleted.contains(&row) {
+            return Err("Row is marked for deletion — undo first".into());
+        }
+        if set_null
+            && let Some(col) =
+                t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == t.grid.columns[t.grid.col]))
+            && !col.nullable
+        {
+            return Err(format!("Column {} does not accept NULL", col.name));
+        }
+        Ok(())
+    }
+
+    fn deny(&mut self, reason: String) {
+        self.notify(Level::Warning, format!("🔒 {reason}"));
+    }
+
+    // ------------------------------------------------------------------
+    // Grid editing
+    // ------------------------------------------------------------------
+
+    fn edit_cell(&mut self) {
+        if let Err(reason) = self.edit_permission(false) {
+            return self.deny(reason);
+        }
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
+        let (row, col) = (t.grid.row, t.grid.col);
+        let column = t.grid.columns[col].clone();
+        let info = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == column));
+        let mut editor = TextArea::from(t.grid.cell_text(row, col).unwrap_or_default().lines());
+        editor.move_cursor(ratatui_textarea::CursorMove::Bottom);
+        editor.move_cursor(ratatui_textarea::CursorMove::End);
+        self.popup = Some(Popup::CellEditor(Box::new(CellEditor {
+            editor,
+            row,
+            col,
+            data_type: info.map(|c| c.data_type.clone()).unwrap_or_default(),
+            nullable: info.is_none_or(|c| c.nullable),
+            new_row: t.grid.is_inserted(row),
+            column,
+        })));
+    }
+
+    fn set_current_cell(&mut self, value: Option<String>) {
+        if let Err(reason) = self.edit_permission(value.is_none()) {
+            return self.deny(reason);
+        }
+        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+            let (row, col) = (t.grid.row, t.grid.col);
+            t.grid.set_cell(row, col, value);
+        }
+    }
+
+    fn delete_row(&mut self) {
+        let Some(b) = self.browser.as_ref() else { return };
+        let Some(t) = b.table.as_ref() else { return };
+        if t.grid.is_empty() {
+            return;
+        }
+        let row = t.grid.row;
+        if !t.grid.is_inserted(row) {
+            let denied = if let Some(reason) = &b.session.read_only_reason {
+                Some(format!("Read-only session: {reason}"))
+            } else if !t.privileges().delete {
+                Some(format!("Read-only: no DELETE permission on {}", t.info.table))
+            } else if !t.has_primary_key() {
+                Some(format!("{} has no primary key, so rows cannot be deleted safely", t.info.table))
+            } else {
+                None
+            };
+            if let Some(reason) = denied {
+                return self.deny(reason);
+            }
+        }
+        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+            t.grid.toggle_delete(row);
+        }
+    }
+
+    fn insert_row(&mut self) {
+        let Some(b) = self.browser.as_ref() else { return };
+        let Some(t) = b.table.as_ref() else { return };
+        let denied = if let Some(reason) = &b.session.read_only_reason {
+            Some(format!("Read-only session: {reason}"))
+        } else if !t.privileges().insert {
+            Some(format!("Read-only: no INSERT permission on {}", t.info.table))
+        } else if !t.loaded || t.grid.columns.is_empty() {
+            Some("Table is still loading".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = denied {
+            return self.deny(reason);
+        }
+        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+            t.grid.insert_row();
+            t.grid.home();
+        }
+    }
+
+    fn view_cell(&mut self) {
+        let Some(b) = self.browser.as_ref() else { return };
+        let grid = match b.tab {
+            Tab::Data => b.table.as_ref().map(|t| &t.grid),
+            Tab::Query => b.query.result.as_ref(),
+            Tab::Structure => None,
+        };
+        let Some(grid) = grid.filter(|g| !g.is_empty()) else { return };
+        let column = grid.columns.get(grid.col).cloned().unwrap_or_default();
+        let text = match grid.cell(grid.row, grid.col).0 {
+            grid::CellValue::Value(v) => v.to_string(),
+            grid::CellValue::Null => "NULL".into(),
+            grid::CellValue::Default => "(default)".into(),
+        };
+        self.popup = Some(Popup::CellView { title: column, text: pretty_value(&text), scroll: 0 });
+    }
+
+    fn copy_cell(&mut self) {
+        let text = self.active_grid().and_then(|g| g.current_text());
+        match text {
+            Some(text) => {
+                crate::clipboard::copy(&text);
+                let preview: String = text.chars().take(40).collect();
+                self.register = Some(text);
+                self.notify(Level::Success, format!("Copied “{preview}”"));
+            }
+            None => self.notify(Level::Info, "Cell is NULL — nothing copied"),
+        }
+    }
+
+    fn change_page(&mut self, delta: isize) {
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
+        if t.grid.has_pending() {
+            return self.notify(Level::Warning, "Commit or undo pending changes before changing page");
+        }
+        if delta > 0 && !t.has_next_page() {
+            return self.notify(Level::Info, "Already on the last page");
+        }
+        if delta < 0 && t.page == 0 {
+            return self.notify(Level::Info, "Already on the first page");
+        }
+        t.page = (t.page as isize + delta).max(0) as usize;
+        t.grid.row = 0;
+        self.request_page();
+    }
+
+    fn open_filter_prompt(&mut self) {
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
+        if t.grid.has_pending() {
+            return self.notify(Level::Warning, "Commit or undo pending changes before filtering");
+        }
+        let column = t.grid.columns.get(t.grid.col).cloned();
+        self.popup = Some(Popup::Prompt(Prompt {
+            kind: PromptKind::Filter,
+            title: format!("Filter {}", t.info.table.name),
+            hint: match column {
+                Some(c) => format!("SQL WHERE condition, e.g. {c} IS NOT NULL — empty clears"),
+                None => "SQL WHERE condition — empty clears".into(),
+            },
+            input: Input::new(t.filter.clone().unwrap_or_default()),
+        }));
+    }
+
+    fn toggle_sort(&mut self) {
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
+        if t.grid.has_pending() {
+            return self.notify(Level::Warning, "Commit or undo pending changes before sorting");
+        }
+        let Some(col) = t.grid.columns.get(t.grid.col).cloned() else { return };
+        t.order_by = match &t.order_by {
+            Some((c, true)) if *c == col => Some((col, false)),
+            Some((c, false)) if *c == col => None,
+            _ => Some((col, true)),
+        };
+        t.page = 0;
+        self.request_page();
+    }
+
+    // ------------------------------------------------------------------
+    // Popups
+    // ------------------------------------------------------------------
+
+    fn popup_key(&mut self, key: KeyEvent) {
+        let Some(popup) = self.popup.take() else { return };
+        let vim = self.keymap_mode() == KeymapMode::Vim;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let scroll_delta = |key: &KeyEvent| -> Option<i32> {
+            match key.code {
+                KeyCode::Up => Some(-1),
+                KeyCode::Down => Some(1),
+                KeyCode::PageUp => Some(-10),
+                KeyCode::PageDown => Some(10),
+                KeyCode::Char('k') if vim => Some(-1),
+                KeyCode::Char('j') if vim => Some(1),
+                KeyCode::Char('u') if vim && key.modifiers.contains(KeyModifiers::CONTROL) => Some(-10),
+                KeyCode::Char('d') if vim && key.modifiers.contains(KeyModifiers::CONTROL) => Some(10),
+                _ => None,
+            }
+        };
+        let scrolled = |s: u16, d: i32| (s as i32 + d).max(0) as u16;
+
+        self.popup = match popup {
+            Popup::Help { scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1) => None,
+                _ => Some(Popup::Help { scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)) }),
+            },
+            Popup::Message { title, body, error, scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+                _ => Some(Popup::Message {
+                    title,
+                    body,
+                    error,
+                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
+                }),
+            },
+            Popup::CellView { title, text, scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') | KeyCode::Char('v') => None,
+                KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || key.code == KeyCode::Char('c') => {
+                    crate::clipboard::copy(&text);
+                    self.register = Some(text.clone());
+                    self.notify(Level::Success, "Copied value");
+                    Some(Popup::CellView { title, text, scroll })
+                }
+                _ => Some(Popup::CellView {
+                    title,
+                    text,
+                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
+                }),
+            },
+            Popup::Confirm { title, message, action } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm(action);
+                    self.popup.take()
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => None,
+                _ => Some(Popup::Confirm { title, message, action }),
+            },
+            Popup::Commit { statements, scroll } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.apply_statements(statements);
+                    None
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
+                _ => Some(Popup::Commit {
+                    statements,
+                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
+                }),
+            },
+            Popup::Form(mut form) => match form.handle_key(key) {
+                FormOutcome::None => Some(Popup::Form(form)),
+                FormOutcome::Cancel => None,
+                FormOutcome::Save => {
+                    self.save_form(form);
+                    self.popup.take()
+                }
+                FormOutcome::Test => {
+                    self.test_connection(&form);
+                    Some(Popup::Form(form))
+                }
+            },
+            Popup::Password(mut p) => match key.code {
+                KeyCode::Esc => None,
+                KeyCode::Enter => {
+                    let password = Zeroizing::new(p.input.value().to_string());
+                    let remember = p.remember.then(|| password.clone());
+                    self.spawn_connect(p.profile.clone(), Some(password), remember);
+                    None
+                }
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                    p.focus_remember = !p.focus_remember;
+                    Some(Popup::Password(p))
+                }
+                KeyCode::Char(' ') if p.focus_remember => {
+                    p.remember = !p.remember;
+                    Some(Popup::Password(p))
+                }
+                _ => {
+                    if !p.focus_remember {
+                        p.input.handle_key(key);
+                    }
+                    Some(Popup::Password(p))
+                }
+            },
+            Popup::Vault(mut v) => match key.code {
+                KeyCode::Esc => {
+                    if let AfterUnlock::Store { .. } = v.then {
+                        self.notify(Level::Warning, "Password was not saved");
+                    }
+                    None
+                }
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down if v.create => {
+                    v.focus = 1 - v.focus;
+                    Some(Popup::Vault(v))
+                }
+                KeyCode::Enter if v.create && v.focus == 0 => {
+                    v.focus = 1;
+                    Some(Popup::Vault(v))
+                }
+                KeyCode::Enter => self.submit_vault(v),
+                _ => {
+                    if v.focus == 0 {
+                        v.input.handle_key(key)
+                    } else {
+                        v.confirm.handle_key(key)
+                    };
+                    v.error = None;
+                    Some(Popup::Vault(v))
+                }
+            },
+            Popup::Prompt(mut p) => match key.code {
+                KeyCode::Esc => {
+                    if p.kind == PromptKind::TreeFilter
+                        && let Some(b) = &mut self.browser
+                    {
+                        b.tree_filter.clear();
+                        b.clamp_tree();
+                    }
+                    None
+                }
+                KeyCode::Enter => {
+                    self.submit_prompt(p);
+                    None
+                }
+                _ => {
+                    p.input.handle_key(key);
+                    if p.kind == PromptKind::TreeFilter
+                        && let Some(b) = &mut self.browser
+                    {
+                        b.tree_filter = p.input.value().to_string();
+                        b.tree_selected =
+                            b.tree_items().iter().position(|i| matches!(i, TreeItem::Table(..))).unwrap_or(0);
+                    }
+                    Some(Popup::Prompt(p))
+                }
+            },
+            Popup::CellEditor(mut c) => {
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Esc => None,
+                    KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        c.editor.insert_newline();
+                        Some(Popup::CellEditor(c))
+                    }
+                    KeyCode::Enter => {
+                        let value = c.editor.lines().join("\n");
+                        self.apply_cell_edit(c.row, c.col, Some(value));
+                        None
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        if c.nullable {
+                            self.apply_cell_edit(c.row, c.col, None);
+                            None
+                        } else {
+                            self.notify(Level::Warning, format!("Column {} does not accept NULL", c.column));
+                            Some(Popup::CellEditor(c))
+                        }
+                    }
+                    KeyCode::Char('d') if ctrl && c.new_row => {
+                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                            t.grid.set_default(c.row, c.col);
+                        }
+                        None
+                    }
+                    _ => {
+                        c.editor.input(key);
+                        Some(Popup::CellEditor(c))
+                    }
+                }
+            }
+        };
+    }
+
+    fn apply_cell_edit(&mut self, row: usize, col: usize, value: Option<String>) {
+        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+            t.grid.set_cell(row, col, value);
+            t.grid.row = row;
+            t.grid.col = col;
+        }
+    }
+
+    fn submit_prompt(&mut self, p: Prompt) {
+        match p.kind {
+            PromptKind::TreeFilter => {
+                if let Some(b) = &mut self.browser {
+                    b.tree_filter = p.input.value().to_string();
+                    b.clamp_tree();
+                }
+            }
+            PromptKind::Filter => {
+                let value = p.input.value().trim().to_string();
+                if let Err(e) = sql::validate_filter(&value) {
+                    return self.notify(Level::Error, format!("Invalid filter: {e}"));
+                }
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                    t.filter = (!value.is_empty()).then_some(value);
+                    t.page = 0;
+                    t.grid.row = 0;
+                }
+                self.request_page();
+            }
+        }
+    }
+
+    fn confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeleteProfile(id) => {
+                if let Some(pos) = self.config.connections.iter().position(|p| p.id == id) {
+                    let profile = self.config.connections.remove(pos);
+                    self.forget_password(&profile);
+                    self.selected_conn = self.selected_conn.min(self.config.connections.len().saturating_sub(1));
+                    self.save_config();
+                    self.notify(Level::Success, format!("Deleted {}", profile.name));
+                }
+            }
+            ConfirmAction::Disconnect => self.disconnect(),
+            ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::DiscardAndOpen(table) => {
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                    t.grid.clear_edits();
+                }
+                self.open_table(&table);
+            }
+            ConfirmAction::DiscardEdits => {
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                    t.grid.clear_edits();
+                }
+                self.notify(Level::Info, "Pending changes discarded");
+                self.request_page();
+            }
+        }
+    }
+
+    fn request_quit(&mut self) {
+        let pending = self.browser.as_ref().map(|b| b.pending_count()).unwrap_or(0);
+        if pending > 0 {
+            self.popup = Some(Popup::Confirm {
+                title: "Quit".into(),
+                message: format!("You have {pending} uncommitted change(s). Quit and discard them?"),
+                action: ConfirmAction::Quit,
+            });
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn request_disconnect(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let pending = b.pending_count();
+        let message = if pending > 0 {
+            format!("Disconnect from {} and discard {pending} uncommitted change(s)?", b.profile.name)
+        } else {
+            format!("Disconnect from {}?", b.profile.name)
+        };
+        self.popup = Some(Popup::Confirm { title: "Disconnect".into(), message, action: ConfirmAction::Disconnect });
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(b) = self.browser.take() {
+            let db = b.db.clone();
+            tokio::spawn(async move { db.close().await });
+            self.notify(Level::Info, format!("Disconnected from {}", b.profile.name));
+        }
+        self.screen = Screen::Connections;
+    }
+
+    // ------------------------------------------------------------------
+    // Vim command line
+    // ------------------------------------------------------------------
+
+    pub fn run_command(&mut self, cmd: &str) {
+        let (name, arg) = match cmd.split_once(char::is_whitespace) {
+            Some((n, a)) => (n, a.trim()),
+            None => (cmd, ""),
+        };
+        let connected = self.browser.is_some();
+        match name {
+            "" => {}
+            "q" | "quit" | "close" if connected => self.request_disconnect(),
+            "q!" | "quit!" if connected => self.disconnect(),
+            "q" | "quit" | "qa" | "qall" | "quitall" => self.request_quit(),
+            "q!" | "qa!" | "quit!" => self.should_quit = true,
+            "w" | "write" | "wq" | "x" => self.begin_commit(),
+            "e!" | "discard" => self.confirm(ConfirmAction::DiscardEdits),
+            "e" | "r" | "refresh" | "reload" => {
+                self.request_page();
+                self.refresh_schemas();
+            }
+            "set" => match arg {
+                "vim" | "keymap=vim" => self.set_keymap(KeymapMode::Vim),
+                "novim" | "keymap=standard" | "keymap=std" => self.set_keymap(KeymapMode::Standard),
+                _ => self.notify(Level::Error, format!("Unknown option: {arg} (try :set vim or :set novim)")),
+            },
+            "help" | "h" => self.popup = Some(Popup::Help { scroll: 0 }),
+            "sql" | "query" | "data" | "structure" | "struct" if connected => {
+                let action = match name {
+                    "data" => Action::TabData,
+                    "structure" | "struct" => Action::TabStructure,
+                    _ => Action::TabQuery,
+                };
+                self.browser_action(action);
+            }
+            "run" if connected => self.run_query(),
+            "filter" | "where" if connected => {
+                if let Err(e) = sql::validate_filter(arg) {
+                    return self.notify(Level::Error, format!("Invalid filter: {e}"));
+                }
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                    t.filter = (!arg.is_empty()).then(|| arg.to_string());
+                    t.page = 0;
+                }
+                self.request_page();
+            }
+            "nofilter" if connected => self.run_command("filter"),
+            "sort" if connected => {
+                let mut parts = arg.split_whitespace();
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                    t.order_by = parts.next().map(|c| (c.to_string(), !matches!(parts.next(), Some("desc" | "DESC"))));
+                    t.page = 0;
+                }
+                self.request_page();
+            }
+            "disconnect" if connected => self.request_disconnect(),
+            n if n.chars().all(|c| c.is_ascii_digit()) => {
+                let target = n.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                if let Some(grid) = self.active_grid() {
+                    grid.row = target.min(grid.total_rows().saturating_sub(1));
+                }
+            }
+            _ => self.notify(Level::Error, format!("Not a command: {name}")),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Connections & credentials
+    // ------------------------------------------------------------------
+
+    /// Connects to a profile given on the command line.
+    pub fn start(&mut self, profile: ConnectionProfile) {
+        self.connect(profile);
+    }
+
+    fn connect_selected(&mut self) {
+        if let Some(profile) = self.config.connections.get(self.selected_conn).cloned() {
+            self.connect(profile);
+        }
+    }
+
+    fn connect(&mut self, profile: ConnectionProfile) {
+        if !profile.needs_password() {
+            return self.spawn_connect(profile, None, None);
+        }
+        match profile.credential {
+            CredentialStore::None => self.ask_password(profile, None),
+            // Read from the keyring in the background task.
+            CredentialStore::Keyring => self.spawn_connect(profile, None, None),
+            CredentialStore::Vault => match &self.vault {
+                None => self.open_vault_prompt(AfterUnlock::Connect(profile)),
+                Some(vault) => match vault.get(&profile.id) {
+                    Ok(Some(pw)) => self.spawn_connect(profile, Some(Zeroizing::new(pw)), None),
+                    Ok(None) => self.ask_password(profile, Some("No password saved in the vault".into())),
+                    Err(e) => self.ask_password(profile, Some(err_text(e))),
+                },
+            },
+        }
+    }
+
+    fn ask_password(&mut self, profile: ConnectionProfile, error: Option<String>) {
+        self.popup = Some(Popup::Password(PasswordPrompt {
+            remember: profile.credential != CredentialStore::None,
+            profile,
+            input: Input::default(),
+            focus_remember: false,
+            error,
+        }));
+    }
+
+    fn spawn_connect(
+        &mut self,
+        profile: ConnectionProfile,
+        password: Option<Zeroizing<String>>,
+        remember: Option<Zeroizing<String>>,
+    ) {
+        self.busy = Some(format!("Connecting to {}", profile.name));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let password = match password {
+                Some(p) => Some(p),
+                None if profile.needs_password() && profile.credential == CredentialStore::Keyring => {
+                    let id = profile.id.clone();
+                    let res = tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await;
+                    match res {
+                        Ok(Ok(Some(p))) => Some(Zeroizing::new(p)),
+                        Ok(Ok(None)) => {
+                            let _ = tx.send(AppEvent::ConnectFailed {
+                                profile,
+                                error: "No password found in the OS keyring".into(),
+                                needs_password: true,
+                            });
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            let _ =
+                                tx.send(AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: true });
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::ConnectFailed {
+                                profile,
+                                error: e.to_string(),
+                                needs_password: true,
+                            });
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+            let result = async {
+                let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
+                let session = db.session_info(&profile).await?;
+                let schemas = db.schemas().await?;
+                anyhow::Ok((db, session, schemas))
+            }
+            .await;
+            let event = match result {
+                Ok((db, session, schemas)) => AppEvent::Connected { profile, db, session, schemas, remember },
+                Err(e) => AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: false },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    fn test_connection(&mut self, form: &ConnectionForm) {
+        let profile = match form.to_profile() {
+            Ok(p) => p,
+            Err(e) => return self.notify(Level::Error, e),
+        };
+        let mut password =
+            (!form.password.value().is_empty()).then(|| Zeroizing::new(form.password.value().to_string()));
+        if password.is_none() && profile.credential == CredentialStore::Vault {
+            password = self.vault.as_ref().and_then(|v| v.get(&profile.id).ok().flatten()).map(Zeroizing::new);
+        }
+        let use_keyring = password.is_none() && profile.credential == CredentialStore::Keyring;
+        self.busy = Some("Testing connection".into());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut password = password;
+                if use_keyring {
+                    let id = profile.id.clone();
+                    password =
+                        tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await??.map(Zeroizing::new);
+                }
+                let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
+                let info = db.session_info(&profile).await;
+                db.close().await;
+                let info = info?;
+                anyhow::Ok(format!("Connected to {} as {}", info.server_version, info.user))
+            }
+            .await;
+            let _ = tx.send(AppEvent::TestResult(result.map_err(err_text)));
+        });
+    }
+
+    fn save_form(&mut self, form: Box<ConnectionForm>) {
+        let mut profile = match form.to_profile() {
+            Ok(p) => p,
+            Err(e) => {
+                let mut form = form;
+                form.error = Some(e);
+                self.popup = Some(Popup::Form(form));
+                return;
+            }
+        };
+        let password = Zeroizing::new(form.password.value().to_string());
+        let save_password = form.save_password && profile.needs_password();
+        if !save_password && profile.credential != CredentialStore::None {
+            self.forget_password(&profile);
+            profile.credential = CredentialStore::None;
+        }
+        let id = profile.id.clone();
+        let name = profile.name.clone();
+        match self.config.connections.iter().position(|p| p.id == id) {
+            Some(pos) => {
+                self.config.connections[pos] = profile;
+                self.selected_conn = pos;
+            }
+            None => {
+                self.config.connections.push(profile);
+                self.selected_conn = self.config.connections.len() - 1;
+            }
+        }
+        self.save_config();
+        self.notify(Level::Success, format!("Saved {name}"));
+        if save_password && !password.is_empty() {
+            self.store_password(&id, &password);
+        }
+    }
+
+    fn set_credential(&mut self, id: &str, store: CredentialStore) {
+        if let Some(p) = self.config.connections.iter_mut().find(|p| p.id == id) {
+            p.credential = store;
+        }
+        self.save_config();
+    }
+
+    /// Saves a password using the configured backend (keyring first, vault as fallback).
+    fn store_password(&mut self, id: &str, password: &str) {
+        let backend = self.config.secret_backend;
+        if backend != SecretBackend::Vault {
+            match secrets::keyring_set(id, password) {
+                Ok(()) => {
+                    self.set_credential(id, CredentialStore::Keyring);
+                    self.notify(Level::Success, "Password saved in the OS keyring");
+                    return;
+                }
+                Err(e) if backend == SecretBackend::Keyring => {
+                    self.notify(Level::Error, format!("Could not save password: {}", err_text(e)));
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        self.store_in_vault(id, password);
+    }
+
+    fn store_in_vault(&mut self, id: &str, password: &str) {
+        match self.vault.as_mut() {
+            Some(vault) => match vault.set(id, password) {
+                Ok(()) => {
+                    self.set_credential(id, CredentialStore::Vault);
+                    self.notify(Level::Success, "Password saved in the encrypted vault");
+                }
+                Err(e) => self.notify(Level::Error, format!("Could not save password: {}", err_text(e))),
+            },
+            None => self.open_vault_prompt(AfterUnlock::Store {
+                id: id.to_string(),
+                password: Zeroizing::new(password.to_string()),
+            }),
+        }
+    }
+
+    fn forget_password(&mut self, profile: &ConnectionProfile) {
+        let result = match profile.credential {
+            CredentialStore::None => Ok(()),
+            CredentialStore::Keyring => secrets::keyring_delete(&profile.id),
+            CredentialStore::Vault => match self.vault.as_mut() {
+                Some(v) => v.remove(&profile.id),
+                None => Vault::default_path().and_then(|p| Vault::remove_locked(&p, &profile.id)),
+            },
+        };
+        if let Err(e) = result {
+            self.notify(Level::Warning, format!("Could not remove saved password: {}", err_text(e)));
+        }
+    }
+
+    fn open_vault_prompt(&mut self, then: AfterUnlock) {
+        let create = match Vault::default_path() {
+            Ok(p) => !Vault::exists(&p),
+            Err(e) => return self.notify(Level::Error, err_text(e)),
+        };
+        self.popup = Some(Popup::Vault(VaultPrompt {
+            create,
+            input: Input::default(),
+            confirm: Input::default(),
+            focus: 0,
+            error: None,
+            then,
+        }));
+    }
+
+    fn submit_vault(&mut self, mut v: VaultPrompt) -> Option<Popup> {
+        let path = match Vault::default_path() {
+            Ok(p) => p,
+            Err(e) => {
+                v.error = Some(err_text(e));
+                return Some(Popup::Vault(v));
+            }
+        };
+        let result = if v.create {
+            if v.input.value() != v.confirm.value() {
+                v.error = Some("Passwords do not match".into());
+                return Some(Popup::Vault(v));
+            }
+            Vault::create(&path, v.input.value())
+        } else {
+            Vault::unlock(&path, v.input.value())
+        };
+        match result {
+            Ok(vault) => {
+                self.vault = Some(vault);
+                match std::mem::replace(&mut v.then, AfterUnlock::Connect(ConnectionProfile::new(Driver::Sqlite))) {
+                    AfterUnlock::Connect(profile) => self.connect(profile),
+                    AfterUnlock::Store { id, password } => self.store_in_vault(&id, &password),
+                }
+                self.popup.take()
+            }
+            Err(e) => {
+                v.error = Some(err_text(e));
+                v.input.set("");
+                v.confirm.set("");
+                v.focus = 0;
+                Some(Popup::Vault(v))
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Data loading
+    // ------------------------------------------------------------------
+
+    fn open_selected_table(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let Some(TreeItem::Table(s, t)) = b.selected_item() else { return };
+        let table = b.schemas[s].tables[t].table.clone();
+        if b.table.as_ref().is_some_and(|t| t.info.table == table) {
+            if let Some(b) = &mut self.browser {
+                b.focus = Focus::Main;
+                if b.tab == Tab::Query {
+                    b.tab = Tab::Data;
+                }
+            }
+            return;
+        }
+        if b.has_pending_edits() {
+            self.popup = Some(Popup::Confirm {
+                title: "Discard changes".into(),
+                message: format!("Discard {} uncommitted change(s) and open {}?", b.pending_count(), table),
+                action: ConfirmAction::DiscardAndOpen(table),
+            });
+            return;
+        }
+        self.open_table(&table);
+    }
+
+    fn open_table(&mut self, table: &TableRef) {
+        let page_size = self.config.page_size.clamp(10, 10_000);
+        let Some(b) = &mut self.browser else { return };
+        let Some(info) = b.schemas.iter().flat_map(|s| &s.tables).find(|t| t.table == *table).cloned() else { return };
+        let mut info = info;
+        info.privileges = b.effective(info.privileges);
+        b.table = Some(OpenTable::new(info, page_size));
+        b.focus = Focus::Main;
+        if b.tab == Tab::Query {
+            b.tab = Tab::Data;
+        }
+        self.request_page();
+    }
+
+    fn request_page(&mut self) {
+        let Some(b) = &mut self.browser else { return };
+        if b.tab == Tab::Query {
+            return;
+        }
+        let Some(t) = &mut b.table else { return };
+        if t.grid.has_pending() {
+            let hint = match self.config.keymap {
+                KeymapMode::Vim => ":w to commit, :e! to discard",
+                KeymapMode::Standard => "Ctrl-S to commit, Ctrl-Z to undo",
+            };
+            return self.notify(Level::Warning, format!("Pending changes — {hint} before reloading"));
+        }
+        b.seq += 1;
+        let seq = b.seq;
+        t.loading = true;
+        t.total = None;
+        let db = b.db.clone();
+        let table = t.info.table.clone();
+        let known_structure = t.structure.clone();
+        let mut req = PageRequest {
+            filter: t.filter.clone(),
+            order_by: t.order_by.clone(),
+            default_order: Vec::new(),
+            limit: t.page_size,
+            offset: t.page * t.page_size,
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let structure = match &known_structure {
+                Some(_) => None,
+                None => Some(db.structure(&table).await.map_err(err_text)),
+            };
+            let columns = match (&known_structure, &structure) {
+                (Some(s), _) | (None, Some(Ok(s))) => s.columns.as_slice(),
+                _ => &[],
+            };
+            req.default_order = columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
+            let data = db.fetch_page(&table, &req).await.map_err(err_text);
+            let ok = data.is_ok();
+            let _ = tx.send(AppEvent::Page { seq, structure, data });
+            if ok {
+                let count = db.count_rows(&table, req.filter.as_deref()).await.map_err(err_text);
+                let _ = tx.send(AppEvent::Count { seq, count });
+            }
+        });
+    }
+
+    fn refresh_schemas(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let db = b.db.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::Schemas(db.schemas().await.map_err(err_text)));
+        });
+    }
+
+    fn run_query(&mut self) {
+        let Some(b) = &mut self.browser else { return };
+        let sql = b.query.sql();
+        if sql.trim().is_empty() {
+            return self.notify(Level::Info, "Nothing to run");
+        }
+        let read_only = b.fully_read_only();
+        if read_only && let Some(keyword) = sql::write_keyword(&sql) {
+            let reason =
+                b.session.read_only_reason.clone().unwrap_or_else(|| "your account has no write permissions".into());
+            b.query.message = Some((format!("🔒 Refused {keyword}: read-only session ({reason})"), true));
+            return self.notify(Level::Warning, format!("🔒 Read-only: {keyword} statements are not allowed"));
+        }
+        b.query.seq += 1;
+        b.query.running = true;
+        b.query.message = Some(("Running…".into(), false));
+        let seq = b.query.seq;
+        let db = b.db.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = db.run_query(&sql, read_only).await.map_err(err_text);
+            let _ = tx.send(AppEvent::Query { seq, result });
+        });
+    }
+
+    fn begin_commit(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let Some(t) = &b.table else { return self.notify(Level::Info, "Nothing to commit") };
+        if !t.grid.has_pending() {
+            return self.notify(Level::Info, "Nothing to commit");
+        }
+        if let Some(reason) = &b.session.read_only_reason {
+            return self.deny(format!("Read-only session: {reason}"));
+        }
+        let Some(structure) = &t.structure else { return };
+        match t.grid.build_statements(b.db.driver(), &t.info.table, structure) {
+            Ok(statements) => self.popup = Some(Popup::Commit { statements, scroll: 0 }),
+            Err(e) => {
+                self.popup = Some(Popup::Message { title: "Cannot commit".into(), body: e, error: true, scroll: 0 })
+            }
+        }
+    }
+
+    fn apply_statements(&mut self, statements: Vec<Statement>) {
+        let Some(b) = &self.browser else { return };
+        self.busy = Some(format!("Committing {} statement(s)", statements.len()));
+        let db = b.db.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::Committed(db.apply(&statements).await.map_err(err_text)));
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Background results
+    // ------------------------------------------------------------------
+
+    pub fn on_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Connected { profile, db, session, schemas, remember } => {
+                self.busy = None;
+                if let Some(pw) = remember {
+                    self.store_password(&profile.id, &pw);
+                }
+                let browser = Browser::new(profile, db, session, schemas);
+                let level = browser.access_level();
+                let mut msg = format!("Connected as {} · {}", browser.session.user, level.label());
+                if let Some(reason) = &browser.session.read_only_reason {
+                    msg.push_str(&format!(" ({reason})"));
+                }
+                self.notify(Level::Success, msg);
+                self.browser = Some(browser);
+                self.screen = Screen::Browser;
+            }
+            AppEvent::ConnectFailed { profile, error, needs_password } => {
+                self.busy = None;
+                if needs_password {
+                    self.ask_password(profile, Some(error));
+                } else {
+                    self.popup = Some(Popup::Message {
+                        title: format!("Could not connect to {}", profile.name),
+                        body: error,
+                        error: true,
+                        scroll: 0,
+                    });
+                }
+            }
+            AppEvent::TestResult(result) => {
+                self.busy = None;
+                match result {
+                    Ok(msg) => self.notify(Level::Success, msg),
+                    Err(e) => {
+                        if let Some(Popup::Form(form)) = &mut self.popup {
+                            form.error = Some(e.clone());
+                        }
+                        self.notify(Level::Error, e);
+                    }
+                }
+            }
+            AppEvent::Schemas(result) => match result {
+                Ok(schemas) => {
+                    if let Some(b) = &mut self.browser {
+                        b.set_schemas(schemas);
+                    }
+                }
+                Err(e) => self.notify(Level::Error, e),
+            },
+            AppEvent::Page { seq, structure, data } => {
+                let Some(b) = &mut self.browser else { return };
+                if seq != b.seq {
+                    return;
+                }
+                let Some(t) = &mut b.table else { return };
+                t.loading = false;
+                if let Some(structure) = structure {
+                    match structure {
+                        Ok(s) => t.structure = Some(s),
+                        Err(e) => t.error = Some(e),
+                    }
+                }
+                match data {
+                    Ok(rs) => {
+                        let columns = if rs.columns.is_empty() {
+                            t.structure
+                                .as_ref()
+                                .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+                                .unwrap_or_default()
+                        } else {
+                            rs.columns
+                        };
+                        let (row, col) = (t.grid.row, t.grid.col);
+                        let mut grid = Grid::new(columns, rs.rows);
+                        grid.row = row.min(grid.total_rows().saturating_sub(1));
+                        grid.col = col.min(grid.columns.len().saturating_sub(1));
+                        t.grid = grid;
+                        t.loaded = true;
+                        t.error = None;
+                    }
+                    Err(e) => {
+                        // Don't leave stale rows on screen under a new filter/page.
+                        t.grid.rows.clear();
+                        t.grid.clear_edits();
+                        t.error = Some(e.clone());
+                        self.notify(Level::Error, e);
+                    }
+                }
+            }
+            AppEvent::Count { seq, count } => {
+                if let Some(b) = &mut self.browser
+                    && seq == b.seq
+                    && let Some(t) = &mut b.table
+                {
+                    t.total = count.ok();
+                }
+            }
+            AppEvent::Query { seq, result } => {
+                let Some(b) = &mut self.browser else { return };
+                if seq != b.query.seq {
+                    return;
+                }
+                b.query.running = false;
+                match result {
+                    Ok(rs) => {
+                        let ms = rs.elapsed.as_secs_f64() * 1000.0;
+                        let msg = if rs.columns.is_empty() {
+                            format!("✓ {} row(s) affected · {ms:.1} ms", rs.rows_affected)
+                        } else {
+                            let more =
+                                if rs.truncated { format!(" (first {} shown)", rs.rows.len()) } else { String::new() };
+                            format!("✓ {} row(s){more} · {ms:.1} ms", rs.rows.len())
+                        };
+                        b.query.message = Some((msg, false));
+                        // Statements may have changed the schema or the open table.
+                        let changed = rs.rows_affected > 0 || rs.columns.is_empty();
+                        b.query.result = (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows));
+                        if changed {
+                            self.refresh_schemas();
+                        }
+                    }
+                    Err(e) => b.query.message = Some((format!("✗ {e}"), true)),
+                }
+            }
+            AppEvent::Committed(result) => {
+                self.busy = None;
+                match result {
+                    Ok(n) => {
+                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
+                            t.grid.clear_edits();
+                        }
+                        self.notify(Level::Success, format!("Committed — {n} row(s) affected"));
+                        self.request_page();
+                    }
+                    Err(e) => {
+                        self.popup =
+                            Some(Popup::Message { title: "Commit failed".into(), body: e, error: true, scroll: 0 })
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pretty-prints JSON values for the cell viewer.
+fn pretty_value(text: &str) -> String {
+    let t = text.trim();
+    if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+        return crate::util::pretty_json(t).unwrap_or_else(|| text.to_string());
+    }
+    text.to_string()
+}
