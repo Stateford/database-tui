@@ -34,12 +34,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Paragraph::new(safe_text(body)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), text);
             frame.render_widget(footer(&[("Enter", "close"), ("↑↓", "scroll")]), foot);
         }
-        Popup::Confirm { title, message, .. } => {
-            let r = centered(area, 60, 8);
+        Popup::Confirm { title, message, action } => {
+            // Tall enough for the message, wrapped between words: a line
+            // holds 50 characters or more.
+            let message = safe_text(message);
+            let lines: usize = message.lines().map(|l| l.chars().count().max(1).div_ceil(50)).sum();
+            let r = centered(area, 72, (lines as u16).saturating_add(5).max(8));
             let inner = modal(frame, r, title, YELLOW).inner(Margin { horizontal: 2, vertical: 1 });
             let [text, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-            frame.render_widget(Paragraph::new(safe_text(message)).wrap(Wrap { trim: false }), text);
-            frame.render_widget(footer(&[("y / Enter", "yes"), ("n / Esc", "no")]), foot);
+            frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), text);
+            let yes = if action.enter_confirms() { "y / Enter" } else { "y" };
+            frame.render_widget(footer(&[(yes, "yes"), ("n / Esc", "no")]), foot);
         }
         Popup::Commit { statements, previews, hidden, scroll, non_transactional, .. } => {
             let force = commit_needs_force(statements, non_transactional.as_ref());
@@ -104,7 +109,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             frame.render_widget(footer(keys), foot);
         }
-        Popup::CellView { title, text, value, cut, scroll, wrapped } => {
+        Popup::CellView { title, text, value, cut, scroll, wrapped, .. } => {
             let r = centered(area, 90, area.height.saturating_sub(6));
             let inner = modal(frame, r, title, CYAN).inner(Margin { horizontal: 2, vertical: 1 });
             let notice = if cut.is_some() { 1 } else { 0 };
@@ -426,6 +431,15 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
         } else {
             messages.push(warning);
         }
+    }
+    if let Some(saved) = form.saved_password_elsewhere().filter(|_| form.password.value().is_empty()) {
+        messages.push(Line::styled(
+            format!(
+                "Saving removes the password saved for {}: it is asked for on connect",
+                safe_line(&saved.address())
+            ),
+            dim(),
+        ));
     }
     if let Some(e) = &form.error {
         messages.push(Line::styled(format!("✖ {}", safe_line(e)), Style::default().fg(RED)));

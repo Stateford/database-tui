@@ -84,10 +84,15 @@ fn send(seq: String) {
     SENT.with(|sent| *sent.borrow_mut() = Some(seq));
 }
 
-/// What the last copy on this thread put on the clipboard, decoded.
+/// What the last copy on this thread put on the clipboard, decoded. Tests
+/// may run in tmux, which gets the sequence wrapped.
 #[cfg(test)]
 pub fn sent() -> Option<String> {
     let seq = SENT.with(|sent| sent.borrow().clone())?;
+    let seq = match seq.strip_prefix("\x1bPtmux;\x1b") {
+        Some(inner) => inner.strip_suffix("\x1b\\")?.to_string(),
+        None => seq,
+    };
     let encoded = seq.strip_prefix("\x1b]52;c;")?.strip_suffix('\x07')?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
     String::from_utf8(bytes).ok()

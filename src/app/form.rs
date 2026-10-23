@@ -246,8 +246,11 @@ impl ConnectionForm {
             }
             Field::Ssl => {
                 let all = SslMode::ALL;
-                let idx = all.iter().position(|s| *s == self.ssl).unwrap_or(0) as i32;
-                self.ssl = all[(idx + dir).rem_euclid(all.len() as i32) as usize];
+                self.ssl = match all.iter().position(|s| *s == self.ssl) {
+                    Some(idx) => all[(idx as i32 + dir).rem_euclid(all.len() as i32) as usize],
+                    // verify-ca, saved by an older version: what it was meant to do.
+                    None => SslMode::VerifyFull,
+                };
                 self.ssl_auto = false;
             }
             Field::SavePassword => self.save_password = !self.save_password,

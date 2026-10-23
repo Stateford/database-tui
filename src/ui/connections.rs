@@ -54,7 +54,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(FG).bg(bg).add_modifier(Modifier::BOLD),
                 ),
             ];
-            if p.read_only {
+            if p.read_only || app.read_only_run {
                 top.push(Span::styled("  read-only", Style::default().fg(YELLOW).bg(bg)));
             }
             top.push(match p.credential {
@@ -123,7 +123,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(row("Password", p.credential.label().to_string()));
     }
-    lines.push(row("Access", if p.read_only { "forced read-only".into() } else { "from database privileges".into() }));
+    let access = if app.read_only_run {
+        "read-only (--read-only)"
+    } else if p.read_only {
+        "forced read-only"
+    } else {
+        "from database privileges"
+    };
+    lines.push(row("Access", access.into()));
     if let Some(warning) = p.tls_warning() {
         lines.push(Line::from(""));
         lines.push(Line::styled(format!("⚠ {}: {warning}", p.ssl_mode.label()), Style::default().fg(YELLOW)));

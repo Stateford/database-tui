@@ -260,7 +260,7 @@ fn focus(app: &mut App, field: form::Field) {
 
 /// Audit M1/M2: a new profile for a remote host verifies the server unless
 /// the user picks another mode, which the form then warns about; verify-ca
-/// needs a CA file. Nothing here saves the configuration.
+/// is refused. Nothing here saves the configuration.
 #[tokio::test]
 async fn new_remote_profiles_verify_the_server() {
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -278,7 +278,7 @@ async fn new_remote_profiles_verify_the_server() {
 
     // Choosing a weaker mode by hand sticks, and is flagged.
     focus(&mut app, form::Field::Ssl);
-    for _ in 0..3 {
+    for _ in 0..2 {
         app.on_key(key(KeyCode::Left));
     }
     assert_eq!(form(&app).ssl, SslMode::Prefer);
@@ -287,25 +287,36 @@ async fn new_remote_profiles_verify_the_server() {
     type_str(&mut app, "x");
     assert_eq!(form(&app).ssl, SslMode::Prefer);
 
-    // verify-ca only with a CA file: Ctrl-S keeps the form open.
+    // verify-ca cannot be chosen; a CA file needs verify-full: Ctrl-S
+    // keeps the form open.
     focus(&mut app, form::Field::Name);
     type_str(&mut app, "prod");
     focus(&mut app, form::Field::Ssl);
     app.on_key(key(KeyCode::Right));
-    app.on_key(key(KeyCode::Right));
-    assert_eq!(form(&app).ssl, SslMode::VerifyCa);
-    app.on_key(ctrl('s'));
-    assert!(form(&app).error.as_ref().unwrap().contains("verify-ca needs a CA file"));
-    assert!(render(&mut app, 120, 40).contains("verify-ca needs a CA file"));
-    assert!(app.config.connections.is_empty());
+    assert_eq!(form(&app).ssl, SslMode::Require);
     focus(&mut app, form::Field::SslCa);
     type_str(&mut app, "/etc/ssl/db-ca.pem");
+    app.on_key(ctrl('s'));
+    assert!(form(&app).error.as_ref().unwrap().contains("only used by verify-full"));
+    assert!(render(&mut app, 120, 40).contains("a CA file is only used by verify-full"));
+    assert!(app.config.connections.is_empty());
+    focus(&mut app, form::Field::Ssl);
+    app.on_key(key(KeyCode::Right));
     let p = form(&app).to_profile().unwrap();
     assert_eq!(
         (p.host.as_str(), p.ssl_mode, p.ssl_ca.as_str()),
-        ("db.example.comx", SslMode::VerifyCa, "/etc/ssl/db-ca.pem")
+        ("db.example.comx", SslMode::VerifyFull, "/etc/ssl/db-ca.pem")
     );
+    // A profile saved with verify-ca (by an older version) must be changed.
+    let mut old = p.clone();
+    old.ssl_mode = SslMode::VerifyCa;
+    app.popup = Some(Popup::Form(Box::new(ConnectionForm::new(old, false))));
+    app.on_key(ctrl('s'));
+    assert!(form(&app).error.as_ref().unwrap().contains("verify-ca is not supported"));
     assert!(render(&mut app, 120, 40).contains("⚠ server host name not checked"));
+    focus(&mut app, form::Field::Ssl);
+    app.on_key(key(KeyCode::Left));
+    assert_eq!(form(&app).ssl, SslMode::VerifyFull);
 }
 
 /// A saved profile keeps its explicit mode, and the connection list and
@@ -327,7 +338,6 @@ async fn saved_profiles_keep_their_mode_with_a_warning() {
     assert_eq!(form(&app).ssl, SslMode::Require);
     assert!(render(&mut app, 120, 40).contains("⚠ server not verified: use verify-full"));
     focus(&mut app, form::Field::Ssl);
-    app.on_key(key(KeyCode::Right));
     app.on_key(key(KeyCode::Right));
     assert_eq!(form(&app).ssl, SslMode::VerifyFull);
     assert!(!render(&mut app, 120, 40).contains('⚠'));
@@ -359,6 +369,26 @@ async fn status_bar_shows_transport_security() {
         let screen = render(&mut app, 120, 30);
         let status = screen.lines().last().unwrap();
         assert!(status.contains(expected), "{status}");
+    }
+
+    // On a narrow terminal, what matters most stays: the access level, the
+    // transport warning, the staged changes and the work running.
+    let b = app.browser.as_mut().unwrap();
+    b.profile.ssl_mode = SslMode::Require;
+    b.session.transport = Transport::Tls { version: "TLSv1.3".into(), cipher: String::new() };
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Delete));
+    app.busy = Some("Committing 2 statement(s)".into());
+    let screen = render(&mut app, 80, 24);
+    let status = screen.lines().last().unwrap();
+    for shown in ["READ-WRITE", "⚠ unverified", "✎ 2 pending", "Committing 2 statement(s)…"] {
+        assert!(status.contains(shown), "{shown} in {status}");
+    }
+    let status = render(&mut app, 200, 24).lines().last().unwrap().to_string();
+    for shown in ["STANDARD", "⚠ TLSv1.3 unverified", "people", "SEL INS UPD DEL", "row 2/2"] {
+        assert!(status.contains(shown), "{shown} in {status}");
     }
 }
 
@@ -393,6 +423,20 @@ fn pg_profile(host: &str, port: u16, credential: CredentialStore) -> ConnectionP
     p.user = "app".into();
     p.credential = credential;
     p
+}
+
+/// What the fake server receives next, while the app's work goes on.
+async fn received(
+    server: &std::sync::mpsc::Receiver<crate::db::transport_tests::PgCapture>,
+) -> crate::db::transport_tests::PgCapture {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(capture) = server.try_recv() {
+            return capture;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "nothing reached the server");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Replaces the value of a form field.
@@ -480,20 +524,139 @@ async fn keyring_passwords_only_go_to_their_server() {
     assert!(form(&app).error.as_ref().unwrap().contains("saved password is for postgres://app@db.internal.example"));
     assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
 
-    // An old password is only used for the profile as it was saved...
+    // A password saved by an older version does not say which server it is
+    // for: Ctrl-T does not use it...
     keyring.put_raw(&profile.id, "legacy-password");
-    set_field(&mut app, form::Field::User, "admin");
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Char('e')));
     app.on_key(ctrl('t'));
     wait_for(&mut app, &mut rx, |a| form(a).error.is_some()).await;
     let error = form(&app).error.clone().unwrap();
-    assert!(error.contains(&format!("is for postgres://app@127.0.0.1:{port}, not postgres://admin@")), "{error}");
+    assert!(error.contains("saved by an earlier version of dbtui"), "{error}");
     assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
     app.on_key(key(KeyCode::Esc));
-    // ...for which it still works.
+    // ...and connecting asks first, saying where it would go.
     app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Confirm { .. }))).await;
+    let Some(Popup::Confirm { message, .. }) = &app.popup else { unreachable!() };
+    assert!(message.contains(&format!("to postgres://app@127.0.0.1:{port}?")), "{message}");
+    assert!(message.contains("saved by an earlier version") && !message.contains("SSL mode"), "{message}");
+    assert!(render(&mut app, 100, 30).contains("check that this is that server"));
+    app.on_key(key(KeyCode::Enter)); // the key that asked to connect, once more
+    assert!(matches!(app.popup, Some(Popup::Confirm { .. })));
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+    app.on_key(key(KeyCode::Char('y')));
     wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Message { .. }))).await;
     let capture = server.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(capture.password.as_deref(), Some("legacy-password"));
+}
+
+/// Audit L1: re-pointing a profile in the form removes its saved password,
+/// which is for the old server, before anything is sent: even one saved by
+/// an older version, which does not say which server it is for.
+#[tokio::test]
+async fn moved_profiles_lose_their_saved_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = fake_pg_server(false);
+    let in_keyring = pg_profile("db.internal.example", 5432, CredentialStore::Keyring);
+    let mut in_vault = pg_profile("db.internal.example", 5433, CredentialStore::Vault);
+    in_vault.name = "replica".into();
+    let vault = Vault::create(&dir.path().join("vault.toml"), "master password").unwrap();
+    vault.put_legacy(&in_vault.id, "vault-password");
+    drop(vault);
+    let config = Config { connections: vec![in_keyring.clone(), in_vault.clone()], ..Config::default() };
+    let (mut app, mut rx, keyring) = app_in(dir.path(), config);
+    keyring.put_raw(&in_keyring.id, "legacy-password");
+
+    // The vault is locked: its entry is removed all the same.
+    for (i, id) in [(0, &in_keyring.id), (1, &in_vault.id)] {
+        app.selected_conn = i;
+        app.on_key(key(KeyCode::Char('e')));
+        let screen = render(&mut app, 120, 40);
+        assert!(!screen.contains("Saving removes"), "{screen}");
+        set_field(&mut app, form::Field::Host, "127.0.0.1");
+        set_field(&mut app, form::Field::Port, &port.to_string());
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("saved for app@db.internal.example:") && screen.contains("Saving removes"), "{screen}");
+        app.on_key(ctrl('s'));
+        assert!(toast(&app).contains("Its saved password was for app@db.internal.example:"), "{}", toast(&app));
+        assert!(toast(&app).contains("has been removed"), "{}", toast(&app));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(credential(&app, id), CredentialStore::None);
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.popup, Some(Popup::Password(p)) if p.error.is_none()));
+        app.on_key(key(KeyCode::Esc));
+    }
+    assert_eq!(keyring.raw(&in_keyring.id), None);
+    let vault = Vault::unlock(&dir.path().join("vault.toml"), "master password").unwrap();
+    assert!(vault.get(&in_vault.id).unwrap().is_none());
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "a saved password was sent");
+
+    // Renaming only keeps it.
+    keyring.put(&in_keyring.id, &Endpoint::of(&app.config.connections[0]), "new-password");
+    app.update_config(|c| c.connections[0].credential = CredentialStore::Keyring);
+    app.selected_conn = 0;
+    app.on_key(key(KeyCode::Char('e')));
+    set_field(&mut app, form::Field::Name, "renamed");
+    app.on_key(ctrl('s'));
+    settle(&mut app, &mut rx).await;
+    assert_eq!(toast(&app), "Saved renamed");
+    assert_eq!(credential(&app, &in_keyring.id), CredentialStore::Keyring);
+    assert_eq!(keyring.secret(&in_keyring.id).unwrap().password(), "new-password");
+}
+
+/// Audit M1: a saved password is not sent unasked to a remote server that
+/// the SSL mode does not authenticate, where whoever is on the network path
+/// could pose as the server; nor by Ctrl-T in the form.
+#[tokio::test]
+async fn saved_passwords_need_an_authenticated_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = fake_pg_server(false);
+    // Not a loopback address, so remote as far as dbtui can tell; it reaches
+    // this machine on Unix.
+    let mut profile = pg_profile("0.0.0.0", port, CredentialStore::Keyring);
+    profile.ssl_mode = SslMode::Prefer;
+    let (mut app, mut rx, keyring) =
+        app_in(dir.path(), Config { connections: vec![profile.clone()], ..Config::default() });
+    keyring.put(&profile.id, &Endpoint::of(&profile), "prod-password");
+
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Confirm { .. }))).await;
+    let Some(Popup::Confirm { message, .. }) = &app.popup else { unreachable!() };
+    assert!(message.contains("⚠ SSL mode prefer: server not verified") && message.contains("pose as the server"));
+    assert!(!message.contains("earlier version"), "{message}");
+    app.on_key(key(KeyCode::Char('n')));
+    assert!(app.popup.is_none() && app.busy.is_none());
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_key(ctrl('t'));
+    wait_for(&mut app, &mut rx, |a| form(a).error.is_some()).await;
+    let error = form(&app).error.clone().unwrap();
+    assert!(error.contains("not sent unasked with SSL mode prefer"), "{error}");
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+    // With verify-full, it would be sent unasked (and the fake server,
+    // without TLS, is refused).
+    focus(&mut app, form::Field::Ssl);
+    app.on_key(key(KeyCode::Right));
+    app.on_key(key(KeyCode::Right));
+    assert_eq!(form(&app).ssl, SslMode::VerifyFull);
+    app.on_key(ctrl('s'));
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
+    assert!(matches!(app.popup, Some(Popup::Message { .. })), "connected without asking");
+    app.on_key(key(KeyCode::Esc));
+    assert!(server.recv_timeout(Duration::from_secs(5)).unwrap().password.is_none());
+
+    // Accepted: sent this time.
+    app.update_config(|c| c.connections[0].ssl_mode = SslMode::Prefer);
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Confirm { .. }))).await;
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(app.busy.as_deref().is_some_and(|b| b.starts_with("Connecting to prod")));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
+    #[cfg(unix)]
+    assert_eq!(server.recv_timeout(Duration::from_secs(5)).unwrap().password.as_deref(), Some("prod-password"));
 }
 
 /// A password saved before passwords were bound is saved again, bound to
@@ -503,8 +666,9 @@ async fn keyring_passwords_only_go_to_their_server() {
 #[tokio::test]
 async fn old_passwords_are_bound_once_they_work() {
     let dir = tempfile::tempdir().unwrap();
-    let in_vault = pg_profile("db.example.com", 5432, CredentialStore::Vault);
-    let mut in_keyring = pg_profile("db.example.com", 5433, CredentialStore::Keyring);
+    let (port, server) = fake_pg_server(false);
+    let in_vault = pg_profile("127.0.0.1", port, CredentialStore::Vault);
+    let mut in_keyring = pg_profile("127.0.0.1", port, CredentialStore::Keyring);
     in_keyring.name = "replica".into();
     let vault = Vault::create(&dir.path().join("vault.toml"), "master password").unwrap();
     vault.put_legacy(&in_vault.id, "vault-password");
@@ -513,22 +677,24 @@ async fn old_passwords_are_bound_once_they_work() {
     keyring.put_raw(&in_keyring.id, "keyring-password");
     app.vault = Some(vault);
 
-    // A local session stands in for the server's.
+    // A local session stands in for the server's, which the fake server
+    // never completes.
     let (_db_dir, mut db_app, _db_rx) = open_people(KeymapMode::Standard, false).await;
     let browser = db_app.browser.take().unwrap();
-    // What a connection attempt the app started brings back.
-    let connected = |app: &mut App, profile: &ConnectionProfile, remember| AppEvent::Connected {
-        attempt: app.begin_connect(),
+    let connected = |attempt, profile: &ConnectionProfile| AppEvent::Connected {
+        attempt,
         profile: profile.clone(),
         db: browser.db.clone(),
         session: Box::new(browser.session.clone()),
         schemas: browser.schemas.clone(),
-        remember: Some(remember),
     };
     for (profile, password) in [(&in_vault, "vault-password"), (&in_keyring, "keyring-password")] {
-        // What `connect_with_saved` asks for with an unbound password.
-        let remember = app.remember(profile, Zeroizing::new(password.into()), true);
-        let event = connected(&mut app, profile, remember);
+        app.connect(profile.clone());
+        wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Confirm { .. }))).await;
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(received(&server).await.password.as_deref(), Some(password));
+        // The attempt works.
+        let event = connected(app.connecting.unwrap(), profile);
         app.on_app_event(event);
     }
     settle(&mut app, &mut rx).await;
@@ -541,21 +707,57 @@ async fn old_passwords_are_bound_once_they_work() {
         (CredentialStore::Vault, CredentialStore::Keyring)
     );
     assert!(toast(&app).starts_with("Connected"), "re-saved quietly: {}", toast(&app));
+    // Bound now: sent without asking.
+    app.connect(in_keyring.clone());
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
+    assert!(matches!(app.popup, Some(Popup::Message { .. })), "connected without asking");
+    assert_eq!(server.recv_timeout(Duration::from_secs(5)).unwrap().password.as_deref(), Some("keyring-password"));
+    app.on_key(key(KeyCode::Esc));
 
+    // A typed password to remember once the attempt works.
+    let typed = |app: &mut App, profile: &ConnectionProfile| {
+        let attempt = app.begin_connect();
+        app.to_remember = Some(app.remember(profile, Zeroizing::new("typed".into()), false));
+        connected(attempt, profile)
+    };
     // The profile now points elsewhere: the password is not saved for it.
-    let remember = app.remember(&in_vault, Zeroizing::new("typed".into()), false);
+    let event = typed(&mut app, &in_vault);
     app.update_config(|c| c.connections[0].host = "db2.example.com".into());
-    let event = connected(&mut app, &in_vault, remember);
     app.on_app_event(event);
     // Deleted while connecting.
-    let remember = app.remember(&in_keyring, Zeroizing::new("typed".into()), false);
+    let event = typed(&mut app, &in_keyring);
     app.confirm(ConfirmAction::DeleteProfile(in_keyring.id.clone()));
-    let event = connected(&mut app, &in_keyring, remember);
     app.on_app_event(event);
     settle(&mut app, &mut rx).await;
     assert_eq!(app.vault.as_ref().unwrap().get(&in_vault.id).unwrap().unwrap().password(), "vault-password");
     assert_eq!(keyring.raw(&in_keyring.id), None);
     assert!(!toast(&app).contains("Password saved"), "{}", toast(&app));
+}
+
+/// A password saved while the edit form was open (by a keyring that was
+/// slow to answer) is still used once the form is saved.
+#[tokio::test]
+async fn saving_the_form_keeps_a_password_saved_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, mut rx, keyring) = app_in(dir.path(), Config::default());
+    keyring.hold();
+    app.on_key(key(KeyCode::Char('n')));
+    type_str(&mut app, "prod");
+    set_field(&mut app, form::Field::Password, "s3cret");
+    app.on_key(ctrl('s'));
+    let id = app.config.connections[0].id.clone();
+    app.on_key(key(KeyCode::Char('e')));
+    keyring.release();
+    settle(&mut app, &mut rx).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Keyring);
+    assert!(matches!(app.popup, Some(Popup::Form(_))), "still editing");
+    set_field(&mut app, form::Field::Name, "production");
+    app.on_key(ctrl('s'));
+    settle(&mut app, &mut rx).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Keyring);
+    let on_disk = Config::load_from(&dir.path().join("config.toml")).unwrap();
+    assert_eq!(on_disk.connections[0].credential, CredentialStore::Keyring);
+    assert_eq!(keyring.secret(&id).unwrap().password(), "s3cret");
 }
 
 /// Audit L2: results of keyring writes that come late, for a profile that
@@ -704,6 +906,66 @@ async fn vault_is_opened_in_the_background_and_never_replaced() {
     let theirs = Vault::unlock(&path, "other master").unwrap();
     assert_eq!(theirs.get(&id).unwrap().unwrap().password(), "s3cret");
     assert_eq!(theirs.get("x").unwrap().unwrap().password(), "theirs");
+}
+
+/// Cancelling the creation of a vault (Esc while its key is derived) leaves
+/// no vault behind.
+#[tokio::test]
+async fn cancelled_vaults_are_not_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.toml");
+    let config = Config { secret_backend: SecretBackend::Vault, ..Config::default() };
+    let (mut app, mut rx, _) = app_in(dir.path(), config);
+    app.on_key(key(KeyCode::Char('n')));
+    type_str(&mut app, "prod");
+    set_field(&mut app, form::Field::Password, "s3cret");
+    app.on_key(ctrl('s'));
+    type_str(&mut app, "first master");
+    app.on_key(key(KeyCode::Tab));
+    type_str(&mut app, "first master");
+    app.on_key(key(KeyCode::Enter));
+    assert!(render(&mut app, 100, 30).contains("Creating the vault…"));
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(toast(&app), "Password was not saved");
+    let event = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await.unwrap().unwrap();
+    assert!(matches!(event, AppEvent::VaultOpened { create: true, .. }));
+    app.on_app_event(event);
+    assert!(!path.exists() && app.vault.is_none() && app.popup.is_none());
+    assert_eq!(credential(&app, &app.config.connections[0].id.clone()), CredentialStore::None);
+    // The next save asks to create one again.
+    app.on_key(key(KeyCode::Char('e')));
+    focus(&mut app, form::Field::SavePassword);
+    app.on_key(key(KeyCode::Char(' ')));
+    set_field(&mut app, form::Field::Password, "s3cret");
+    app.on_key(ctrl('s'));
+    assert!(matches!(&app.popup, Some(Popup::Vault(v)) if v.create));
+}
+
+/// `--read-only` makes every connection of the run read-only, including
+/// ones opened again from the list.
+#[tokio::test]
+async fn read_only_runs_stay_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sqlite_db(dir.path(), "t.db", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut app = App::new(Config { connections: vec![profile], ..Config::default() }, tx);
+    app.read_only_run = true;
+    assert!(render(&mut app, 120, 30).contains("READ-ONLY RUN"));
+    // Opened at start-up, then again from the list.
+    app.start(app.config.connections[0].clone());
+    for again in [true, false] {
+        wait_for(&mut app, &mut rx, |a| a.browser.is_some()).await;
+        let b = app.browser.as_ref().unwrap();
+        assert_eq!(b.session.read_only_reason.as_deref(), Some("dbtui was started with --read-only"));
+        assert!(b.fully_read_only());
+        // The database itself refuses writes too.
+        assert!(b.db.run_query("INSERT INTO t VALUES (5)", false).await.is_err());
+        app.run_command("q!");
+        if again {
+            app.on_key(key(KeyCode::Enter));
+        }
+    }
+    assert!(!app.config.connections[0].read_only, "the saved profile is unchanged");
 }
 
 /// Two instances sharing a configuration keep each other's changes.
@@ -1102,14 +1364,14 @@ async fn cell_editor_keeps_values_exactly() {
 }
 
 /// Audit L8: binary values are shown as `0x…`; that text is never written
-/// back by editing the cell.
+/// back by editing the cell, nor by pasting a copy of it.
 #[tokio::test]
 async fn binary_values_are_not_edited_as_text() {
     let dir = tempfile::tempdir().unwrap();
     let profile = sqlite_db(
         dir.path(),
         "t.db",
-        "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB); INSERT INTO files VALUES (1, x'CAFE');",
+        "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB); INSERT INTO files VALUES (1, x'CAFE'), (2, 'text');",
     )
     .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1121,6 +1383,26 @@ async fn binary_values_are_not_edited_as_text() {
     app.on_key(key(KeyCode::Enter));
     let Some(Popup::CellView { text, .. }) = &app.popup else { panic!("expected the viewer") };
     assert_eq!(text, "0xcafe");
+
+    // Copied to the clipboard as shown, but not for pasting into a cell,
+    // which would store the text '0xcafe'.
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(ctrl('c'));
+    assert_eq!(app.register.as_deref(), Some("text"));
+    app.on_key(key(KeyCode::Up));
+    app.on_key(ctrl('c'));
+    assert_eq!(crate::clipboard::sent().as_deref(), Some("0xcafe"));
+    assert_eq!(app.register, None);
+    assert!(toast(&app).contains("binary data, shown as hex. It cannot be pasted into a cell"), "{}", toast(&app));
+    app.on_key(key(KeyCode::F(3)));
+    app.on_key(key(KeyCode::Char('y')));
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.register, None);
+    app.on_key(key(KeyCode::Down));
+    app.on_key(ctrl('v'));
+    assert_eq!(toast(&app), "Nothing to paste — copy a cell first");
+    assert_eq!(table(&app).grid.pending_count(), 0);
 }
 
 /// Audit M4: a saved password read for a connection attempt that was given
@@ -1402,4 +1684,23 @@ async fn panics_in_background_work_end_the_request() {
     }
     let screen = render(&mut app, 120, 30);
     assert!(!screen.contains("Loading"), "{screen}");
+}
+
+/// A refused certificate says what to do about it: remote profiles verify
+/// the server by default, including ones saved without an SSL mode.
+#[test]
+fn certificate_errors_come_with_a_hint() {
+    let error = |text: &str| connect_error(anyhow::anyhow!("{text}").context("could not connect to PostgreSQL"));
+    let unknown =
+        error("error occurred while attempting to establish a TLS connection: invalid peer certificate: UnknownIssuer");
+    assert!(unknown.contains("UnknownIssuer\n\nThe server's certificate is not from a CA dbtui trusts"), "{unknown}");
+    assert!(unknown.contains("set CA file (ssl_ca)"), "{unknown}");
+    let name =
+        error("invalid peer certificate: certificate not valid for name \"db\"; certificate is only valid for x");
+    assert!(name.contains("issued for another host name"), "{name}");
+    assert!(error("invalid peer certificate: Expired").contains("could not be verified"));
+    assert_eq!(
+        error("password authentication failed"),
+        "could not connect to PostgreSQL: password authentication failed"
+    );
 }

@@ -392,8 +392,8 @@ impl Database {
                         SslMode::Disable => PgSslMode::Disable,
                         SslMode::Prefer => PgSslMode::Prefer,
                         SslMode::Require => PgSslMode::Require,
-                        SslMode::VerifyCa => PgSslMode::VerifyCa,
-                        SslMode::VerifyFull => PgSslMode::VerifyFull,
+                        // verify-ca is refused by `check_tls`.
+                        SslMode::VerifyCa | SslMode::VerifyFull => PgSslMode::VerifyFull,
                     })
                     // Even when empty, so that PGPASSWORD is never sent.
                     .password(password.unwrap_or_default());
@@ -426,8 +426,7 @@ impl Database {
                         SslMode::Disable => MySqlSslMode::Disabled,
                         SslMode::Prefer => MySqlSslMode::Preferred,
                         SslMode::Require => MySqlSslMode::Required,
-                        SslMode::VerifyCa => MySqlSslMode::VerifyCa,
-                        SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+                        SslMode::VerifyCa | SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
                     });
                 if let Some(ca) = &ssl_ca {
                     opts = opts.ssl_ca(ca);

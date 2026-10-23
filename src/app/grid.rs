@@ -174,6 +174,14 @@ impl Grid {
         }
     }
 
+    /// Whether cell (`row`, `col`) shows a stored binary value as `0x…`.
+    pub fn binary(&self, row: usize, col: usize) -> bool {
+        match self.cell(row, col).1 {
+            CellState::Clean | CellState::Deleted => self.kind(row, col).is_binary(),
+            CellState::Edited | CellState::Inserted => false,
+        }
+    }
+
     /// How many fetched values were too large to load in full.
     pub fn cut_count(&self) -> usize {
         self.kinds.iter().flatten().filter(|k| k.truncated().is_some()).count()

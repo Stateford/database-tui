@@ -176,10 +176,12 @@ async fn pg_prefer_is_only_the_default_for_local_servers() {
     assert_eq!(SslMode::default_for_host("db.example.com"), SslMode::VerifyFull);
 }
 
-/// Audit M2: verify-ca without the profile's own CA would trust any public
-/// certificate for any name, so it is refused before anything is sent.
+/// Audit M2: sqlx's verify-ca trusts the public CAs whatever the CA file,
+/// and does not check the host name, so any public certificate for any
+/// name would pass: it is refused before anything is sent. A missing CA
+/// file is reported before connecting too.
 #[tokio::test]
-async fn verify_ca_needs_an_existing_ca_file() {
+async fn verify_ca_is_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
@@ -187,8 +189,11 @@ async fn verify_ca_needs_an_existing_ca_file() {
     for driver in [Driver::Postgres, Driver::MySql] {
         let mut p = profile(driver, port);
         p.ssl_mode = SslMode::VerifyCa;
+        p.ssl_ca = dir.path().join("ca.pem").to_string_lossy().into_owned();
+        std::fs::write(&p.ssl_ca, "").unwrap();
         let err = Database::connect(&p, Some("s3cret")).await.err().unwrap().to_string();
-        assert!(err.contains("verify-ca needs a CA file"), "{err}");
+        assert!(err.contains("verify-ca is not supported"), "{err}");
+        p.ssl_mode = SslMode::VerifyFull;
         p.ssl_ca = dir.path().join("missing.pem").to_string_lossy().into_owned();
         let err = Database::connect(&p, Some("s3cret")).await.err().unwrap().to_string();
         assert!(err.contains("not found"), "{err}");

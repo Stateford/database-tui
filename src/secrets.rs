@@ -131,21 +131,24 @@ impl StoredSecret {
         Ok(StoredSecret { password: Zeroizing::new(password.to_string()), endpoint: Some(endpoint) })
     }
 
-    /// False for a password saved before passwords were bound to a server:
-    /// it should be saved again, bound, once it has worked.
-    pub fn is_bound(&self) -> bool {
-        self.endpoint.is_some()
+    /// A password saved before passwords were bound to a server. Nothing
+    /// says which server it is for (the profile may have been pointed
+    /// elsewhere since), so it is only sent once the user has confirmed
+    /// where it goes, then saved again, bound.
+    pub fn unbound_password(&self) -> Option<&Zeroizing<String>> {
+        self.endpoint.is_none().then_some(&self.password)
     }
 
-    /// The password, if it may be sent to `endpoint`. A password saved
-    /// without its server counts as saved for `legacy`, the server of the
-    /// profile as it was saved.
-    pub fn password_for(&self, endpoint: &Endpoint, legacy: &Endpoint) -> Result<&Zeroizing<String>, String> {
-        let saved_for = self.endpoint.as_ref().unwrap_or(legacy);
-        if saved_for == endpoint {
-            Ok(&self.password)
-        } else {
-            Err(format!("The saved password is for {saved_for}, not {endpoint}: enter the password for this server."))
+    /// The password, if it was saved for `endpoint`; otherwise why not.
+    pub fn password_for(&self, endpoint: &Endpoint) -> Result<&Zeroizing<String>, String> {
+        match &self.endpoint {
+            Some(saved_for) if saved_for == endpoint => Ok(&self.password),
+            Some(saved_for) => Err(format!(
+                "The saved password is for {saved_for}, not {endpoint}: enter the password for this server."
+            )),
+            None => Err("The saved password was saved by an earlier version of dbtui, which did not record the \
+                         server it is for: connect from the list once to confirm that server, or type the password."
+                .into()),
         }
     }
 }
@@ -507,6 +510,18 @@ impl Vault {
         write_vault(&self.path, &file)
     }
 
+    /// Deletes the vault file this vault was just created as, if it is
+    /// still that: no entries, the same key. True if it was deleted.
+    pub fn discard_if_empty(&self) -> Result<bool> {
+        let _lock = lock(&self.path)?;
+        let file = self.load()?;
+        if !file.entries.is_empty() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&self.path).with_context(|| format!("could not remove {}", self.path.display()))?;
+        Ok(true)
+    }
+
     /// Removes an entry, if there is one. Needs no master password: entries
     /// are sealed independently, so none is needed to drop one.
     pub fn remove(path: &Path, id: &str) -> Result<()> {
@@ -723,8 +738,7 @@ mod tests {
     }
 
     /// Audit L1: a password is only handed out for the server it was saved
-    /// for. One saved by an older version counts as saved for the profile's
-    /// server as it was saved.
+    /// for. One saved by an older version, which does not say, is kept apart.
     #[test]
     fn passwords_are_bound_to_their_endpoint() {
         let saved = endpoint("db.example.com");
@@ -733,22 +747,23 @@ mod tests {
         assert_eq!(saved.to_string(), "postgres://app@db.example.com:5432");
 
         let secret = StoredSecret::decode(encode(&saved, "pw\nwith newline")).unwrap();
-        assert!(secret.is_bound());
-        assert_eq!(secret.password_for(&saved, &endpoint("other")).unwrap().as_str(), "pw\nwith newline");
+        assert_eq!(secret.password_for(&saved).unwrap().as_str(), "pw\nwith newline");
         for other in [
             endpoint("evil.example.com"),
             Endpoint { port: 6432, ..saved.clone() },
             Endpoint { user: "postgres".into(), ..saved.clone() },
             Endpoint { driver: Driver::MySql, ..saved.clone() },
         ] {
-            let err = secret.password_for(&other, &saved).unwrap_err();
+            let err = secret.password_for(&other).unwrap_err();
             assert!(err.contains("postgres://app@db.example.com:5432") && err.contains(&other.to_string()), "{err}");
         }
 
+        assert!(secret.unbound_password().is_none());
         let legacy = StoredSecret::decode(Zeroizing::new("old-password".into())).unwrap();
-        assert!(!legacy.is_bound());
-        assert_eq!(legacy.password_for(&saved, &saved).unwrap().as_str(), "old-password");
-        assert!(legacy.password_for(&endpoint("evil.example.com"), &saved).is_err());
+        assert_eq!(legacy.unbound_password().unwrap().as_str(), "old-password");
+        // Never handed out as if it were for a given server.
+        let err = legacy.password_for(&saved).unwrap_err();
+        assert!(err.contains("saved by an earlier version"), "{err}");
 
         assert!(StoredSecret::decode(Zeroizing::new(format!("{BOUND_PREFIX}{{not json\npw"))).is_err());
     }
@@ -767,7 +782,7 @@ mod tests {
         assert_eq!((after.kdf.m_cost, after.kdf.t_cost, after.kdf.p_cost), (64 * 1024, 3, 1));
         assert_ne!(after.kdf.salt, before.kdf.salt);
         let secret = v.get("abc").unwrap().unwrap();
-        assert_eq!((secret.password(), secret.is_bound()), ("old-password", false));
+        assert_eq!((secret.password(), secret.endpoint()), ("old-password", None));
 
         let v = Vault::unlock(&path, "correct horse").unwrap();
         assert_eq!(v.get("abc").unwrap().unwrap().password(), "old-password");
@@ -807,6 +822,21 @@ mod tests {
         let err = Vault::create(&path, "battery staple").unwrap_err();
         assert!(err.is::<VaultExists>(), "{err}");
         let v = Vault::unlock(&path, "correct horse").unwrap();
+        assert_eq!(v.get("a").unwrap().unwrap().password(), "one");
+    }
+
+    /// A vault whose creation was cancelled is deleted, unless something was
+    /// saved in it meanwhile.
+    #[test]
+    fn only_empty_vaults_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.toml");
+        let v = Vault::create(&path, "correct horse").unwrap();
+        assert!(v.discard_if_empty().unwrap());
+        assert!(!path.exists());
+        let v = Vault::create(&path, "correct horse").unwrap();
+        v.set("a", &endpoint("db"), "one").unwrap();
+        assert!(!v.discard_if_empty().unwrap());
         assert_eq!(v.get("a").unwrap().unwrap().password(), "one");
     }
 

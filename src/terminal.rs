@@ -206,6 +206,16 @@ impl Signals {
         Ok(Signals {})
     }
 
+    /// Runs `work`, unless a signal asks dbtui to stop first. Anything dbtui
+    /// waits for once the UI is gone goes through this: the signals are
+    /// handled, so they would otherwise no longer end the process.
+    pub async fn run_until<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Stop> {
+        tokio::select! {
+            out = work => Ok(out),
+            stop = self.recv() => Err(stop),
+        }
+    }
+
     /// The next signal asking dbtui to stop.
     pub async fn recv(&mut self) -> Stop {
         #[cfg(unix)]
@@ -259,7 +269,8 @@ mod tests {
             ACTIVE.store(true, Ordering::SeqCst);
             let worker = std::thread::spawn(|| panic!("in a worker"));
             assert!(worker.join().is_err());
-            let kept = take_background_panic().unwrap();
+            // The location uses the platform's path separator.
+            let kept = take_background_panic().unwrap().replace('\\', "/");
             assert!(kept.starts_with("in a worker (at src/terminal.rs:"), "{kept}");
             assert!(ACTIVE.load(Ordering::SeqCst), "the UI goes on");
             let caught = catch_panic_blocking(|| panic!("caught"));
@@ -278,7 +289,12 @@ mod tests {
         let (before, after) = stdout.split_once("--- before the UI panic").expect("the child ran");
         // Nothing reached the screen from the worker or the caught panic.
         assert!(!before.contains('\x1b') && !stderr.contains("in a worker") && !stderr.contains("caught"), "{stderr}");
+        // A Windows console may be reset through its API instead, which
+        // writes nothing to the (piped) output.
+        #[cfg(unix)]
         assert!(after.contains("\x1b[?2004l") && after.contains("\x1b[?1049l"), "{after:?}");
+        #[cfg(not(unix))]
+        let _ = after;
         assert!(stderr.contains("in the UI"), "{stderr}");
     }
 
@@ -300,5 +316,15 @@ mod tests {
             let stop = tokio::time::timeout(std::time::Duration::from_secs(5), signals.recv()).await.unwrap();
             assert_eq!(stop, Stop { name, number });
         }
+        // Waiting for something once the UI is gone (a connection to close,
+        // the keyring) still ends on a signal.
+        assert_eq!(signals.run_until(async { 7 }).await, Ok(7));
+        let stuck = async {
+            // SAFETY: as above.
+            unsafe { libc::raise(libc::SIGTERM) };
+            std::future::pending::<()>().await
+        };
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), signals.run_until(stuck)).await.unwrap();
+        assert_eq!(stopped, Err(Stop { name: "SIGTERM", number: libc::SIGTERM }));
     }
 }

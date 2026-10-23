@@ -97,7 +97,8 @@ Rows are identified by their primary key, never by where they are on screen:
   the grid shows, and SQLite keys keep their storage class: in a column without type affinity,
   integer `1` and text `'1'` are different rows that look the same. A row whose key is not shown
   exactly as stored (text that is not UTF-8, a MySQL `BIT` value) cannot be changed from the
-  grid; use the SQL editor. Binary values themselves cannot be edited as text either.
+  grid; use the SQL editor. Binary values themselves cannot be edited as text either, nor
+  pasted from a copy (which holds their `0x…` text).
 - **The cell editor remembers its row and column**, not their position. If the table is
   reloaded while it is open, the value goes to the same row wherever it now is, or, if the row
   is gone, the editor closes without staging anything. Confirming without a change stages
@@ -137,7 +138,8 @@ chooses them. dbtui shows them for what they are:
   clipboard with control characters other than tabs and line breaks replaced by their symbols:
   pasted into a terminal, `ESC [201~` in a value would end the paste early and type the rest as
   keys. dbtui says when it did this; pasting into a cell within dbtui keeps the value exactly.
-  At most 1 MiB goes to the clipboard.
+  At most 1 MiB goes to the clipboard. A binary value goes there as its `0x…` text, and cannot
+  be pasted into a cell (that would store the text).
 - **Large values are cut when loaded.** At most 256 KiB of each value is kept, and 32 MiB for a
   whole page or query result; past that, values keep just enough to fill a column. A view can
   produce values of any size without storing anything. Such a value ends in `…` in the grid, the
@@ -149,7 +151,9 @@ chooses them. dbtui shows them for what they are:
   table whose columns another program has just changed) ends that request with an
   "internal error" instead of leaving it loading, and any other is reported on screen. If the UI
   itself crashes, or dbtui gets SIGTERM or SIGHUP, the terminal is restored (raw mode, alternate
-  screen, bracketed paste) before it exits.
+  screen, bracketed paste) before it exits. Quitting gives the terminal back first, then waits at
+  most 2 seconds for work still running on the connection (a query, a commit) before closing it;
+  SIGTERM and SIGHUP end dbtui at any point.
 
 ## Connection security
 
@@ -161,7 +165,7 @@ proves that you are talking to the right server:
 | `disable`     | no                   | no                                                          |
 | `prefer`      | if the server agrees | no: any certificate is accepted, and TLS can be refused     |
 | `require`     | yes                  | no: any certificate is accepted                             |
-| `verify-ca`   | yes                  | partly: the certificate chain is checked, not the host name |
+| `verify-ca`   | refused              | no: any public certificate passes (see below)               |
 | `verify-full` | yes                  | yes: a trusted certificate for the host name you typed      |
 
 Without authentication, anyone who can intercept or redirect the connection (shared Wi-Fi, a
@@ -170,9 +174,17 @@ including one saved in the keyring or vault. So:
 
 - **Defaults**: a new profile uses `verify-full`, or `prefer` when the host is `localhost`, a
   loopback address or a Unix socket directory. A profile written without `ssl_mode` gets the
-  same default. Saved modes are kept as they are.
+  same default (earlier versions used `prefer`). Saved modes are kept as they are. When
+  `verify-full` refuses a certificate, the error says what to do: set a CA file, or use the host
+  name the certificate is for.
 - **Warnings**: the connection form, the connection list, the connect message and the status
-  bar warn when a remote profile uses `disable`, `prefer`, `require` or `verify-ca`.
+  bar warn when a remote profile uses `disable`, `prefer` or `require`. On a narrow terminal the
+  status bar keeps the warning (shortened to `⚠ unverified`) over less important details.
+- **Saved passwords only go to an authenticated server unasked**: connecting to a remote server
+  with one of those modes asks before sending the saved password, saying why (`y` sends it, `n`
+  or `Esc` cancels, `Enter` does nothing), and `Ctrl-T` in the form only tests with a typed
+  password. Profiles saved by earlier versions have `ssl_mode = "prefer"` written out, so they
+  ask until they are switched to `verify-full`.
 - **What was negotiated**: the status bar shows the transport the server reports (`pg_stat_ssl`
   on PostgreSQL, `Ssl_version` / `Ssl_cipher` on MySQL): `✓ TLSv1.3 verified`,
   `⚠ TLSv1.3 unverified`, `⚠ NOT ENCRYPTED`, or a plain `no TLS` / `socket` for local
@@ -181,10 +193,11 @@ including one saved in the keyring or vault. So:
   not the operating system's store. For a server with a private CA (company CA, AWS RDS, Cloud
   SQL, MySQL's self-generated certificates), set **CA file** (`ssl_ca`) to a PEM file. It is
   trusted in addition to the public roots.
-- **`verify-ca`** needs a CA file, as in libpq; a profile saved with `verify-ca` and no CA file
-  no longer connects. Even then, the public roots stay trusted and the host name is not
-  checked, so any publicly trusted certificate passes: prefer `verify-full`. A CA file with
-  `disable`, `prefer` or `require` is refused, because those modes ignore it.
+- **`verify-ca` is refused**: sqlx trusts the public roots in addition to the CA file and does
+  not check the host name, so any publicly trusted certificate, issued for any domain, would
+  pass. Use `verify-full`, with a CA file for a private CA. A profile saved with `verify-ca` must
+  be changed (in the form, changing its mode starts from `verify-full`). A CA file with
+  `disable`, `prefer` or `require` is refused too, because those modes ignore it.
 - **MySQL cleartext passwords**: sqlx 0.9 sends the password in clear text when the server's
   first packet asks for the `mysql_clear_password` plugin (an upstream bug: its own
   cleartext-plugin setting is not applied there). With `disable` or `prefer`, an attacker on the
@@ -205,12 +218,15 @@ A password you choose to save goes to the OS keyring or, when there is none (or 
 `secret_backend = "vault"`), to the encrypted vault.
 
 - **Bound to their server**: a password is saved together with the driver, host, port and user
-  it was entered for, and is only sent there. If a profile is changed to point somewhere else, in
-  the form or by editing `config.toml`, connecting asks for the password, says which server the
-  saved one belongs to, and saves what you type for the new server. `Ctrl-T` in the form only
-  uses the saved password while the form still points to that server. Passwords saved by
-  earlier versions do not record their server: they are used for the profile as saved, and saved
-  again with their server after the next successful connection.
+  it was entered for, and is only sent there. If `config.toml` is edited to point a profile
+  somewhere else, connecting asks for the password, says which server the saved one belongs to,
+  and saves what you type for the new server. Pointing a profile elsewhere in the form removes
+  its saved password when the form is saved (the form says so beforehand). `Ctrl-T` in the form
+  only uses the saved password while the form still points to that server.
+- **Passwords saved by earlier versions** do not record their server, and the profile may have
+  been pointed elsewhere since. They are never sent unasked: connecting shows where the
+  password would go and asks first (`Ctrl-T` does not use them). Once a connection with one
+  works, it is saved again with its server, and no longer asked about.
 - **Cleaned up**: deleting a profile removes its password from both the keyring and the vault,
   and a password that moves from one to the other is removed from the first.
 - **Slow keyrings**: a keyring waiting for its unlock prompt is not treated as a failure. After
@@ -221,7 +237,8 @@ A password you choose to save goes to the OS keyring or, when there is none (or 
   (8+ characters, never stored) with Argon2id, 64 MiB of memory and 3 passes. Vaults made by
   earlier versions (19 MiB, 2 passes) are re-encrypted with these settings when unlocked, and a
   vault file asking for more than 1 GiB, 10 passes or 8 lanes is refused. Creating a vault never
-  replaces an existing one, for example one another dbtui instance has just created.
+  replaces an existing one, for example one another dbtui instance has just created, and
+  pressing `Esc` while it is being created leaves no vault behind.
 - **In memory**: password fields and decrypted passwords are wiped once used, including the key
   derivation's working memory, and core dumps are disabled on Unix. The database driver keeps
   its own copy of the password while connected.
@@ -252,9 +269,14 @@ cargo build --release && ./target/release/dbtui
 dbtui                 # connection manager
 dbtui "prod replica"  # open a saved connection by name
 dbtui --read-only "prod replica"  # ...without allowing any change, whatever the profile says
+dbtui --read-only     # every connection opened in this run is read-only
 dbtui ./app.db        # open a SQLite file directly (add --read-only to be safe)
 dbtui --vim           # use (and remember) vim keys
 ```
+
+`--read-only` applies to every connection opened in that run, including ones opened again from
+the connection manager after disconnecting; the status bar shows `READ-ONLY RUN`, and the
+connection's read-only reason names the flag. Saved profiles are not changed.
 
 Press `n` in the connection manager to add a connection. `Ctrl-T` tests it and `Ctrl-S` saves it.
 Press `?` or `F1` anywhere for the full key reference.
@@ -282,7 +304,9 @@ Press `?` or `F1` anywhere for the full key reference.
 Settings live in `config.toml` in the platform config directory (for example
 `~/.config/dbtui/` on Linux). Set `DBTUI_CONFIG_DIR` to use a different directory. The file never
 contains passwords. Like the vault, it is replaced atomically by a new, randomly named file that
-only you can read (`0600`); a missing config directory is created `0700`. Several dbtui instances
+only you can read (`0600`); a missing config directory is created `0700`, and an existing one
+that earlier versions left readable by others is made `0700` if it holds only dbtui's files (a
+directory chosen with `DBTUI_CONFIG_DIR` that holds other files is left alone). Several dbtui instances
 can share the directory: each change is made, under a lock (`config.lock`, `vault.lock`), to the
 file as it is on disk, so an instance never overwrites what another one saved.
 
@@ -299,9 +323,9 @@ host = "localhost"
 port = 5432
 user = "app"
 database = "app"
-ssl_mode = "prefer"       # disable, prefer, require, verify-ca, verify-full; if left out:
+ssl_mode = "prefer"       # disable, prefer, require or verify-full; if left out:
                           # verify-full, or prefer for localhost and sockets
-# ssl_ca = "~/certs/db-ca.pem"   # optional: PEM file of a private CA
+# ssl_ca = "~/certs/db-ca.pem"   # optional, with verify-full: PEM file of a private CA
 read_only = false
 credential = "keyring"    # where the password is stored: none, keyring or vault
 ```

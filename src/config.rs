@@ -69,8 +69,10 @@ impl CredentialStore {
 
 /// TLS mode, named as in libpq. With sqlx only `verify-full` authenticates
 /// the server: `prefer` and `require` accept any certificate (and `prefer`
-/// falls back to plain TCP), and `verify-ca` checks the chain but not the
-/// host name, against the public web CAs as well as the profile's CA file.
+/// falls back to plain TCP). `verify-ca` would check the chain but not the
+/// host name, against the public web CAs as well as the profile's CA file:
+/// any public certificate, for any name, would pass. It is refused (see
+/// [`ConnectionProfile::check_tls`]), and only read from older files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SslMode {
@@ -82,8 +84,8 @@ pub enum SslMode {
 }
 
 impl SslMode {
-    pub const ALL: [SslMode; 5] =
-        [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull];
+    /// The modes that can be chosen.
+    pub const ALL: [SslMode; 4] = [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::VerifyFull];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -194,14 +196,16 @@ impl ConnectionProfile {
             return Ok(());
         }
         match self.ssl_mode {
-            // As in libpq: without its own CA, verify-ca would accept any
-            // certificate from a public CA, for any host name.
-            SslMode::VerifyCa if self.ssl_ca.trim().is_empty() => {
-                Err("verify-ca needs a CA file; use verify-full to check the server against public CAs".into())
-            }
+            // sqlx always trusts the public CAs as well as the CA file, and
+            // verify-ca does not check the host name: a certificate anyone
+            // can get for their own domain would pass.
+            SslMode::VerifyCa => Err("verify-ca is not supported: with dbtui's driver it would accept any publicly \
+                                      trusted certificate, for any host name. Use verify-full (with a CA file for a \
+                                      private CA)"
+                .into()),
             // libpq would verify the chain here; sqlx does not.
             SslMode::Disable | SslMode::Prefer | SslMode::Require if !self.ssl_ca.trim().is_empty() => {
-                Err(format!("a CA file is only used by verify-ca and verify-full, not by {}", self.ssl_mode.label()))
+                Err(format!("a CA file is only used by verify-full, not by {}", self.ssl_mode.label()))
             }
             _ => Ok(()),
         }
@@ -402,9 +406,12 @@ fn parent_dir(path: &Path) -> &Path {
 }
 
 /// Creates the directory, readable by the current user only, if it does
-/// not exist yet.
+/// not exist yet. One that exists is made private if it holds nothing but
+/// dbtui's files (older versions created it readable by everyone).
 fn create_private_dir(dir: &Path) -> Result<()> {
     if dir.is_dir() {
+        #[cfg(unix)]
+        make_private(dir);
         return Ok(());
     }
     let mut builder = std::fs::DirBuilder::new();
@@ -415,6 +422,29 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir).with_context(|| format!("could not create {}", dir.display()))
+}
+
+/// Removes the group and other permissions of `dir`, when it belongs to the
+/// current user and only holds files dbtui writes there: a directory chosen
+/// with `DBTUI_CONFIG_DIR` that holds anything else is left as it is. Best
+/// effort: the files themselves are private either way.
+#[cfg(unix)]
+fn make_private(dir: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::metadata(dir) else { return };
+    // SAFETY: plain system call, without arguments.
+    if meta.mode() & 0o077 == 0 || meta.uid() != unsafe { libc::geteuid() } {
+        return;
+    }
+    let ours = |name: &std::ffi::OsStr| {
+        name.to_str().is_some_and(|n| {
+            ["config.toml", "config.lock", "vault.toml", "vault.lock"].contains(&n) || n.starts_with(".dbtui-")
+        })
+    };
+    let Ok(mut entries) = std::fs::read_dir(dir) else { return };
+    if entries.all(|e| e.is_ok_and(|e| ours(&e.file_name()))) {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.mode() & 0o7700));
+    }
 }
 
 /// Atomically writes a file that only the current user can read.
@@ -523,6 +553,33 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
     }
 
+    /// Audit L3: a config directory an older version created readable by
+    /// everyone is made private; a directory holding other files (one
+    /// chosen with DBTUI_CONFIG_DIR, say) is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn existing_config_directories_are_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("dbtui");
+        let shared = dir.path().join("shared");
+        for d in [&old, &shared] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_private(&d.join("config.toml"), b"").unwrap();
+        }
+        assert_eq!(mode(&old), 0o700);
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Config::update_at(&old.join("config.toml"), |c| c.page_size = 10).unwrap();
+        assert_eq!(mode(&old), 0o700, "taken by the lock as well");
+
+        std::fs::write(shared.join("notes.txt"), b"mine").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_private(&shared.join("config.toml"), b"").unwrap();
+        assert_eq!(mode(&shared), 0o755);
+    }
+
     /// Two dbtui instances changing the configuration at the same time keep
     /// each other's changes: each change is made to the file as it is.
     #[test]
@@ -629,7 +686,8 @@ mod tests {
     }
 
     /// Audit M1/M2: modes that do not authenticate a remote server are
-    /// flagged, and verify-ca is only accepted with the profile's own CA.
+    /// flagged, and verify-ca, which would accept any public certificate
+    /// whatever the CA file, is refused.
     #[test]
     fn tls_checks_and_warnings() {
         let mut p = ConnectionProfile::new(Driver::Postgres);
@@ -642,12 +700,13 @@ mod tests {
         p.ssl_mode = SslMode::VerifyFull;
         assert_eq!((p.check_tls(), p.tls_warning()), (Ok(()), None));
 
-        p.ssl_mode = SslMode::VerifyCa;
-        assert!(p.check_tls().unwrap_err().contains("CA file"));
         p.ssl_ca = "ca.pem".into();
         assert!(p.check_tls().is_ok());
+        p.ssl_mode = SslMode::VerifyCa;
+        assert!(p.check_tls().unwrap_err().contains("verify-ca is not supported"));
+        assert!(!SslMode::ALL.contains(&SslMode::VerifyCa));
         p.ssl_mode = SslMode::Require;
-        assert!(p.check_tls().unwrap_err().contains("only used by verify-ca and verify-full"));
+        assert!(p.check_tls().unwrap_err().contains("only used by verify-full"));
 
         let mut file = ConnectionProfile::new(Driver::Sqlite);
         file.ssl_mode = SslMode::Disable;

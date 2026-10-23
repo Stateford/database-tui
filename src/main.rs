@@ -36,7 +36,7 @@ ARGS:
 OPTIONS:
     --vim            use vim-style keys (saved as your preference)
     --standard       use standard keys (saved as your preference)
-    --read-only      open the CONNECTION or FILE.db read-only
+    --read-only      make every connection opened in this run read-only
     -h, --help       show this help
     -V, --version    show the version
 
@@ -79,7 +79,12 @@ fn main() -> Result<ExitCode> {
     // SAFETY: nothing has spawned a thread yet.
     unsafe { db::clear_client_environment() };
     disable_core_dumps();
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main())
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = runtime.block_on(async_main());
+    // Work still running in the background (a keyring read waiting for its
+    // unlock prompt, a query) must not keep dbtui from exiting.
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    result
 }
 
 /// A core dump would contain the passwords and the vault key in memory.
@@ -108,15 +113,25 @@ async fn async_main() -> Result<ExitCode> {
 
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(config, tx);
+    app.read_only_run = args.read_only;
     if let Some(profile) = startup {
         app.start(profile);
     }
 
     let mut signals = terminal::Signals::new().context("listening for signals")?;
     let mut terminal = terminal::init().context("setting up the terminal")?;
-    let result = run(&mut terminal, app, rx, &mut signals).await;
+    let result = run(&mut terminal, &mut app, rx, &mut signals).await;
     terminal::restore();
-    match result? {
+    let mut exit = result?;
+    // Closing the connection waits for what still runs on it (a query, a
+    // commit): only for so long, with the terminal already given back, and
+    // a signal still ends dbtui meanwhile.
+    if let (Exit::Quit, Some(b)) = (&exit, app.browser.take())
+        && let Err(stop) = signals.run_until(close_within(&b.db, CLOSE_TIMEOUT)).await
+    {
+        exit = Exit::Stopped(stop);
+    }
+    match exit {
         Exit::Quit => Ok(ExitCode::SUCCESS),
         Exit::Stopped(stop) => {
             // The terminal may be gone (SIGHUP): never fail over this.
@@ -124,6 +139,16 @@ async fn async_main() -> Result<ExitCode> {
             Ok(ExitCode::from(stop.exit_code()))
         }
     }
+}
+
+/// How long quitting waits for the connection to close.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Closes `db`, waiting at most `limit` for work still running on it to end
+/// (`false` if it had not). Past that, its connections are dropped with the
+/// process, and the server rolls back what they had not committed.
+async fn close_within(db: &db::Database, limit: Duration) -> bool {
+    tokio::time::timeout(limit, db.close()).await.is_ok()
 }
 
 /// How the UI loop ended.
@@ -135,14 +160,8 @@ enum Exit {
 
 /// The saved connection or SQLite file named on the command line.
 fn startup_profile(config: &Config, args: &Args) -> Result<Option<ConnectionProfile>> {
-    let Some(target) = &args.target else {
-        if args.read_only {
-            // Don't let the flag look like it protects connections opened later.
-            anyhow::bail!("--read-only needs a CONNECTION or FILE.db to open\n\n{USAGE}");
-        }
-        return Ok(None);
-    };
-    let mut profile = match config.connections.iter().find(|p| p.name == *target) {
+    let Some(target) = &args.target else { return Ok(None) };
+    let profile = match config.connections.iter().find(|p| p.name == *target) {
         Some(p) => p.clone(),
         None if std::path::Path::new(target).is_file() => {
             let mut p = ConnectionProfile::new(Driver::Sqlite);
@@ -155,21 +174,21 @@ fn startup_profile(config: &Config, args: &Args) -> Result<Option<ConnectionProf
         }
         None => anyhow::bail!("no saved connection or file named {target:?}"),
     };
-    // The flag can only make a saved profile stricter, never looser.
-    profile.read_only |= args.read_only;
+    // `--read-only` is not applied here: it applies to every connection of
+    // the run (see `App::read_only_run`), this one included.
     Ok(Some(profile))
 }
 
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    mut app: App,
+    app: &mut App,
     mut rx: mpsc::UnboundedReceiver<app::AppEvent>,
     signals: &mut terminal::Signals,
 ) -> Result<Exit> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
@@ -191,14 +210,12 @@ async fn run(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while app.keyring_busy() {
         app.busy = Some("Finishing with the OS keyring".into());
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(event)) => app.on_app_event(event),
-            _ => break,
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        match signals.run_until(tokio::time::timeout_at(deadline, rx.recv())).await {
+            Err(stop) => return Ok(Exit::Stopped(stop)),
+            Ok(Ok(Some(event))) => app.on_app_event(event),
+            Ok(_) => break,
         }
-    }
-    if let Some(b) = &app.browser {
-        b.db.close().await;
     }
     Ok(Exit::Quit)
 }
@@ -211,8 +228,31 @@ mod tests {
         Args { keymap: None, read_only, target: target.map(Into::into) }
     }
 
+    /// Quitting does not hang on a connection still in use (a long query, a
+    /// commit waiting for a lock): closing it gives up after a while.
+    #[tokio::test]
+    async fn closing_does_not_wait_for_running_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.db");
+        std::fs::File::create(&file).unwrap();
+        let mut profile = ConnectionProfile::new(Driver::Sqlite);
+        profile.path = file.to_string_lossy().into_owned();
+        let db = db::Database::connect(&profile, None).await.unwrap();
+        let db::Database::Sqlite(pool, _) = &db else { unreachable!() };
+        let busy = pool.acquire().await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(!close_within(&db, Duration::from_millis(200)).await);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(busy);
+        assert!(close_within(&db, Duration::from_secs(5)).await);
+        assert!(db.is_closed());
+    }
+
+    /// The target is a saved connection, by name, or a SQLite file. Saved
+    /// profiles are opened as saved: `--read-only` applies to the whole run
+    /// (see `read_only_runs_stay_read_only` in the app tests).
     #[test]
-    fn read_only_flag_applies_to_saved_connections_and_files() {
+    fn startup_targets() {
         let mut config = Config::default();
         let mut saved = ConnectionProfile::new(Driver::Postgres);
         saved.name = "prod".into();
@@ -222,9 +262,7 @@ mod tests {
         config.connections.push(saved);
 
         let open = |target, read_only| startup_profile(&config, &args(Some(target), read_only)).unwrap().unwrap();
-        assert!(open("prod", true).read_only);
-        assert!(!open("prod", false).read_only);
-        // A profile marked read-only stays read-only without the flag.
+        assert_eq!(open("prod", true), config.connections[0]);
         assert!(open("locked", false).read_only);
 
         let dir = tempfile::tempdir().unwrap();
@@ -232,11 +270,10 @@ mod tests {
         std::fs::File::create(&file).unwrap();
         let file = file.to_string_lossy().into_owned();
         let p = open(&file, true);
-        assert_eq!((p.driver, p.name.as_str(), p.read_only), (Driver::Sqlite, "app.db", true));
-        assert!(!open(&file, false).read_only);
+        assert_eq!((p.driver, p.name.as_str()), (Driver::Sqlite, "app.db"));
 
         assert!(startup_profile(&config, &args(None, false)).unwrap().is_none());
-        assert!(startup_profile(&config, &args(None, true)).is_err());
+        assert!(startup_profile(&config, &args(None, true)).unwrap().is_none());
         assert!(startup_profile(&config, &args(Some("missing"), true)).is_err());
     }
 }

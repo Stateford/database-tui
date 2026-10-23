@@ -217,10 +217,52 @@ fn mode_pill(app: &App) -> Span<'static> {
     }
 }
 
+/// A part of the status bar. When the bar is too narrow, parts go in order
+/// of `rank`, highest first; one with a `short` form is shortened first.
+struct Part {
+    spans: Vec<Span<'static>>,
+    rank: u8,
+    /// The rank and spans of the shorter form.
+    short: Option<(u8, Vec<Span<'static>>)>,
+    /// Drawn right-aligned, after the others.
+    right: bool,
+}
+
+impl Part {
+    fn new(rank: u8, spans: Vec<Span<'static>>) -> Part {
+        Part { spans, rank, short: None, right: false }
+    }
+
+    fn right(rank: u8, spans: Vec<Span<'static>>) -> Part {
+        Part { right: true, ..Part::new(rank, spans) }
+    }
+
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+}
+
+/// Shortens or drops parts, least important first, until they fit `width`.
+fn fit_parts(parts: &mut Vec<Part>, width: usize) {
+    while parts.iter().map(Part::width).sum::<usize>() > width {
+        let Some(i) = (0..parts.len()).max_by_key(|&i| (parts[i].rank, i)) else { return };
+        match parts[i].short.take() {
+            Some((rank, spans)) => (parts[i].rank, parts[i].spans) = (rank, spans),
+            None => drop(parts.remove(i)),
+        }
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Block::default().style(Style::default().bg(BG_DARK)), area);
-    let mut left = vec![mode_pill(app), Span::raw(" ")];
-    let mut right: Vec<Span> = Vec::new();
+    // What matters most when the bar is narrow: the access level, whether
+    // work is running (a commit, say), whether the server is authenticated,
+    // and how many changes are staged.
+    let mut parts = vec![Part::new(4, vec![mode_pill(app), Span::raw(" ")])];
+    if let Some(busy) = &app.busy {
+        let text = format!("{} {}… ", spinner(app), safe_line(busy));
+        parts.push(Part::right(1, vec![Span::styled(text, Style::default().fg(CYAN))]));
+    }
 
     if let (Some(b), Screen::Browser) = (&app.browser, app.screen) {
         let level = b.access_level();
@@ -230,26 +272,48 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             AccessLevel::Superuser => RED,
         };
         let icon = if level == AccessLevel::ReadOnly { "🔒" } else { "●" };
-        left.push(Span::styled(format!(" {icon} {} ", level.label()), pill(color)));
-        left.push(Span::styled(format!(" {} ", safe_line(&b.session.user)), Style::default().fg(FG)));
+        parts.push(Part::new(1, vec![Span::styled(format!(" {icon} {} ", level.label()), pill(color))]));
+        parts.push(Part::new(
+            7,
+            vec![Span::styled(format!(" {} ", safe_line(&b.session.user)), Style::default().fg(FG))],
+        ));
         if let Some((label, trust)) = b.session.transport.summary(&b.profile) {
             // The TLS version is as the server reports it.
             let label = safe_line(&label);
-            left.push(match trust {
-                TransportTrust::Local => Span::styled(format!("{label} "), dim()),
-                TransportTrust::Verified => Span::styled(format!("✓ {label} "), Style::default().fg(GREEN)),
-                TransportTrust::Unverified => Span::styled(format!(" ⚠ {label} "), pill(YELLOW)),
-                TransportTrust::Exposed => Span::styled(format!(" ⚠ {label} "), pill(RED)),
-            });
-            left.push(Span::raw(" "));
+            let warn = |color| Span::styled(format!(" ⚠ {label} "), pill(color));
+            let mut part = match trust {
+                TransportTrust::Local => Part::new(7, vec![Span::styled(format!("{label} "), dim())]),
+                TransportTrust::Verified => {
+                    let style = Style::default().fg(GREEN);
+                    let mut part = Part::new(5, vec![Span::styled(format!("✓ {label} "), style)]);
+                    part.short = Some((5, vec![Span::styled("✓ TLS ", style)]));
+                    part
+                }
+                TransportTrust::Unverified => {
+                    let mut part = Part::new(5, vec![warn(YELLOW)]);
+                    part.short = Some((2, vec![Span::styled(" ⚠ unverified ", pill(YELLOW))]));
+                    part
+                }
+                TransportTrust::Exposed => Part::new(2, vec![warn(RED)]),
+            };
+            part.spans.push(Span::raw(" "));
+            if let Some((_, short)) = &mut part.short {
+                short.push(Span::raw(" "));
+            }
+            parts.push(part);
         }
         if let Some(t) = &b.table {
-            left.push(Span::styled("│ ", Style::default().fg(BORDER)));
-            left.push(Span::styled(format!("{} ", crate::util::ident(&t.info.table.name)), Style::default().fg(CYAN)));
-            left.extend(privilege_spans(t.privileges()));
+            parts.push(Part::new(
+                6,
+                vec![
+                    Span::styled("│ ", Style::default().fg(BORDER)),
+                    Span::styled(format!("{} ", crate::util::ident(&t.info.table.name)), Style::default().fg(CYAN)),
+                ],
+            ));
+            parts.push(Part::new(8, privilege_spans(t.privileges())));
             let pending = t.grid.pending_count();
             if pending > 0 {
-                left.push(Span::styled(format!(" ✎ {pending} pending "), pill(ORANGE)));
+                parts.push(Part::new(2, vec![Span::styled(format!(" ✎ {pending} pending "), pill(ORANGE))]));
             }
         }
         let grid = match b.tab {
@@ -260,29 +324,29 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         if let Some((g, first)) = grid
             && !g.is_empty()
         {
-            right.push(Span::styled(
-                format!("row {}/{}  col {}/{} ", first + g.row + 1, first + g.total_rows(), g.col + 1, g.columns.len()),
-                dim(),
-            ));
+            let position =
+                format!("row {}/{}  col {}/{} ", first + g.row + 1, first + g.total_rows(), g.col + 1, g.columns.len());
+            parts.push(Part::right(9, vec![Span::styled(position, dim())]));
         }
     } else {
         let n = app.config.connections.len();
-        left.push(Span::styled(
-            format!(" {n} saved connection{} ", if n == 1 { "" } else { "s" }),
-            Style::default().fg(FG_DIM),
-        ));
+        let count = format!(" {n} saved connection{} ", if n == 1 { "" } else { "s" });
+        parts.push(Part::new(6, vec![Span::styled(count, Style::default().fg(FG_DIM))]));
+        if app.read_only_run {
+            parts.push(Part::new(1, vec![Span::styled(" 🔒 READ-ONLY RUN ", pill(YELLOW)), Span::raw(" ")]));
+        }
         let vault = if app.vault.is_some() { " · vault unlocked" } else { "" };
-        right.push(Span::styled(format!("passwords: {:?}{vault} ", app.config.secret_backend).to_lowercase(), dim()));
+        let backend = format!("passwords: {:?}{vault} ", app.config.secret_backend).to_lowercase();
+        parts.push(Part::right(9, vec![Span::styled(backend, dim())]));
     }
-    if let Some(busy) = &app.busy {
-        right.insert(0, Span::styled(format!("{} {}… ", spinner(app), safe_line(busy)), Style::default().fg(CYAN)));
-    }
-    // The right part yields to the left one (access level, transport).
-    let left = Line::from(left);
+    fit_parts(&mut parts, area.width as usize);
+    let (right, left): (Vec<Part>, Vec<Part>) = parts.into_iter().partition(|p| p.right);
+    let left = Line::from(left.into_iter().flat_map(|p| p.spans).collect::<Vec<_>>());
     let left_width = (left.width() as u16).min(area.width);
     frame.render_widget(Paragraph::new(left), area);
     let right_area = Rect { x: area.x + left_width, width: area.width - left_width, ..area };
-    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), right_area);
+    let right = Line::from(right.into_iter().flat_map(|p| p.spans).collect::<Vec<_>>());
+    frame.render_widget(Paragraph::new(right).right_aligned(), right_area);
 }
 
 /// Rounded panel with a title that lights up when focused.
