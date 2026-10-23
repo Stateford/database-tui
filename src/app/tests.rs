@@ -646,7 +646,11 @@ async fn saved_passwords_need_an_authenticated_server() {
     wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
     assert!(matches!(app.popup, Some(Popup::Message { .. })), "connected without asking");
     app.on_key(key(KeyCode::Esc));
+    #[cfg(unix)]
     assert!(server.recv_timeout(Duration::from_secs(5)).unwrap().password.is_none());
+    // Elsewhere 0.0.0.0 is not connectable, so the server sees nothing at all.
+    #[cfg(not(unix))]
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
 
     // Accepted: sent this time.
     app.update_config(|c| c.connections[0].ssl_mode = SslMode::Prefer);
