@@ -5,26 +5,37 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::{
-    ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    hex_bytes, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
+    TableStructure, Transport, capped_hex, capped_text, truthy,
 };
 
 pub(super) fn cell_text(row: &SqliteRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+    cell(row, idx, usize::MAX).0
+}
+
+/// A value's text, and its storage class: a column without type affinity
+/// can hold integer 1, real 1.5, text '1' and a blob side by side.
+pub(super) fn cell(row: &SqliteRow, idx: usize, max: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
+    // The value's storage class, not the column's declared type.
     let ty = raw.type_info().name().to_string();
-    match ty.as_str() {
-        "INTEGER" | "BOOLEAN" => row.try_get_unchecked::<i64, _>(idx).ok().map(|v| v.to_string()),
-        // Debug keeps the decimal point (`3.0`, not `3`).
-        "REAL" => row.try_get_unchecked::<f64, _>(idx).ok().map(|v| format!("{v:?}")),
-        "BLOB" => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| hex_bytes(&b)),
-        _ => match row.try_get_unchecked::<String, _>(idx) {
-            Ok(s) => Some(s),
-            Err(_) => row.try_get_unchecked::<Vec<u8>, _>(idx).ok().map(|b| hex_bytes(&b)),
+    let decoded = match ty.as_str() {
+        "INTEGER" | "BOOLEAN" => {
+            row.try_get_unchecked::<i64, _>(idx).ok().map(|v| (Some(v.to_string()), CellKind::Integer))
+        }
+        // Debug keeps the decimal point (`3.0`, not `3`) and reads back exactly.
+        "REAL" => row.try_get_unchecked::<f64, _>(idx).ok().map(|v| (Some(format!("{v:?}")), CellKind::Real)),
+        "BLOB" => row.try_get_unchecked::<&[u8], _>(idx).ok().map(|b| capped_hex(b, CellKind::Bytes, max)),
+        _ => match row.try_get_unchecked::<&str, _>(idx) {
+            Ok(s) => Some(capped_text(s, CellKind::Text, max)),
+            // Text that is not UTF-8: shown as hex, which it is not.
+            Err(_) => row.try_get_unchecked::<&[u8], _>(idx).ok().map(|b| capped_hex(b, CellKind::Inexact, max)),
         },
-    }
+    };
+    decoded.unwrap_or((None, CellKind::Inexact))
 }
 
 /// Checks write access without modifying the file.
@@ -51,6 +62,7 @@ pub(super) async fn session_info(pool: &SqlitePool, path: &Path) -> Result<Sessi
         // SQLite has no users: whoever can write the file can do anything.
         superuser: false,
         read_only_reason,
+        transport: Transport::File,
     })
 }
 
@@ -105,6 +117,7 @@ pub(super) async fn structure(pool: &SqlitePool, table: &TableRef) -> Result<Tab
                 Some("2" | "3") => Some("generated".into()),
                 _ => None,
             },
+            base_type: String::new(),
         })
         .collect();
 
@@ -142,5 +155,5 @@ pub(super) async fn structure(pool: &SqlitePool, table: &TableRef) -> Result<Tab
             name,
         });
     }
-    Ok(TableStructure { columns, indexes })
+    Ok(TableStructure { columns, indexes, non_transactional_engine: None })
 }

@@ -5,19 +5,22 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Row, ValueRef};
 
 use super::{
-    ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef, TableStructure,
-    hex_bytes, text_col, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
+    TableStructure, Transport, capped_hex, capped_text, text_col, truthy,
 };
 
-pub(super) fn cell_text(row: &PgRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+pub(super) fn cell(row: &PgRow, idx: usize, max: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
-    // Rows come from the simple query protocol, so every value is text.
+    // Rows come from the simple query protocol, so every value is text,
+    // which casts back to the same value (bytea as `\x…`).
     match raw.as_str() {
-        Ok(s) => Some(s.to_string()),
-        Err(_) => Some(hex_bytes(raw.as_bytes().unwrap_or_default())),
+        Ok(s) => capped_text(s, CellKind::Text, max),
+        // Not UTF-8 (not expected: the session asks for UTF8): shown as hex,
+        // which it is not.
+        Err(_) => capped_hex(raw.as_bytes().unwrap_or_default(), CellKind::Inexact, max),
     }
 }
 
@@ -49,7 +52,38 @@ pub(super) async fn session_info(pool: &PgPool) -> Result<SessionInfo> {
         database: text_col(&row, 2).unwrap_or_default(),
         superuser: truthy(text_col(&row, 5).as_deref()),
         read_only_reason,
+        transport: transport(pool).await,
     })
+}
+
+/// TLS state of a pooled connection (they all use the same options).
+/// Servers without `pg_stat_ssl` (PostgreSQL-compatible ones) give `Unknown`.
+async fn transport(pool: &PgPool) -> Transport {
+    let row = sqlx::query(
+        "SELECT s.ssl::text, s.version::text, s.cipher::text, (inet_server_addr() IS NULL)::text
+         FROM pg_catalog.pg_stat_ssl s WHERE s.pid = pg_catalog.pg_backend_pid()",
+    )
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some(row)) => transport_from(
+            truthy(text_col(&row, 0).as_deref()),
+            text_col(&row, 1),
+            text_col(&row, 2),
+            truthy(text_col(&row, 3).as_deref()),
+        ),
+        _ => Transport::Unknown,
+    }
+}
+
+/// `socket`: the server has no address for the session, which happens only
+/// on a Unix socket.
+fn transport_from(ssl: bool, version: Option<String>, cipher: Option<String>, socket: bool) -> Transport {
+    match (ssl, socket) {
+        (true, _) => Transport::Tls { version: version.unwrap_or_default(), cipher: cipher.unwrap_or_default() },
+        (false, true) => Transport::Socket,
+        (false, false) => Transport::Plain,
+    }
 }
 
 const SYSTEM_SCHEMA_FILTER: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -118,7 +152,16 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
                         WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey))::text,
                 CASE WHEN a.attidentity IN ('a', 'd') THEN 'identity'
                      WHEN a.attgenerated = 's' THEN 'generated'
-                     ELSE NULL END
+                     ELSE NULL END,
+                -- Cast target for bound values: domains resolved to their base
+                -- type, no typmod (-1 keeps bpchar from turning into char(1)).
+                (WITH RECURSIVE base(oid, typtype, typbasetype) AS (
+                     SELECT t.oid, t.typtype, t.typbasetype FROM pg_catalog.pg_type t WHERE t.oid = a.atttypid
+                     UNION ALL
+                     SELECT t.oid, t.typtype, t.typbasetype
+                     FROM pg_catalog.pg_type t JOIN base b ON t.oid = b.typbasetype
+                     WHERE b.typtype = 'd')
+                 SELECT format_type(base.oid, -1) FROM base WHERE base.typtype <> 'd')::text
          FROM pg_catalog.pg_attribute a
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -139,6 +182,7 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
             default: text_col(row, 3),
             primary_key: truthy(text_col(row, 4).as_deref()),
             extra: text_col(row, 5),
+            base_type: text_col(row, 6).unwrap_or_default(),
         })
         .collect();
 
@@ -164,5 +208,18 @@ pub(super) async fn structure(pool: &PgPool, table: &TableRef) -> Result<TableSt
             primary: truthy(text_col(row, 3).as_deref()),
         })
         .collect();
-    Ok(TableStructure { columns, indexes })
+    Ok(TableStructure { columns, indexes, non_transactional_engine: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_from_pg_stat_ssl() {
+        let tls = transport_from(true, Some("TLSv1.3".into()), Some("TLS_AES_256_GCM_SHA384".into()), false);
+        assert_eq!(tls, Transport::Tls { version: "TLSv1.3".into(), cipher: "TLS_AES_256_GCM_SHA384".into() });
+        assert_eq!(transport_from(false, None, None, false), Transport::Plain);
+        assert_eq!(transport_from(false, None, None, true), Transport::Socket);
+    }
 }

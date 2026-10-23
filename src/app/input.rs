@@ -1,9 +1,11 @@
 //! Single-line text input used by forms, prompts and the command line.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Debug, Clone, Default)]
+/// Inputs may hold passwords, so they are wiped when dropped or replaced,
+/// leave no copies behind when they grow, and are not printed by `Debug`.
+#[derive(Default)]
 pub struct Input {
     value: String,
     /// Cursor position in characters.
@@ -12,8 +14,13 @@ pub struct Input {
 
 impl Drop for Input {
     fn drop(&mut self) {
-        // Inputs may hold passwords.
         self.value.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Input").field("cursor", &self.cursor).finish_non_exhaustive()
     }
 }
 
@@ -42,16 +49,39 @@ impl Input {
         self.value.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(self.value.len())
     }
 
+    /// Makes room for `additional` bytes. A `String` that grows frees its
+    /// old buffer as it is, so the input moves to a bigger one itself and
+    /// wipes the old one.
+    fn reserve(&mut self, additional: usize) {
+        if self.value.capacity() - self.value.len() >= additional {
+            return;
+        }
+        let capacity = (self.value.len() + additional).max(self.value.capacity() * 2).max(32);
+        let mut grown = String::with_capacity(capacity);
+        grown.push_str(&self.value);
+        self.value.zeroize();
+        self.value = grown;
+    }
+
     pub fn insert(&mut self, c: char) {
+        self.reserve(c.len_utf8());
         let idx = self.byte_index(self.cursor);
         self.value.insert(idx, c);
         self.cursor += 1;
     }
 
+    /// Inserts `s` at the cursor, without its control characters, in one
+    /// go: a character at a time takes time quadratic in its length, which
+    /// freezes the UI for a large paste.
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars().filter(|c| !c.is_control()) {
-            self.insert(c);
-        }
+        // Sized up front: a `String` that grows leaves copies of a pasted
+        // password behind.
+        let mut text = Zeroizing::new(String::with_capacity(s.len()));
+        text.extend(s.chars().filter(|c| !c.is_control()));
+        self.reserve(text.len());
+        let idx = self.byte_index(self.cursor);
+        self.value.insert_str(idx, &text);
+        self.cursor += text.chars().count();
     }
 
     /// Returns true when the key was consumed.
@@ -113,6 +143,29 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Inputs hold passwords: they are never printed, and growing one does
+    /// not leave its earlier content behind in a freed buffer.
+    #[test]
+    fn secrets_stay_inside() {
+        let mut i = Input::default();
+        let mut buffer = (std::ptr::null(), 0);
+        let mut moves = 0;
+        for c in "correct horse battery staple, and then some more to grow".chars() {
+            i.insert(c);
+            if i.value.as_ptr() != buffer.0 {
+                buffer = (i.value.as_ptr(), i.value.capacity());
+                moves += 1;
+            }
+            assert!(i.value.capacity() >= i.value.len());
+        }
+        assert_eq!(i.value(), "correct horse battery staple, and then some more to grow");
+        // Grown by the input itself (32, then 64 bytes), which wipes the old
+        // buffer, rather than by `String` (8, 16, 32, 64), which does not.
+        assert_eq!((moves, buffer.1), (2, 64));
+        let shown = format!("{i:?}");
+        assert!(!shown.contains("horse"), "{shown}");
+    }
+
     #[test]
     fn editing() {
         let mut i = Input::new("héllo");
@@ -126,5 +179,13 @@ mod tests {
         i.insert_str(" world");
         i.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(i.value(), ">hélo ");
+        i.handle_key(key(KeyCode::Home));
+        i.handle_key(key(KeyCode::Right));
+        i.insert_str("a\x1bb\nç");
+        assert_eq!((i.value(), i.cursor()), (">abçhélo ", 4));
+        // A large paste goes in at once.
+        let large = "x".repeat(1 << 20);
+        i.insert_str(&large);
+        assert_eq!((i.value().len(), i.cursor()), ((1 << 20) + 11, (1 << 20) + 4));
     }
 }

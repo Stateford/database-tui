@@ -1,10 +1,12 @@
 //! Tabular data with a cell cursor and staged (uncommitted) edits.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::db::{Driver, Statement, TableRef, TableStructure, sql};
+use crate::db::{CellKind, Driver, Statement, TableRef, TableStructure, Value, sql};
+use crate::util::{ident, width_up_to};
 
 const MAX_COL_WIDTH: usize = 40;
 const MIN_COL_WIDTH: usize = 4;
@@ -35,6 +37,19 @@ pub struct Edits {
     history: Vec<Undo>,
 }
 
+impl Edits {
+    /// Whether both stage the same changes (whatever their undo history).
+    pub fn same_changes(&self, other: &Edits) -> bool {
+        self.updates == other.updates && self.deleted == other.deleted && self.inserted == other.inserted
+    }
+}
+
+/// A fetched row, identified by the values of its primary-key cells
+/// (column name, text, kind) rather than by its position, which changes
+/// whenever the table is reloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowKey(Vec<(String, Option<String>, CellKind)>);
+
 /// How a cell should be displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellState {
@@ -54,8 +69,14 @@ pub enum CellValue<'a> {
 
 #[derive(Debug, Clone, Default)]
 pub struct Grid {
+    /// Changes whenever the rows are replaced or the staged changes reset,
+    /// so that what was built from the grid can tell it is out of date.
+    pub id: u64,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// What each fetched cell's text stands for (see [`CellKind`]); a row
+    /// with no entries is plain text.
+    pub kinds: Vec<Vec<CellKind>>,
     pub widths: Vec<usize>,
     pub row: usize,
     pub col: usize,
@@ -66,13 +87,66 @@ pub struct Grid {
     pub edits: Edits,
 }
 
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Grid {
     pub fn new(columns: Vec<String>, rows: Vec<Vec<Option<String>>>) -> Self {
-        let mut grid = Grid { columns, rows, viewport_rows: 20, ..Default::default() };
+        let mut grid = Grid { id: next_id(), columns, rows, viewport_rows: 20, ..Default::default() };
         grid.compute_widths();
         grid
     }
 
+    /// Sets what the cells' text stands for (see [`ResultSet::kinds`](crate::db::ResultSet::kinds)).
+    pub fn with_kinds(mut self, kinds: Vec<Vec<CellKind>>) -> Self {
+        self.kinds = kinds;
+        self
+    }
+
+    /// What a fetched cell's text stands for.
+    pub fn kind(&self, row: usize, col: usize) -> CellKind {
+        self.kinds.get(row).and_then(|r| r.get(col)).copied().unwrap_or_default()
+    }
+
+    /// The key of fetched row `row`, made of the cells of `key_columns`.
+    pub fn row_key(&self, row: usize, key_columns: &[String]) -> Option<RowKey> {
+        let cells = self.rows.get(row)?;
+        let key = key_columns
+            .iter()
+            .map(|name| {
+                let col = self.columns.iter().position(|c| c == name)?;
+                Some((name.clone(), cells.get(col)?.clone(), self.kind(row, col)))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!key.is_empty()).then_some(RowKey(key))
+    }
+
+    /// Where the fetched row with `key` is now, if it is there (and only
+    /// once).
+    pub fn find_row(&self, key: &RowKey) -> Option<usize> {
+        let cols =
+            key.0.iter().map(|(name, ..)| self.columns.iter().position(|c| c == name)).collect::<Option<Vec<_>>>()?;
+        let mut found = (0..self.rows.len()).filter(|&row| {
+            key.0
+                .iter()
+                .zip(&cols)
+                .all(|((_, text, kind), &col)| self.rows[row].get(col) == Some(text) && self.kind(row, col) == *kind)
+        });
+        let row = found.next()?;
+        found.next().is_none().then_some(row)
+    }
+
+    /// Drops the fetched rows (after a failed load), keeping the columns.
+    pub fn clear_rows(&mut self) {
+        self.rows.clear();
+        self.kinds.clear();
+        self.clear_edits();
+    }
+
+    /// Column widths from the names and the values, as shown; values are
+    /// only measured as far as a column can be wide.
     fn compute_widths(&mut self) {
         self.widths = self
             .columns
@@ -83,12 +157,34 @@ impl Grid {
                     .rows
                     .iter()
                     .take(500)
-                    .map(|r| r.get(i).and_then(|v| v.as_deref()).map(display_width).unwrap_or(4))
+                    .map(|r| r.get(i).and_then(|v| v.as_deref()).map_or(4, |v| width_up_to(v, MAX_COL_WIDTH)))
                     .max()
                     .unwrap_or(0);
-                content.max(name.width()).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+                content.max(ident(name).width()).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
             })
             .collect();
+    }
+
+    /// When cell (`row`, `col`) shows only the start of a value too large to
+    /// load in full: the size of the whole value's text.
+    pub fn cut(&self, row: usize, col: usize) -> Option<u64> {
+        match self.cell(row, col).1 {
+            CellState::Clean | CellState::Deleted => self.kind(row, col).truncated(),
+            CellState::Edited | CellState::Inserted => None,
+        }
+    }
+
+    /// Whether cell (`row`, `col`) shows a stored binary value as `0x…`.
+    pub fn binary(&self, row: usize, col: usize) -> bool {
+        match self.cell(row, col).1 {
+            CellState::Clean | CellState::Deleted => self.kind(row, col).is_binary(),
+            CellState::Edited | CellState::Inserted => false,
+        }
+    }
+
+    /// How many fetched values were too large to load in full.
+    pub fn cut_count(&self) -> usize {
+        self.kinds.iter().flatten().filter(|k| k.truncated().is_some()).count()
     }
 
     pub fn total_rows(&self) -> usize {
@@ -192,6 +288,29 @@ impl Grid {
 
     pub fn clear_edits(&mut self) {
         self.edits = Edits::default();
+        self.id = next_id();
+        self.row = self.row.min(self.total_rows().saturating_sub(1));
+    }
+
+    /// Removes the staged changes that `committed` (a copy taken when they
+    /// were sent to the database) holds, and only those.
+    pub fn remove_committed(&mut self, committed: &Edits) {
+        for (cell, value) in &committed.updates {
+            if self.edits.updates.get(cell) == Some(value) {
+                self.edits.updates.remove(cell);
+            }
+        }
+        for row in &committed.deleted {
+            self.edits.deleted.remove(row);
+        }
+        for new_row in &committed.inserted {
+            if let Some(i) = self.edits.inserted.iter().position(|r| r == new_row) {
+                self.edits.inserted.remove(i);
+            }
+        }
+        // Undoing a committed change would stage it again.
+        self.edits.history.clear();
+        self.id = next_id();
         self.row = self.row.min(self.total_rows().saturating_sub(1));
     }
 
@@ -294,7 +413,7 @@ impl Grid {
         structure: &TableStructure,
     ) -> Result<Vec<Statement>, String> {
         let column_info = |grid_col: usize| {
-            let name = &self.columns[grid_col];
+            let name = self.columns.get(grid_col).ok_or("column not found")?;
             structure
                 .columns
                 .iter()
@@ -313,8 +432,31 @@ impl Grid {
             return Err(format!("{table} has no primary key; existing rows cannot be changed safely"));
         }
 
+        // The key as read, so that it matches the row it was read from and no
+        // other: never text that merely looks like it (`0x…` for bytes).
         let key_for = |row: usize| -> Result<Vec<_>, String> {
-            key_cols.iter().map(|&c| Ok((column_info(c)?, self.rows[row][c].clone()))).collect()
+            key_cols
+                .iter()
+                .map(|&c| {
+                    let info = column_info(c)?;
+                    let text = self.rows.get(row).and_then(|r| r.get(c)).ok_or("row not found")?;
+                    let value = match (text, self.kind(row, c)) {
+                        (_, CellKind::Inexact) => None,
+                        (None, _) => return Ok((info, None)),
+                        (Some(text), kind) => Value::from_cell(text, kind),
+                    };
+                    match value {
+                        Some(value) => Ok((info, Some(value))),
+                        None => Err(format!(
+                            "The key {} = {} of a row cannot be matched exactly: it is not shown as stored \
+                             (binary data, text that is not UTF-8, or a value too large to load in full). \
+                             Change this row with SQL instead.",
+                            info.name,
+                            crate::util::fit(text.as_deref().unwrap_or("NULL"), 80)
+                        )),
+                    }
+                })
+                .collect()
         };
 
         let mut out = Vec::new();
@@ -344,10 +486,6 @@ impl Grid {
     }
 }
 
-pub fn display_width(s: &str) -> usize {
-    s.lines().next().map(|l| l.width()).unwrap_or(0) + usize::from(s.contains('\n'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +499,7 @@ mod tests {
             primary_key: pk,
             ..Default::default()
         };
-        TableStructure { columns: vec![col("id", true), col("name", false), col("note", false)], indexes: vec![] }
+        TableStructure { columns: vec![col("id", true), col("name", false), col("note", false)], ..Default::default() }
     }
 
     fn grid() -> Grid {
@@ -454,6 +592,56 @@ mod tests {
         let mut g = grid();
         g.insert_row();
         assert!(g.build_statements(Driver::Sqlite, &TableRef::new("main", "t"), &s).is_ok());
+    }
+
+    /// Audit L8: key values are bound as they were read, and a key that is
+    /// not shown exactly as stored is refused.
+    #[test]
+    fn keys_keep_their_kind() {
+        let mut s = structure();
+        s.columns[0].data_type = "varbinary(4)".into();
+        let mut g = grid().with_kinds(vec![vec![CellKind::Bytes], vec![CellKind::Inexact]]);
+        g.rows[0][0] = Some("0xff00".into());
+        g.set_cell(0, 1, Some("x".into()));
+        let st = g.build_statements(Driver::MySql, &TableRef::new("db", "t"), &s).unwrap();
+        assert_eq!(st[0].params, vec![Some("x".into()), Some(Value::Bytes(vec![0xff, 0]))]);
+        g.toggle_delete(1);
+        let err = g.build_statements(Driver::MySql, &TableRef::new("db", "t"), &s).unwrap_err();
+        assert!(err.contains("The key id = 2 of a row cannot be matched exactly"), "{err}");
+    }
+
+    /// A row is found again by its key, wherever it is.
+    #[test]
+    fn rows_are_found_by_key() {
+        let g = grid();
+        let key = g.row_key(1, &["id".to_string()]).unwrap();
+        let mut reloaded = Grid::new(g.columns.clone(), vec![g.rows[1].clone(), g.rows[0].clone()]);
+        assert_eq!(reloaded.find_row(&key), Some(0));
+        // Not text that merely looks the same.
+        reloaded.kinds = vec![vec![CellKind::Integer]];
+        assert_eq!(reloaded.find_row(&key), None);
+        reloaded.kinds.clear();
+        reloaded.rows.remove(0);
+        assert_eq!(reloaded.find_row(&key), None);
+        assert!(g.row_key(0, &["missing".to_string()]).is_none());
+    }
+
+    /// Only what was committed is cleared; changes staged since stay.
+    #[test]
+    fn committed_changes_are_removed() {
+        let mut g = grid();
+        g.set_cell(0, 1, Some("Ada L.".into()));
+        g.toggle_delete(1);
+        g.insert_row();
+        let committed = g.edits.clone();
+        let id = g.id;
+        g.set_cell(0, 2, Some("note".into()));
+        g.set_cell(0, 1, Some("Ada B.".into()));
+        g.remove_committed(&committed);
+        assert_ne!(g.id, id);
+        assert_eq!(g.edits.updates, [((0, 1), Some("Ada B.".to_string())), ((0, 2), Some("note".to_string()))].into());
+        assert!(g.edits.deleted.is_empty() && g.edits.inserted.is_empty());
+        assert!(!g.undo(), "committed changes cannot be undone into the grid again");
     }
 
     #[test]
