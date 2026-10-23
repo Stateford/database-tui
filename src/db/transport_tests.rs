@@ -25,10 +25,10 @@ fn read_pg_body(s: &mut TcpStream) -> Option<Vec<u8>> {
 
 /// What a fake PostgreSQL server received on one connection.
 #[derive(Debug, Default)]
-struct PgCapture {
-    ssl_request: bool,
-    params: Vec<(String, String)>,
-    password: Option<String>,
+pub(crate) struct PgCapture {
+    pub ssl_request: bool,
+    pub params: Vec<(String, String)>,
+    pub password: Option<String>,
 }
 
 impl PgCapture {
@@ -40,7 +40,7 @@ impl PgCapture {
 /// A PostgreSQL server that declines TLS, as a downgrading attacker does,
 /// then asks for the password in cleartext. With `tls`, it accepts TLS
 /// instead and hangs up, so that the client sets up its TLS session.
-fn fake_pg_server(tls: bool) -> (u16, mpsc::Receiver<PgCapture>) {
+pub(crate) fn fake_pg_server(tls: bool) -> (u16, mpsc::Receiver<PgCapture>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();

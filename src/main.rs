@@ -75,15 +75,29 @@ fn main() -> Result<()> {
     // it, so this happens before the async runtime starts its threads.
     // SAFETY: nothing has spawned a thread yet.
     unsafe { db::clear_client_environment() };
+    disable_core_dumps();
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main())
+}
+
+/// A core dump would contain the passwords and the vault key in memory.
+fn disable_core_dumps() {
+    #[cfg(unix)]
+    {
+        let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: plain system call on a valid struct. Lowering the limit
+        // cannot fail for lack of privileges.
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+    }
 }
 
 async fn async_main() -> Result<()> {
     let Some(args) = parse_args()? else { return Ok(()) };
     let mut config = Config::load().context("loading configuration")?;
     if let Some(mode) = args.keymap {
-        config.keymap = mode;
-        config.save().ok();
+        match Config::update(|c| c.keymap = mode) {
+            Ok(saved) => config = saved,
+            Err(_) => config.keymap = mode,
+        }
     }
 
     // Resolve what to open at start-up before touching the terminal.
@@ -152,6 +166,17 @@ async fn run(
         }
         if app.should_quit {
             break;
+        }
+    }
+    // Saving a password in the keyring normally takes a moment: let it
+    // finish and be recorded (or cleaned up), unless the keyring is stuck.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while app.keyring_busy() {
+        app.busy = Some("Finishing with the OS keyring".into());
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(event)) => app.on_app_event(event),
+            _ => break,
         }
     }
     if let Some(b) = &app.browser {

@@ -1,6 +1,8 @@
 //! Drives the real [`App`] against a temporary SQLite database and renders
 //! it headlessly, checking editing and read-only behaviour end to end.
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11,6 +13,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use super::*;
 use crate::config::{Config, SslMode};
 use crate::db::Transport;
+use crate::db::transport_tests::fake_pg_server;
+use crate::secrets::fake::FakeKeyring;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -356,4 +360,367 @@ async fn status_bar_shows_transport_security() {
         let status = screen.lines().last().unwrap();
         assert!(status.contains(expected), "{status}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Saved passwords
+// ---------------------------------------------------------------------------
+
+/// An app keeping its configuration (`config`, saved there first) and vault
+/// in `dir`, with an in-memory keyring.
+fn app_in(dir: &Path, config: Config) -> (App, UnboundedReceiver<AppEvent>, Arc<FakeKeyring>) {
+    config.save_to(&dir.join("config.toml")).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(config, tx);
+    app.config_dir = Some(dir.to_path_buf());
+    let keyring = Arc::new(FakeKeyring::default());
+    app.keyring = Keyring::new(keyring.clone());
+    (app, rx, keyring)
+}
+
+/// Handles background results until none has come for a moment.
+async fn settle(app: &mut App, rx: &mut UnboundedReceiver<AppEvent>) {
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+        app.on_app_event(ev);
+    }
+}
+
+fn pg_profile(host: &str, port: u16, credential: CredentialStore) -> ConnectionProfile {
+    let mut p = ConnectionProfile::new(Driver::Postgres);
+    p.name = "prod".into();
+    p.host = host.into();
+    p.port = Some(port);
+    p.user = "app".into();
+    p.credential = credential;
+    p
+}
+
+/// Replaces the value of a form field.
+fn set_field(app: &mut App, field: form::Field, value: &str) {
+    focus(app, field);
+    for _ in 0..form(app).input(field).unwrap().value().chars().count() {
+        app.on_key(key(KeyCode::Backspace));
+    }
+    type_str(app, value);
+}
+
+fn toast(app: &App) -> &str {
+    app.toast.as_ref().map_or("", |t| t.text.as_str())
+}
+
+fn credential(app: &App, id: &str) -> CredentialStore {
+    app.profile(id).unwrap().credential
+}
+
+/// Audit L1: a password saved in the vault only goes to the server it was
+/// saved for. Pointing the profile elsewhere (in the form, or by editing
+/// config.toml) asks for the password instead, and Ctrl-T on unsaved edits
+/// does not use it.
+#[tokio::test]
+async fn saved_passwords_only_go_to_their_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = fake_pg_server(false);
+    let saved = pg_profile("db.internal.example", 5432, CredentialStore::Vault);
+    let vault = Vault::create(&dir.path().join("vault.toml"), "master password").unwrap();
+    vault.set(&saved.id, &Endpoint::of(&saved), "prod-password").unwrap();
+    let (mut app, mut rx, _) = app_in(dir.path(), Config { connections: vec![saved], ..Config::default() });
+    app.vault = Some(vault);
+    let mismatch = format!(
+        "The saved password is for postgres://app@db.internal.example:5432, not postgres://app@127.0.0.1:{port}"
+    );
+
+    app.on_key(key(KeyCode::Char('e')));
+    set_field(&mut app, form::Field::Host, "127.0.0.1");
+    set_field(&mut app, form::Field::Port, &port.to_string());
+    let screen = render(&mut app, 120, 40);
+    assert!(screen.contains("saved for app@db.internal.example:5432 only"), "{screen}");
+    app.on_key(ctrl('t'));
+    wait_for(&mut app, &mut rx, |a| form(a).error.is_some()).await;
+    assert!(form(&app).error.as_ref().unwrap().contains(&mismatch), "{:?}", form(&app).error);
+    // A password typed for that server is used.
+    set_field(&mut app, form::Field::Password, "typed-password");
+    app.on_key(ctrl('t'));
+    wait_for(&mut app, &mut rx, |a| a.busy.is_none()).await;
+    let capture = server.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(capture.password.as_deref(), Some("typed-password"));
+    app.on_key(key(KeyCode::Esc));
+
+    // The profile itself now points there (config.toml edited, say).
+    app.update_config(|c| (c.connections[0].host, c.connections[0].port) = ("127.0.0.1".into(), Some(port)));
+    app.on_key(key(KeyCode::Enter));
+    let Some(Popup::Password(prompt)) = &app.popup else { panic!("expected the password prompt") };
+    assert!(prompt.error.as_ref().unwrap().contains(&mismatch), "{:?}", prompt.error);
+    // What is typed now is saved, for this server, once it works.
+    assert!(prompt.remember);
+    let screen = render(&mut app, 120, 40);
+    assert!(screen.contains("The saved password is for") && screen.contains("server."), "{screen}");
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+}
+
+/// The same with the OS keyring, and a password saved by an older version
+/// (without its server), which counts as saved for the profile as saved.
+#[tokio::test]
+async fn keyring_passwords_only_go_to_their_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = fake_pg_server(false);
+    let profile = pg_profile("127.0.0.1", port, CredentialStore::Keyring);
+    let (mut app, mut rx, keyring) =
+        app_in(dir.path(), Config { connections: vec![profile.clone()], ..Config::default() });
+    let elsewhere = Endpoint::new(Driver::Postgres, "db.internal.example", None, "app");
+    keyring.put(&profile.id, &elsewhere, "prod-password");
+
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Password(_)))).await;
+    let Some(Popup::Password(prompt)) = &app.popup else { unreachable!() };
+    assert!(prompt.error.as_ref().unwrap().contains("saved password is for postgres://app@db.internal.example:5432"));
+    app.on_key(key(KeyCode::Esc));
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_key(ctrl('t'));
+    wait_for(&mut app, &mut rx, |a| form(a).error.is_some()).await;
+    assert!(form(&app).error.as_ref().unwrap().contains("saved password is for postgres://app@db.internal.example"));
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+
+    // An old password is only used for the profile as it was saved...
+    keyring.put_raw(&profile.id, "legacy-password");
+    set_field(&mut app, form::Field::User, "admin");
+    app.on_key(ctrl('t'));
+    wait_for(&mut app, &mut rx, |a| form(a).error.is_some()).await;
+    let error = form(&app).error.clone().unwrap();
+    assert!(error.contains(&format!("is for postgres://app@127.0.0.1:{port}, not postgres://admin@")), "{error}");
+    assert!(server.recv_timeout(Duration::from_millis(300)).is_err(), "the saved password was sent");
+    app.on_key(key(KeyCode::Esc));
+    // ...for which it still works.
+    app.on_key(key(KeyCode::Enter));
+    wait_for(&mut app, &mut rx, |a| matches!(a.popup, Some(Popup::Message { .. }))).await;
+    let capture = server.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(capture.password.as_deref(), Some("legacy-password"));
+}
+
+/// A password saved before passwords were bound is saved again, bound to
+/// its server and where it was, once a connection with it has worked. A
+/// password is not saved for a profile that was changed or deleted while
+/// connecting.
+#[tokio::test]
+async fn old_passwords_are_bound_once_they_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let in_vault = pg_profile("db.example.com", 5432, CredentialStore::Vault);
+    let mut in_keyring = pg_profile("db.example.com", 5433, CredentialStore::Keyring);
+    in_keyring.name = "replica".into();
+    let vault = Vault::create(&dir.path().join("vault.toml"), "master password").unwrap();
+    vault.put_legacy(&in_vault.id, "vault-password");
+    let config = Config { connections: vec![in_vault.clone(), in_keyring.clone()], ..Config::default() };
+    let (mut app, mut rx, keyring) = app_in(dir.path(), config);
+    keyring.put_raw(&in_keyring.id, "keyring-password");
+    app.vault = Some(vault);
+
+    // A local session stands in for the server's.
+    let (_db_dir, mut db_app, _db_rx) = open_people(KeymapMode::Standard, false).await;
+    let browser = db_app.browser.take().unwrap();
+    let connected = |profile: &ConnectionProfile, remember| AppEvent::Connected {
+        profile: profile.clone(),
+        db: browser.db.clone(),
+        session: Box::new(browser.session.clone()),
+        schemas: browser.schemas.clone(),
+        remember: Some(remember),
+    };
+    for (profile, password) in [(&in_vault, "vault-password"), (&in_keyring, "keyring-password")] {
+        // What `connect_with_saved` asks for with an unbound password.
+        let remember = app.remember(profile, Zeroizing::new(password.into()), true);
+        app.on_app_event(connected(profile, remember));
+    }
+    settle(&mut app, &mut rx).await;
+    let secret = app.vault.as_ref().unwrap().get(&in_vault.id).unwrap().unwrap();
+    assert_eq!((secret.password(), secret.endpoint()), ("vault-password", Some(&Endpoint::of(&in_vault))));
+    let secret = keyring.secret(&in_keyring.id).unwrap();
+    assert_eq!((secret.password(), secret.endpoint()), ("keyring-password", Some(&Endpoint::of(&in_keyring))));
+    assert_eq!(
+        (credential(&app, &in_vault.id), credential(&app, &in_keyring.id)),
+        (CredentialStore::Vault, CredentialStore::Keyring)
+    );
+    assert!(toast(&app).starts_with("Connected"), "re-saved quietly: {}", toast(&app));
+
+    // The profile now points elsewhere: the password is not saved for it.
+    let remember = app.remember(&in_vault, Zeroizing::new("typed".into()), false);
+    app.update_config(|c| c.connections[0].host = "db2.example.com".into());
+    app.on_app_event(connected(&in_vault, remember));
+    // Deleted while connecting.
+    let remember = app.remember(&in_keyring, Zeroizing::new("typed".into()), false);
+    app.confirm(ConfirmAction::DeleteProfile(in_keyring.id.clone()));
+    app.on_app_event(connected(&in_keyring, remember));
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.vault.as_ref().unwrap().get(&in_vault.id).unwrap().unwrap().password(), "vault-password");
+    assert_eq!(keyring.raw(&in_keyring.id), None);
+    assert!(!toast(&app).contains("Password saved"), "{}", toast(&app));
+}
+
+/// Audit L2: results of keyring writes that come late, for a profile that
+/// was deleted or whose password is no longer to be saved, are removed
+/// rather than recorded. A slow keyring is not a failure: nothing goes to
+/// the vault, and the write counts when it completes.
+#[tokio::test]
+async fn late_keyring_results_are_cleaned_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, mut rx, keyring) = app_in(dir.path(), Config::default());
+    let new_profile = |app: &mut App, password: &str| {
+        app.on_key(key(KeyCode::Char('n')));
+        type_str(app, "prod");
+        set_field(app, form::Field::Password, password);
+        app.on_key(ctrl('s'));
+        app.config.connections.last().unwrap().id.clone()
+    };
+
+    // Deleted while the keyring waits (for its unlock prompt, say).
+    keyring.hold();
+    let id = new_profile(&mut app, "s3cret");
+    assert_eq!(credential(&app, &id), CredentialStore::None);
+    app.on_key(key(KeyCode::Delete));
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(app.config.connections.is_empty());
+    assert!(app.keyring_busy(), "quitting now waits a moment for the keyring");
+    keyring.release();
+    settle(&mut app, &mut rx).await;
+    assert!(!app.keyring_busy());
+    assert_eq!(keyring.raw(&id), None);
+    assert!(app.popup.is_none() && !dir.path().join("vault.toml").exists());
+    assert!(!toast(&app).contains("Password saved"), "{}", toast(&app));
+
+    // No longer to be saved.
+    keyring.hold();
+    let id = new_profile(&mut app, "s3cret");
+    app.on_key(key(KeyCode::Char('e')));
+    assert!(form(&app).save_password, "the form shows the save in progress");
+    focus(&mut app, form::Field::SavePassword);
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(ctrl('s'));
+    keyring.release();
+    settle(&mut app, &mut rx).await;
+    assert_eq!(keyring.raw(&id), None);
+    assert_eq!(credential(&app, &id), CredentialStore::None);
+
+    // Slow.
+    keyring.hold();
+    app.on_key(key(KeyCode::Char('e')));
+    focus(&mut app, form::Field::SavePassword);
+    app.on_key(key(KeyCode::Char(' ')));
+    set_field(&mut app, form::Field::Password, "later");
+    app.on_key(ctrl('s'));
+    for (started, _) in app.credentials.pending.values_mut() {
+        *started = started.checked_sub(KEYRING_TIMEOUT).unwrap();
+    }
+    app.on_tick();
+    assert!(toast(&app).contains("The OS keyring is not answering"), "{}", toast(&app));
+    settle(&mut app, &mut rx).await;
+    assert!(app.popup.is_none() && !dir.path().join("vault.toml").exists());
+    assert_eq!(credential(&app, &id), CredentialStore::None);
+    keyring.release();
+    settle(&mut app, &mut rx).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Keyring);
+    assert_eq!(keyring.secret(&id).unwrap().password(), "later");
+    assert_eq!(toast(&app), "Password saved in the OS keyring");
+}
+
+/// Audit L2: a password moved to the other store is removed from the one it
+/// was in, and deleting a profile removes it from both.
+#[tokio::test]
+async fn old_copies_go_when_the_store_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = pg_profile("db.example.com", 5432, CredentialStore::Vault);
+    let id = profile.id.clone();
+    let vault = Vault::create(&dir.path().join("vault.toml"), "master password").unwrap();
+    vault.set(&id, &Endpoint::of(&profile), "old").unwrap();
+    let (mut app, mut rx, keyring) =
+        app_in(dir.path(), Config { connections: vec![profile.clone()], ..Config::default() });
+    app.vault = Some(vault);
+    let in_vault = |app: &App| app.vault.as_ref().unwrap().get(&id).unwrap().map(|s| s.password().to_string());
+    let save = |app: &mut App, password: &str| {
+        app.on_key(key(KeyCode::Char('e')));
+        set_field(app, form::Field::Password, password);
+        app.on_key(ctrl('s'));
+    };
+
+    // Saved again, into the keyring this time.
+    save(&mut app, "new");
+    settle(&mut app, &mut rx).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Keyring);
+    assert_eq!(keyring.secret(&id).unwrap().password(), "new");
+    assert_eq!(in_vault(&app), None);
+
+    // And back into the vault.
+    app.update_config(|c| c.secret_backend = SecretBackend::Vault);
+    save(&mut app, "newer");
+    settle(&mut app, &mut rx).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Vault);
+    assert_eq!(in_vault(&app).as_deref(), Some("newer"));
+    assert_eq!(keyring.raw(&id), None);
+
+    // A copy left in the keyring (by an older version, say) goes as well.
+    keyring.put(&id, &Endpoint::of(&profile), "stray");
+    app.on_key(key(KeyCode::Delete));
+    app.on_key(key(KeyCode::Char('y')));
+    settle(&mut app, &mut rx).await;
+    assert_eq!((keyring.raw(&id), in_vault(&app)), (None, None));
+}
+
+/// The master password is checked in the background, and a vault another
+/// dbtui instance created meanwhile is unlocked, never replaced.
+#[tokio::test]
+async fn vault_is_opened_in_the_background_and_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.toml");
+    let config = Config { secret_backend: SecretBackend::Vault, ..Config::default() };
+    let (mut app, mut rx, _) = app_in(dir.path(), config);
+    app.on_key(key(KeyCode::Char('n')));
+    type_str(&mut app, "prod");
+    set_field(&mut app, form::Field::Password, "s3cret");
+    app.on_key(ctrl('s'));
+    let id = app.config.connections[0].id.clone();
+    assert!(matches!(&app.popup, Some(Popup::Vault(v)) if v.create));
+    type_str(&mut app, "first master");
+    app.on_key(key(KeyCode::Tab));
+    type_str(&mut app, "first master");
+
+    let other = Vault::create(&path, "other master").unwrap();
+    other.set("x", &Endpoint::new(Driver::Postgres, "db", None, "app"), "theirs").unwrap();
+    app.on_key(key(KeyCode::Enter));
+    assert!(render(&mut app, 100, 30).contains("Creating the vault…"));
+    type_str(&mut app, "ignored");
+    assert!(matches!(&app.popup, Some(Popup::Vault(v)) if v.working.is_some() && v.confirm.value() == "first master"));
+    wait_for(&mut app, &mut rx, |a| matches!(&a.popup, Some(Popup::Vault(v)) if v.working.is_none())).await;
+    let Some(Popup::Vault(v)) = &app.popup else { unreachable!() };
+    assert!(!v.create && v.input.value().is_empty());
+    assert!(v.error.as_ref().unwrap().contains("created by another dbtui instance"), "{:?}", v.error);
+    assert!(render(&mut app, 100, 30).contains("Unlock password vault"));
+
+    type_str(&mut app, "other master");
+    app.on_key(key(KeyCode::Enter));
+    assert!(render(&mut app, 100, 30).contains("Checking the master password…"));
+    wait_for(&mut app, &mut rx, |a| a.popup.is_none()).await;
+    assert_eq!(credential(&app, &id), CredentialStore::Vault);
+    let theirs = Vault::unlock(&path, "other master").unwrap();
+    assert_eq!(theirs.get(&id).unwrap().unwrap().password(), "s3cret");
+    assert_eq!(theirs.get("x").unwrap().unwrap().password(), "theirs");
+}
+
+/// Two instances sharing a configuration keep each other's changes.
+#[tokio::test]
+async fn instances_keep_each_others_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut one, _rx, _) = app_in(dir.path(), Config::default());
+    let (mut two, _rx, _) = app_in(dir.path(), Config::default());
+    let add = |app: &mut App, name: &str| {
+        app.on_key(key(KeyCode::Char('n')));
+        type_str(app, name);
+        app.on_key(ctrl('s'));
+    };
+    let names = |config: &Config| config.connections.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    add(&mut one, "one");
+    add(&mut two, "two");
+    assert_eq!(names(&two.config), ["one", "two"]);
+    one.on_key(ctrl('k'));
+    assert_eq!((names(&one.config), one.config.keymap), (vec!["one".to_string(), "two".into()], KeymapMode::Vim));
+    two.on_key(key(KeyCode::Up));
+    two.on_key(key(KeyCode::Delete));
+    two.on_key(key(KeyCode::Char('y')));
+    let on_disk = Config::load_from(&dir.path().join("config.toml")).unwrap();
+    assert_eq!((names(&on_disk), on_disk.keymap), (vec!["two".to_string()], KeymapMode::Vim));
 }

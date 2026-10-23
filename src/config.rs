@@ -1,9 +1,12 @@
 //! Persistent, non-secret configuration: preferences and connection profiles.
 //! Passwords are never written here; see [`crate::secrets`].
 
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Driver;
@@ -327,36 +330,129 @@ impl Config {
         Ok(config)
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&Self::path()?)
+    /// Applies `change` to the configuration file as it is on disk now and
+    /// saves it, then returns the result. Another dbtui instance may have
+    /// changed the file since this one loaded it: the file is re-read under
+    /// a lock, so its changes are kept rather than overwritten.
+    pub fn update(change: impl FnOnce(&mut Config)) -> Result<Config> {
+        Self::update_at(&Self::path()?, change)
     }
 
+    pub fn update_at(path: &Path, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        let _lock = lock(path)?;
+        let mut config = Self::load_from(path)?;
+        change(&mut config);
+        config.save_to(path)?;
+        Ok(config)
+    }
+
+    /// Writes the whole file. Use [`Config::update`] to change it.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self)?;
         write_private(path, text.as_bytes())
     }
 }
 
+/// How long to wait for another dbtui instance to finish changing a file.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An exclusive lock on a file shared with other dbtui instances, held
+/// while the file is read, changed and written back. Released on drop.
+pub struct FileLock {
+    _file: Option<File>,
+}
+
+/// Locks `path` against other dbtui instances, through a lock file next to
+/// it (`config.lock` for `config.toml`). The lock is advisory: only dbtui
+/// takes it. Never call it while holding the same lock: it would wait for
+/// itself.
+pub fn lock(path: &Path) -> Result<FileLock> {
+    create_private_dir(parent_dir(path))?;
+    let lock_path = path.with_extension("lock");
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&lock_path).with_context(|| format!("could not open {}", lock_path.display()))?;
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(FileLock { _file: Some(file) }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(TryLockError::WouldBlock) => {
+                bail!("{} is being changed by another dbtui instance; try again", path.display())
+            }
+            // Some file systems (network shares) cannot lock files.
+            Err(TryLockError::Error(e)) if e.kind() == ErrorKind::Unsupported => return Ok(FileLock { _file: None }),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("could not lock {}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Creates the directory, readable by the current user only, if it does
+/// not exist yet.
+fn create_private_dir(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).with_context(|| format!("could not create {}", dir.display()))
+}
+
 /// Atomically writes a file that only the current user can read.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
-    let tmp = path.with_extension("tmp");
+    write_private_file(path, contents, true)
+}
+
+/// Like [`write_private`], but fails with [`ErrorKind::AlreadyExists`] when
+/// the file exists, even if it appears while this one is written.
+pub fn write_private_new(path: &Path, contents: &[u8]) -> Result<()> {
+    write_private_file(path, contents, false)
+}
+
+fn write_private_file(path: &Path, contents: &[u8], replace: bool) -> Result<()> {
+    use std::io::Write;
+    let dir = parent_dir(path);
+    create_private_dir(dir)?;
+    // A new file with a random name, created exclusively (never through a
+    // link or over a file someone else prepared), then renamed into place.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".dbtui-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    #[cfg(unix)]
     {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp).with_context(|| format!("could not write {}", tmp.display()))?;
-        f.write_all(contents)?;
-        f.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("could not write {}", path.display()))?;
+    tmp.write_all(contents)?;
+    tmp.as_file().sync_all()?;
+    let persisted = if replace { tmp.persist(path) } else { tmp.persist_noclobber(path) };
+    persisted.map_err(|e| e.error).with_context(|| format!("could not write {}", path.display()))?;
+    // Make the rename itself durable.
+    #[cfg(unix)]
+    if let Ok(dir) = File::open(dir) {
+        dir.sync_all().ok();
+    }
     Ok(())
 }
 
@@ -388,6 +484,81 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// Audit L3: files are written through a new file with a random name,
+    /// never through one someone else prepared, and end up 0600 in a 0700
+    /// directory. Creating a file never replaces one.
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_written_safely() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("dbtui");
+        let path = sub.join("vault.toml");
+        write_private(&path, b"first").unwrap();
+        assert_eq!((mode(&sub), mode(&path)), (0o700, 0o600));
+
+        // What could be planted at the fixed temporary names older versions
+        // used, and a target whose mode was changed, are of no consequence.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"important").unwrap();
+        std::os::unix::fs::symlink(&victim, sub.join("vault.tmp")).unwrap();
+        std::fs::write(sub.join("config.tmp"), b"planted").unwrap();
+        std::fs::set_permissions(sub.join("config.tmp"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"second").unwrap();
+        write_private(&sub.join("config.toml"), b"config").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"important");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!((mode(&path), mode(&sub.join("config.toml"))), (0o600, 0o600));
+        let mut names: Vec<_> = std::fs::read_dir(&sub).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["config.tmp", "config.toml", "vault.tmp", "vault.toml"], "no temporary files left");
+
+        let err = write_private_new(&path, b"third").unwrap_err();
+        assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    /// Two dbtui instances changing the configuration at the same time keep
+    /// each other's changes: each change is made to the file as it is.
+    #[test]
+    fn concurrent_updates_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let stale = Config::load_from(&path).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        Config::update_at(&path, |c| {
+                            let mut p = ConnectionProfile::new(Driver::Sqlite);
+                            p.name = format!("{t}-{i}");
+                            c.connections.push(p);
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        // An instance that loaded the file long ago still keeps them all.
+        assert!(stale.connections.is_empty());
+        let config = Config::update_at(&path, |c| c.keymap = KeymapMode::Vim).unwrap();
+        assert_eq!(config.connections.len(), 40);
+        assert_eq!(Config::load_from(&path).unwrap().connections.len(), 40);
+        assert_eq!(Config::load_from(&path).unwrap().keymap, KeymapMode::Vim);
+
+        // A file that cannot be read is not overwritten.
+        std::fs::write(&path, "not = [valid").unwrap();
+        assert!(Config::update_at(&path, |c| c.page_size = 5).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not = [valid");
     }
 
     #[test]

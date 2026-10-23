@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::input::Input;
 use crate::config::{ConnectionProfile, CredentialStore, SslMode};
 use crate::db::Driver;
+use crate::secrets::Endpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -153,6 +154,15 @@ impl ConnectionForm {
 
     pub fn has_stored_password(&self) -> bool {
         self.original.credential != CredentialStore::None
+    }
+
+    /// The server of the saved profile, when the form now points to another
+    /// one: its saved password is then not used (see [`Endpoint`]).
+    pub fn saved_password_elsewhere(&self) -> Option<Endpoint> {
+        let saved = Endpoint::of(&self.original);
+        let port = self.port.value().trim().parse().ok();
+        let current = Endpoint::new(self.driver, self.host.value(), port, self.user.value());
+        (self.has_stored_password() && current != saved).then_some(saved)
     }
 
     /// Warning about the TLS mode for the host currently in the form.

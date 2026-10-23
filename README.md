@@ -28,7 +28,8 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
   keyring (macOS Keychain, Windows Credential Manager, Secret Service on Linux). When no keyring
   is available (servers, containers, WSL), they go to an encrypted vault instead. The vault uses
   Argon2id for the key and XChaCha20-Poly1305 for the data, and is unlocked once per session
-  with a master password.
+  with a master password. A saved password is only ever sent to the server it was saved for.
+  See [Saved passwords](#saved-passwords).
 - **Permission-aware**: the status bar always shows your access level and your privileges on the
   open table. Read-only users can browse and query, but cannot even start an edit. See below.
 - **Verified connections**: new profiles for remote servers check the server's certificate and
@@ -132,6 +133,33 @@ including one saved in the keyring or vault. So:
   marks as safe) and `PRAGMA cell_size_check = ON`. A path starting with `file:` is a file
   name, never an SQLite URI, and extensions cannot be loaded.
 
+## Saved passwords
+
+A password you choose to save goes to the OS keyring or, when there is none (or with
+`secret_backend = "vault"`), to the encrypted vault.
+
+- **Bound to their server**: a password is saved together with the driver, host, port and user
+  it was entered for, and is only sent there. If a profile is changed to point somewhere else, in
+  the form or by editing `config.toml`, connecting asks for the password, says which server the
+  saved one belongs to, and saves what you type for the new server. `Ctrl-T` in the form only
+  uses the saved password while the form still points to that server. Passwords saved by
+  earlier versions do not record their server: they are used for the profile as saved, and saved
+  again with their server after the next successful connection.
+- **Cleaned up**: deleting a profile removes its password from both the keyring and the vault,
+  and a password that moves from one to the other is removed from the first.
+- **Slow keyrings**: a keyring waiting for its unlock prompt is not treated as a failure. After
+  15 seconds dbtui says so; the password is saved once the keyring answers, and is not put in
+  the vault meanwhile. If the profile has been deleted by then, or its password changed or no
+  longer to be saved, what the keyring stored is removed again.
+- **The vault** (`vault.toml`, next to the config file) derives its key from the master password
+  (8+ characters, never stored) with Argon2id, 64 MiB of memory and 3 passes. Vaults made by
+  earlier versions (19 MiB, 2 passes) are re-encrypted with these settings when unlocked, and a
+  vault file asking for more than 1 GiB, 10 passes or 8 lanes is refused. Creating a vault never
+  replaces an existing one, for example one another dbtui instance has just created.
+- **In memory**: password fields and decrypted passwords are wiped once used, including the key
+  derivation's working memory, and core dumps are disabled on Unix. The database driver keeps
+  its own copy of the password while connected.
+
 ## Screenshots
 
 | Connection manager | Reviewing staged changes before commit |
@@ -186,8 +214,11 @@ Press `?` or `F1` anywhere for the full key reference.
 ## Configuration
 
 Settings live in `config.toml` in the platform config directory (for example
-`~/.config/dbtui/` on Linux). Set `DBTUI_CONFIG_DIR` to use a different directory. The file is
-created with `0600` permissions and never contains passwords.
+`~/.config/dbtui/` on Linux). Set `DBTUI_CONFIG_DIR` to use a different directory. The file never
+contains passwords. Like the vault, it is replaced atomically by a new, randomly named file that
+only you can read (`0600`); a missing config directory is created `0700`. Several dbtui instances
+can share the directory: each change is made, under a lock (`config.lock`, `vault.lock`), to the
+file as it is on disk, so an instance never overwrites what another one saved.
 
 ```toml
 keymap = "vim"            # or "standard"

@@ -74,6 +74,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -687,6 +688,7 @@ dependencies = [
  "directories",
  "futures",
  "keyring",
+ "libc",
  "rand 0.8.8",
  "ratatui",
  "ratatui-textarea",

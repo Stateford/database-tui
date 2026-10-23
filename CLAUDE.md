@@ -42,7 +42,7 @@ Set `DBTUI_CONFIG_DIR` to a scratch directory when running manually so the real 
 
 **UI** (`src/ui/`): stateless rendering of `App` (`ui::draw`), split by screen (connections, browser, grid) plus `popups.rs`, `help.rs`, and `theme.rs` (Tokyo Night–style palette).
 
-**Config and secrets**: `src/config.rs` loads/saves `config.toml` (0600, never contains passwords); each `ConnectionProfile` has a stable `id` used as the credential key. `src/secrets.rs` stores passwords in the OS keyring or, as fallback, an Argon2id + XChaCha20-Poly1305 vault (`vault.toml`) unlocked once per session. Passwords are held in `Zeroizing<String>`.
+**Config and secrets**: `src/config.rs` loads `config.toml` (0600, never contains passwords); each `ConnectionProfile` has a stable `id` used as the credential key. Other dbtui instances may share the files, so every change goes through `App::update_config` / `Config::update`, which re-read the file under a lock before applying it (the vault does the same for its entries). `src/secrets.rs` stores passwords in the OS keyring or, as fallback, an Argon2id + XChaCha20-Poly1305 vault (`vault.toml`) unlocked once per session (off the UI thread). Each stored password is bound to its `Endpoint` (driver, host, port, user) and must not be used for another one (`StoredSecret::password_for`). Keyring calls go through `Keyring`, which runs them in order on its own thread; results come back as `AppEvent`s whenever the keyring answers, and `CredentialOps` generations tell stale ones apart (they are cleaned up, not recorded). Passwords are held in `Zeroizing<String>`.
 
 ## Tests
 

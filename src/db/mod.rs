@@ -12,7 +12,7 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod transport_tests;
+pub(crate) mod transport_tests;
 
 use std::ffi::OsStr;
 use std::path::PathBuf;

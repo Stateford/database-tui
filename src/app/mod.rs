@@ -8,8 +8,11 @@ pub mod query;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
@@ -25,7 +28,7 @@ use crate::db::{
     Database, Driver, PageRequest, ResultSet, SchemaInfo, SessionInfo, Statement, TableRef, TableStructure, sql,
 };
 use crate::keymap::{Action, Context, Keymap};
-use crate::secrets::{self, Vault};
+use crate::secrets::{Endpoint, KEYRING_TIMEOUT, Keyring, StoredSecret, Vault, VaultChanged, VaultExists};
 
 /// Results of background work, delivered to the UI loop.
 pub enum AppEvent {
@@ -34,7 +37,12 @@ pub enum AppEvent {
         db: Database,
         session: Box<SessionInfo>,
         schemas: Vec<SchemaInfo>,
-        remember: Option<Zeroizing<String>>,
+        remember: Option<Remember>,
+    },
+    /// The password saved in the keyring for a profile being connected.
+    SavedPassword {
+        profile: ConnectionProfile,
+        result: Result<Option<StoredSecret>, String>,
     },
     ConnectFailed {
         profile: ConnectionProfile,
@@ -58,12 +66,91 @@ pub enum AppEvent {
         result: Result<ResultSet, String>,
     },
     Committed(Result<u64, String>),
-    KeyringStored {
-        id: String,
-        password: Zeroizing<String>,
+    /// A keyring write finished, possibly long after it was requested.
+    KeyringStored(SaveRequest, Result<(), String>),
+    /// `report`: tell the user if it failed (the keyring was known to hold
+    /// the password, rather than possibly holding an old copy).
+    KeyringRemoved {
+        op: u64,
+        report: bool,
         result: Result<(), String>,
     },
-    KeyringRemoved(Result<(), String>),
+    /// The vault prompt's master password was checked in the background.
+    VaultOpened {
+        seq: u64,
+        result: anyhow::Result<Vault>,
+    },
+}
+
+/// A password to save for a profile, once its connection has worked.
+pub struct Remember {
+    pub password: Zeroizing<String>,
+    /// Save again, bound to its server and where it already is, a password
+    /// saved before passwords were bound; rather than one the user typed,
+    /// which goes to the configured backend.
+    pub rebind: bool,
+    /// The profile's credential generation when connecting (see
+    /// [`CredentialOps`]): if it has changed since, the password was saved
+    /// or forgotten in the meantime and this one is not kept.
+    pub generation: u64,
+}
+
+/// A password being saved for a profile.
+pub struct SaveRequest {
+    pub id: String,
+    pub endpoint: Endpoint,
+    pub password: Zeroizing<String>,
+    /// The credential generation this save belongs to.
+    pub generation: u64,
+    /// Re-saving a password that is already saved: no message on success.
+    pub quiet: bool,
+}
+
+/// Bookkeeping that lets results of background keyring work be matched to
+/// what the user did since: a profile deleted, its password saved again or
+/// no longer saved. Such late results are cleaned up, not recorded.
+#[derive(Default)]
+struct CredentialOps {
+    counter: u64,
+    /// Per profile id, the generation of its latest password change (saved,
+    /// re-saved or forgotten). A result from an older generation is stale.
+    generation: HashMap<String, u64>,
+    /// Per profile id, the last keyring write or delete queued. The keyring
+    /// runs them in order, so that one decides what the keyring ends up
+    /// holding for the profile.
+    last_keyring_op: HashMap<String, u64>,
+    /// Keyring operations not answered yet: when they started, and whether
+    /// the user has been told that the keyring is slow (deletes are not
+    /// worth telling about).
+    pending: HashMap<u64, (Instant, bool)>,
+}
+
+impl CredentialOps {
+    fn next(&mut self) -> u64 {
+        self.counter += 1;
+        self.counter
+    }
+
+    /// Starts a new generation for a profile's password.
+    fn bump(&mut self, id: &str) -> u64 {
+        let generation = self.next();
+        self.generation.insert(id.to_string(), generation);
+        generation
+    }
+
+    fn generation(&self, id: &str) -> u64 {
+        self.generation.get(id).copied().unwrap_or(0)
+    }
+
+    /// Whether the profile's password is being saved to the keyring.
+    fn saving(&self, id: &str) -> bool {
+        self.pending.contains_key(&self.generation(id))
+    }
+
+    /// Whether anything about the profile's password happened this session.
+    fn knows(&self, id: &str) -> bool {
+        self.generation.contains_key(id) || self.last_keyring_op.contains_key(id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +183,7 @@ pub enum ConfirmAction {
 
 pub enum AfterUnlock {
     Connect(ConnectionProfile),
-    Store { id: String, password: Zeroizing<String> },
+    Store(SaveRequest),
 }
 
 pub struct PasswordPrompt {
@@ -114,6 +201,9 @@ pub struct VaultPrompt {
     pub focus: usize,
     pub error: Option<String>,
     pub then: AfterUnlock,
+    /// While the master password is checked in the background (deriving the
+    /// key takes a moment): the `seq` of that request.
+    pub working: Option<u64>,
 }
 
 pub struct CellEditor {
@@ -170,6 +260,12 @@ pub struct App {
     pub toast: Option<Toast>,
     pub keymap: Keymap,
     pub vault: Option<Vault>,
+    keyring: Keyring,
+    credentials: CredentialOps,
+    /// Last vault prompt request (see [`VaultPrompt::working`]).
+    vault_seq: u64,
+    /// Where `config.toml` and `vault.toml` live.
+    config_dir: Option<PathBuf>,
     pub busy: Option<String>,
     pub tick: usize,
     pub should_quit: bool,
@@ -206,6 +302,10 @@ impl App {
             toast: None,
             keymap: Keymap::default(),
             vault: None,
+            keyring: Keyring::os(),
+            credentials: CredentialOps::default(),
+            vault_seq: 0,
+            config_dir: crate::config::config_dir().ok(),
             busy: None,
             tick: 0,
             should_quit: false,
@@ -232,21 +332,58 @@ impl App {
         if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
             self.toast = None;
         }
-    }
-
-    fn save_config(&mut self) {
-        if let Err(e) = self.config.save() {
-            self.notify(Level::Error, format!("Could not save configuration: {}", err_text(e)));
+        // A slow keyring is not a failure: the write completes (or fails)
+        // whenever the keyring answers, and is handled then.
+        let mut slow = false;
+        for (started, told) in self.credentials.pending.values_mut() {
+            if !*told && started.elapsed() >= KEYRING_TIMEOUT {
+                *told = true;
+                slow = true;
+            }
+        }
+        if slow {
+            self.notify(
+                Level::Warning,
+                "The OS keyring is not answering (is it locked?). The password will be saved there once it does, \
+                 and is not saved anywhere else meanwhile.",
+            );
         }
     }
 
+    fn config_path(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.config_dir.as_ref().context("could not determine a configuration directory")?;
+        Ok(dir.join("config.toml"))
+    }
+
+    fn vault_path(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.config_dir.as_ref().context("could not determine a configuration directory")?;
+        Ok(dir.join("vault.toml"))
+    }
+
+    /// Changes the configuration and saves it. The change is made to the
+    /// file as it is on disk, which another dbtui instance may have changed
+    /// meanwhile, and the result becomes this app's configuration.
+    fn update_config(&mut self, mut change: impl FnMut(&mut Config)) {
+        match self.config_path().and_then(|path| Config::update_at(&path, &mut change)) {
+            Ok(config) => self.config = config,
+            Err(e) => {
+                change(&mut self.config);
+                self.notify(Level::Error, format!("Could not save configuration: {}", err_text(e)));
+            }
+        }
+        self.selected_conn = self.selected_conn.min(self.config.connections.len().saturating_sub(1));
+    }
+
+    fn profile(&self, id: &str) -> Option<&ConnectionProfile> {
+        self.config.connections.iter().find(|p| p.id == id)
+    }
+
     fn set_keymap(&mut self, mode: KeymapMode) {
-        self.config.keymap = mode;
         self.keymap.clear();
         if let Some(b) = &mut self.browser {
             b.query.vim_mode = VimMode::Normal;
         }
-        self.save_config();
+        self.update_config(|c| c.keymap = mode);
         let how = match mode {
             KeymapMode::Vim => "Vim keys enabled (hjkl, gg/G, dd, :w …)",
             KeymapMode::Standard => "Standard keys enabled (arrows, Enter, Del, Ctrl-S …)",
@@ -259,16 +396,18 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn on_paste(&mut self, text: String) {
+        // It may be a password: wiped once used.
+        let text = Zeroizing::new(text);
         match &mut self.popup {
             Some(Popup::Form(form)) => form.paste(&text),
             Some(Popup::Password(p)) => p.input.insert_str(text.lines().next().unwrap_or_default()),
-            Some(Popup::Vault(v)) => {
+            Some(Popup::Vault(v)) if v.working.is_none() => {
                 let target = if v.focus == 0 { &mut v.input } else { &mut v.confirm };
                 target.insert_str(text.lines().next().unwrap_or_default());
             }
             Some(Popup::Prompt(p)) => p.input.insert_str(&text.replace('\n', " ")),
             Some(Popup::CellEditor(c)) => {
-                c.editor.insert_str(text);
+                c.editor.insert_str(text.as_str());
             }
             Some(_) => {}
             None => {
@@ -279,7 +418,7 @@ impl App {
                     && b.focus == Focus::Main
                     && b.query.focus == EditorFocus::Editor
                 {
-                    b.query.editor.insert_str(text);
+                    b.query.editor.insert_str(text.as_str());
                 }
             }
         }
@@ -331,7 +470,10 @@ impl App {
             }
             Action::EditItem => {
                 if let Some(p) = self.config.connections.get(self.selected_conn).cloned() {
-                    self.popup = Some(Popup::Form(Box::new(ConnectionForm::new(p, false))));
+                    let mut form = ConnectionForm::new(p, false);
+                    // Its password is still on its way to the keyring.
+                    form.save_password |= self.credentials.saving(&form.original.id);
+                    self.popup = Some(Popup::Form(Box::new(form)));
                 }
             }
             Action::DeleteItem => {
@@ -956,7 +1098,7 @@ impl App {
                 KeyCode::Esc => None,
                 KeyCode::Enter => {
                     let password = Zeroizing::new(p.input.value().to_string());
-                    let remember = p.remember.then(|| password.clone());
+                    let remember = p.remember.then(|| self.remember(&p.profile, password.clone(), false));
                     self.spawn_connect(p.profile.clone(), Some(password), remember);
                     None
                 }
@@ -982,6 +1124,7 @@ impl App {
                     }
                     None
                 }
+                _ if v.working.is_some() => Some(Popup::Vault(v)),
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down if v.create => {
                     v.focus = 1 - v.focus;
                     Some(Popup::Vault(v))
@@ -1099,12 +1242,10 @@ impl App {
     fn confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::DeleteProfile(id) => {
-                if let Some(pos) = self.config.connections.iter().position(|p| p.id == id) {
-                    let profile = self.config.connections.remove(pos);
-                    self.forget_password(&profile);
-                    self.selected_conn = self.selected_conn.min(self.config.connections.len().saturating_sub(1));
-                    self.save_config();
+                if let Some(profile) = self.profile(&id).cloned() {
                     self.notify(Level::Success, format!("Deleted {}", profile.name));
+                    self.update_config(|c| c.connections.retain(|p| p.id != id));
+                    self.forget_password(&id, profile.credential);
                 }
             }
             ConfirmAction::Disconnect => self.disconnect(),
@@ -1247,20 +1388,60 @@ impl App {
         }
         match profile.credential {
             CredentialStore::None => self.ask_password(profile, None),
-            // Read from the keyring in the background task.
-            CredentialStore::Keyring => self.spawn_connect(profile, None, None),
+            // Read from the keyring in the background: it can be slow.
+            CredentialStore::Keyring => {
+                self.busy = Some(format!("Connecting to {}", profile.name));
+                let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = keyring.get(&profile.id).map_err(err_text);
+                    let _ = tx.send(AppEvent::SavedPassword { profile, result });
+                });
+            }
             CredentialStore::Vault => match &self.vault {
                 None => self.open_vault_prompt(AfterUnlock::Connect(profile)),
-                Some(vault) => match vault.get(&profile.id) {
-                    Ok(Some(pw)) => self.spawn_connect(profile, Some(Zeroizing::new(pw)), None),
-                    Ok(None) => self.ask_password(profile, Some("No password saved in the vault".into())),
-                    Err(e) => self.ask_password(profile, Some(err_text(e))),
-                },
+                Some(vault) => {
+                    let result = vault.get(&profile.id);
+                    self.connect_with_saved(profile, result, "the vault");
+                }
             },
         }
     }
 
+    /// Connects with the password saved for `profile`, if it was saved for
+    /// the server the profile now points to; otherwise asks for one.
+    fn connect_with_saved(
+        &mut self,
+        profile: ConnectionProfile,
+        saved: anyhow::Result<Option<StoredSecret>>,
+        store: &str,
+    ) {
+        let secret = match saved {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return self.ask_password(profile, Some(format!("No password saved in {store}"))),
+            Err(e) => {
+                if e.is::<VaultChanged>() {
+                    self.vault = None;
+                }
+                return self.ask_password(profile, Some(err_text(e)));
+            }
+        };
+        let endpoint = Endpoint::of(&profile);
+        match secret.password_for(&endpoint, &endpoint) {
+            Ok(password) => {
+                // Saved before passwords were bound: bind it once it works.
+                let rebind = (!secret.is_bound()).then(|| self.remember(&profile, password.clone(), true));
+                self.spawn_connect(profile, Some(password.clone()), rebind);
+            }
+            Err(mismatch) => self.ask_password(profile, Some(mismatch)),
+        }
+    }
+
+    fn remember(&self, profile: &ConnectionProfile, password: Zeroizing<String>, rebind: bool) -> Remember {
+        Remember { password, rebind, generation: self.credentials.generation(&profile.id) }
+    }
+
     fn ask_password(&mut self, profile: ConnectionProfile, error: Option<String>) {
+        self.busy = None;
         self.popup = Some(Popup::Password(PasswordPrompt {
             remember: profile.credential != CredentialStore::None,
             profile,
@@ -1274,43 +1455,11 @@ impl App {
         &mut self,
         profile: ConnectionProfile,
         password: Option<Zeroizing<String>>,
-        remember: Option<Zeroizing<String>>,
+        remember: Option<Remember>,
     ) {
         self.busy = Some(format!("Connecting to {}", profile.name));
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let password = match password {
-                Some(p) => Some(p),
-                None if profile.needs_password() && profile.credential == CredentialStore::Keyring => {
-                    let id = profile.id.clone();
-                    let res = tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await;
-                    match res {
-                        Ok(Ok(Some(p))) => Some(Zeroizing::new(p)),
-                        Ok(Ok(None)) => {
-                            let _ = tx.send(AppEvent::ConnectFailed {
-                                profile,
-                                error: "No password found in the OS keyring".into(),
-                                needs_password: true,
-                            });
-                            return;
-                        }
-                        Ok(Err(e)) => {
-                            let _ =
-                                tx.send(AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: true });
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::ConnectFailed {
-                                profile,
-                                error: e.to_string(),
-                                needs_password: true,
-                            });
-                            return;
-                        }
-                    }
-                }
-                None => None,
-            };
             let result = async {
                 let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
                 let session = db.session_info(&profile).await?;
@@ -1333,21 +1482,44 @@ impl App {
             Ok(p) => p,
             Err(e) => return self.notify(Level::Error, e),
         };
+        // A saved password is only used for the server it was saved for (one
+        // saved before passwords were bound: the server of the saved profile).
+        let endpoint = Endpoint::of(&profile);
+        let saved_for = Endpoint::of(&form.original);
         let mut password =
             (!form.password.value().is_empty()).then(|| Zeroizing::new(form.password.value().to_string()));
-        if password.is_none() && profile.credential == CredentialStore::Vault {
-            password = self.vault.as_ref().and_then(|v| v.get(&profile.id).ok().flatten()).map(Zeroizing::new);
+        let use_keyring =
+            password.is_none() && profile.needs_password() && profile.credential == CredentialStore::Keyring;
+        if password.is_none()
+            && profile.needs_password()
+            && profile.credential == CredentialStore::Vault
+            && let Some(vault) = &self.vault
+        {
+            let saved = vault.get(&profile.id).map_err(err_text).and_then(|secret| match secret {
+                Some(secret) => secret.password_for(&endpoint, &saved_for).map(|pw| Some(pw.clone())),
+                None => Ok(None),
+            });
+            match saved {
+                Ok(saved) => password = saved,
+                // Reported like any other test failure, once the form is back.
+                Err(e) => {
+                    let _ = self.tx.send(AppEvent::TestResult(Err(e)));
+                    return;
+                }
+            }
         }
-        let use_keyring = password.is_none() && profile.credential == CredentialStore::Keyring;
         self.busy = Some("Testing connection".into());
-        let tx = self.tx.clone();
+        let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
         tokio::spawn(async move {
             let result = async {
                 let mut password = password;
                 if use_keyring {
                     let id = profile.id.clone();
-                    password =
-                        tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await??.map(Zeroizing::new);
+                    let saved = tokio::task::spawn_blocking(move || keyring.get(&id)).await??;
+                    if let Some(secret) = saved {
+                        password =
+                            Some(secret.password_for(&endpoint, &saved_for).map_err(anyhow::Error::msg)?.clone());
+                    }
                 }
                 let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
                 let info = db.session_info(&profile).await;
@@ -1383,58 +1555,106 @@ impl App {
         };
         let password = Zeroizing::new(form.password.value().to_string());
         let save_password = form.save_password && profile.needs_password();
-        if !save_password && profile.credential != CredentialStore::None {
-            self.forget_password(&profile);
+        if !save_password && (profile.credential != CredentialStore::None || self.credentials.knows(&profile.id)) {
+            self.forget_password(&profile.id, profile.credential);
             profile.credential = CredentialStore::None;
         }
-        let id = profile.id.clone();
-        let name = profile.name.clone();
-        match self.config.connections.iter().position(|p| p.id == id) {
-            Some(pos) => {
-                self.config.connections[pos] = profile;
-                self.selected_conn = pos;
-            }
-            None => {
-                self.config.connections.push(profile);
-                self.selected_conn = self.config.connections.len() - 1;
-            }
-        }
-        self.save_config();
-        self.notify(Level::Success, format!("Saved {name}"));
+        let (id, name, endpoint) = (profile.id.clone(), profile.name.clone(), Endpoint::of(&profile));
+        let moved = profile.credential != CredentialStore::None && endpoint != Endpoint::of(&form.original);
+        self.update_config(|c| match c.connections.iter().position(|p| p.id == id) {
+            Some(pos) => c.connections[pos] = profile.clone(),
+            None => c.connections.push(profile.clone()),
+        });
+        self.selected_conn = self.config.connections.iter().position(|p| p.id == id).unwrap_or(0);
         if save_password && !password.is_empty() {
-            self.store_password(&id, &password);
+            self.notify(Level::Success, format!("Saved {name}"));
+            self.store_password(&id, endpoint, password);
+        } else if moved {
+            self.notify(
+                Level::Info,
+                format!("Saved {name}. Its saved password is not sent to the new server: it is asked for on connect."),
+            );
+        } else {
+            self.notify(Level::Success, format!("Saved {name}"));
         }
     }
 
-    fn set_credential(&mut self, id: &str, store: CredentialStore) {
-        if let Some(p) = self.config.connections.iter_mut().find(|p| p.id == id) {
-            p.credential = store;
-        }
-        self.save_config();
+    /// Records where a profile's password now is. False if the profile is
+    /// gone (perhaps deleted by another dbtui instance).
+    fn set_credential(&mut self, id: &str, store: CredentialStore) -> bool {
+        self.update_config(|c| {
+            if let Some(p) = c.connections.iter_mut().find(|p| p.id == id) {
+                p.credential = store;
+            }
+        });
+        self.profile(id).is_some()
     }
 
-    /// Saves a password using the configured backend (keyring first, vault as fallback).
-    fn store_password(&mut self, id: &str, password: &str) {
+    /// Saves a password for profile `id`, bound to `endpoint`, using the
+    /// configured backend (keyring first, vault as fallback).
+    fn store_password(&mut self, id: &str, endpoint: Endpoint, password: Zeroizing<String>) {
+        let generation = self.credentials.bump(id);
+        let request = SaveRequest { id: id.to_string(), endpoint, password, generation, quiet: false };
         if self.config.secret_backend == SecretBackend::Vault {
-            return self.store_in_vault(id, password);
+            return self.store_in_vault(request);
         }
-        // The keyring can block for a long time (e.g. waiting to be unlocked),
-        // so it is never called on the UI thread; the result comes back as
-        // `AppEvent::KeyringStored`.
-        let (id, password) = (id.to_string(), Zeroizing::new(password.to_string()));
+        self.store_in_keyring(request);
+    }
+
+    /// Saves a password that was saved before passwords were bound to their
+    /// server again, bound, where it already is.
+    fn rebind_password(&mut self, profile: &ConnectionProfile, password: Zeroizing<String>) {
+        let generation = self.credentials.bump(&profile.id);
+        let request =
+            SaveRequest { id: profile.id.clone(), endpoint: Endpoint::of(profile), password, generation, quiet: true };
+        match profile.credential {
+            CredentialStore::Keyring => self.store_in_keyring(request),
+            CredentialStore::Vault => self.store_in_vault(request),
+            CredentialStore::None => {}
+        }
+    }
+
+    /// The keyring can block for a long time (e.g. waiting to be unlocked),
+    /// so it is never called on the UI thread; the result comes back as
+    /// `AppEvent::KeyringStored`, whenever the keyring answers.
+    fn store_in_keyring(&mut self, request: SaveRequest) {
+        let generation = request.generation;
+        self.credentials.last_keyring_op.insert(request.id.clone(), generation);
+        self.credentials.pending.insert(generation, (Instant::now(), false));
         let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = secrets::keyring_set(&id, &password).map_err(err_text);
-            let _ = tx.send(AppEvent::KeyringStored { id, password, result });
+        let (id, endpoint, password) = (request.id.clone(), request.endpoint.clone(), request.password.clone());
+        self.keyring.set(&id, &endpoint, &password, move |result| {
+            let _ = tx.send(AppEvent::KeyringStored(request, result.map_err(err_text)));
         });
     }
 
-    fn keyring_stored(&mut self, id: &str, password: &str, result: Result<(), String>) {
+    fn keyring_stored(&mut self, request: SaveRequest, result: Result<(), String>) {
+        let SaveRequest { id, generation, quiet, .. } = &request;
+        self.credentials.pending.remove(generation);
+        if self.credentials.generation(id) != *generation || self.profile(id).is_none() {
+            // Stale: the profile was deleted, or its password saved again or
+            // no longer saved, while the keyring was busy. Unless a later
+            // keyring operation for it is queued (it runs after this one, and
+            // decides what the keyring holds), remove what this one wrote.
+            if self.credentials.last_keyring_op.get(id) == Some(generation) {
+                self.keyring_delete(id, false);
+            }
+            return;
+        }
         match result {
             Ok(()) => {
-                self.set_credential(id, CredentialStore::Keyring);
-                self.notify(Level::Success, "Password saved in the OS keyring");
+                let id = id.clone();
+                if !self.set_credential(&id, CredentialStore::Keyring) {
+                    return self.keyring_delete(&id, false);
+                }
+                // The password may have been in the vault until now.
+                self.vault_delete(&id, false);
+                if !quiet {
+                    self.notify(Level::Success, "Password saved in the OS keyring");
+                }
             }
+            // A password that is already saved stays where it is.
+            Err(_) if *quiet => {}
             // Don't replace whatever dialog the user opened in the meantime with the vault prompt.
             Err(e)
                 if self.config.secret_backend == SecretBackend::Keyring
@@ -1442,48 +1662,92 @@ impl App {
             {
                 self.notify(Level::Error, format!("Could not save password: {e}"));
             }
-            Err(_) => self.store_in_vault(id, password),
+            Err(_) => self.store_in_vault(request),
         }
     }
 
-    fn store_in_vault(&mut self, id: &str, password: &str) {
-        match self.vault.as_mut() {
-            Some(vault) => match vault.set(id, password) {
-                Ok(()) => {
-                    self.set_credential(id, CredentialStore::Vault);
-                    self.notify(Level::Success, "Password saved in the encrypted vault");
-                }
-                Err(e) => self.notify(Level::Error, format!("Could not save password: {}", err_text(e))),
-            },
-            None => self.open_vault_prompt(AfterUnlock::Store {
-                id: id.to_string(),
-                password: Zeroizing::new(password.to_string()),
-            }),
+    fn store_in_vault(&mut self, request: SaveRequest) {
+        // Saved again or forgotten, or the profile deleted, meanwhile (e.g.
+        // while the vault prompt was open).
+        if self.credentials.generation(&request.id) != request.generation || self.profile(&request.id).is_none() {
+            return;
         }
-    }
-
-    fn forget_password(&mut self, profile: &ConnectionProfile) {
-        let result = match profile.credential {
-            CredentialStore::None => Ok(()),
-            CredentialStore::Keyring => {
-                let (id, tx) = (profile.id.clone(), self.tx.clone());
-                tokio::task::spawn_blocking(move || {
-                    let _ = tx.send(AppEvent::KeyringRemoved(secrets::keyring_delete(&id).map_err(err_text)));
-                });
-                Ok(())
-            }
-            CredentialStore::Vault => match self.vault.as_mut() {
-                Some(v) => v.remove(&profile.id),
-                None => Vault::default_path().and_then(|p| Vault::remove_locked(&p, &profile.id)),
-            },
+        let Some(vault) = &self.vault else {
+            return self.open_vault_prompt(AfterUnlock::Store(request));
         };
-        if let Err(e) = result {
+        let SaveRequest { id, endpoint, password, quiet, .. } = &request;
+        if let Err(e) = vault.set(id, endpoint, password) {
+            if e.is::<VaultChanged>() {
+                self.vault = None;
+            }
+            return self.notify(Level::Error, format!("Could not save password: {}", err_text(e)));
+        }
+        let previous = self.profile(id).map(|p| p.credential);
+        if !self.set_credential(id, CredentialStore::Vault) {
+            return self.vault_delete(id, false);
+        }
+        // The keyring may still hold an older copy.
+        if previous == Some(CredentialStore::Keyring) || self.credentials.last_keyring_op.contains_key(id) {
+            self.keyring_delete(id, previous == Some(CredentialStore::Keyring));
+        }
+        if !quiet {
+            self.notify(Level::Success, "Password saved in the encrypted vault");
+        }
+    }
+
+    /// Removes a profile's saved password from both stores (it may have been
+    /// saved in either one at some point), and makes saves still in progress
+    /// stale, so that their results are removed rather than recorded.
+    fn forget_password(&mut self, id: &str, credential: CredentialStore) {
+        self.credentials.bump(id);
+        self.vault_delete(id, credential == CredentialStore::Vault);
+        self.keyring_delete(id, credential == CredentialStore::Keyring);
+    }
+
+    /// Removes a profile's vault entry, if any; the vault need not be unlocked.
+    fn vault_delete(&mut self, id: &str, report: bool) {
+        if let Err(e) = self.vault_path().and_then(|path| Vault::remove(&path, id))
+            && report
+        {
             self.notify(Level::Warning, format!("Could not remove saved password: {}", err_text(e)));
         }
     }
 
+    fn keyring_delete(&mut self, id: &str, report: bool) {
+        let op = self.credentials.next();
+        self.credentials.last_keyring_op.insert(id.to_string(), op);
+        self.credentials.pending.insert(op, (Instant::now(), true));
+        let tx = self.tx.clone();
+        self.keyring.delete(id, move |result| {
+            let _ = tx.send(AppEvent::KeyringRemoved { op, report, result: result.map_err(err_text) });
+        });
+    }
+
+    /// Whether keyring work is still in progress: a password being saved or
+    /// removed, whose result should be recorded before quitting.
+    pub fn keyring_busy(&self) -> bool {
+        !self.credentials.pending.is_empty()
+    }
+
+    /// Saves the password a connection worked with, if asked to.
+    fn remember_password(&mut self, connected: &ConnectionProfile, remember: Remember) {
+        // Only for the profile as it was connected: not if it has been
+        // deleted or now points to another server, or if its password was
+        // saved or forgotten in the meantime.
+        let Some(current) = self.profile(&connected.id).cloned() else { return };
+        let endpoint = Endpoint::of(connected);
+        if Endpoint::of(&current) != endpoint || self.credentials.generation(&current.id) != remember.generation {
+            return;
+        }
+        if remember.rebind {
+            self.rebind_password(&current, remember.password);
+        } else {
+            self.store_password(&current.id, endpoint, remember.password);
+        }
+    }
+
     fn open_vault_prompt(&mut self, then: AfterUnlock) {
-        let create = match Vault::default_path() {
+        let create = match self.vault_path() {
             Ok(p) => !Vault::exists(&p),
             Err(e) => return self.notify(Level::Error, err_text(e)),
         };
@@ -1494,42 +1758,69 @@ impl App {
             focus: 0,
             error: None,
             then,
+            working: None,
         }));
     }
 
+    /// Checks the master password in the background: deriving the key is
+    /// deliberately slow. The result comes back as `AppEvent::VaultOpened`.
     fn submit_vault(&mut self, mut v: VaultPrompt) -> Option<Popup> {
-        let path = match Vault::default_path() {
+        let path = match self.vault_path() {
             Ok(p) => p,
             Err(e) => {
                 v.error = Some(err_text(e));
                 return Some(Popup::Vault(v));
             }
         };
-        let result = if v.create {
-            if v.input.value() != v.confirm.value() {
-                v.error = Some("Passwords do not match".into());
-                return Some(Popup::Vault(v));
+        if v.create && v.input.value() != v.confirm.value() {
+            v.error = Some("Passwords do not match".into());
+            return Some(Popup::Vault(v));
+        }
+        let master = Zeroizing::new(v.input.value().to_string());
+        self.vault_seq += 1;
+        let (seq, create, tx) = (self.vault_seq, v.create, self.tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let result = if create { Vault::create(&path, &master) } else { Vault::unlock(&path, &master) };
+            let _ = tx.send(AppEvent::VaultOpened { seq, result });
+        });
+        v.working = Some(seq);
+        v.error = None;
+        Some(Popup::Vault(v))
+    }
+
+    fn vault_opened(&mut self, seq: u64, result: anyhow::Result<Vault>) {
+        let prompt = match self.popup.take() {
+            Some(Popup::Vault(v)) if v.working == Some(seq) => Some(v),
+            other => {
+                self.popup = other;
+                None
             }
-            Vault::create(&path, v.input.value())
-        } else {
-            Vault::unlock(&path, v.input.value())
         };
-        match result {
-            Ok(vault) => {
+        match (result, prompt) {
+            (Ok(vault), Some(v)) => {
                 self.vault = Some(vault);
-                match std::mem::replace(&mut v.then, AfterUnlock::Connect(ConnectionProfile::new(Driver::Sqlite))) {
+                match v.then {
                     AfterUnlock::Connect(profile) => self.connect(profile),
-                    AfterUnlock::Store { id, password } => self.store_in_vault(&id, &password),
+                    AfterUnlock::Store(request) => self.store_in_vault(request),
                 }
-                self.popup.take()
             }
-            Err(e) => {
-                v.error = Some(err_text(e));
+            // Cancelled while it was checked: keep it unlocked, nothing more.
+            (Ok(vault), None) => self.vault = Some(vault),
+            (Err(e), Some(mut v)) => {
+                v.working = None;
                 v.input.set("");
                 v.confirm.set("");
                 v.focus = 0;
-                Some(Popup::Vault(v))
+                v.error = Some(if e.is::<VaultExists>() {
+                    // Created meanwhile, by another dbtui instance: never replaced.
+                    v.create = false;
+                    "A vault has just been created by another dbtui instance: enter its master password".into()
+                } else {
+                    err_text(e)
+                });
+                self.popup = Some(Popup::Vault(v));
             }
+            (Err(_), None) => {}
         }
     }
 
@@ -1706,8 +1997,8 @@ impl App {
         match event {
             AppEvent::Connected { profile, db, session, schemas, remember } => {
                 self.busy = None;
-                if let Some(pw) = remember {
-                    self.store_password(&profile.id, &pw);
+                if let Some(remember) = remember {
+                    self.remember_password(&profile, remember);
                 }
                 let browser = Browser::new(profile, db, *session, schemas);
                 let level = browser.access_level();
@@ -1737,12 +2028,19 @@ impl App {
                     });
                 }
             }
-            AppEvent::KeyringStored { id, password, result } => self.keyring_stored(&id, &password, result),
-            AppEvent::KeyringRemoved(result) => {
-                if let Err(e) = result {
+            AppEvent::SavedPassword { profile, result } => {
+                self.connect_with_saved(profile, result.map_err(anyhow::Error::msg), "the OS keyring")
+            }
+            AppEvent::KeyringStored(request, result) => self.keyring_stored(request, result),
+            AppEvent::KeyringRemoved { op, report, result } => {
+                self.credentials.pending.remove(&op);
+                if let Err(e) = result
+                    && report
+                {
                     self.notify(Level::Warning, format!("Could not remove saved password: {e}"));
                 }
             }
+            AppEvent::VaultOpened { seq, result } => self.vault_opened(seq, result),
             AppEvent::TestResult(result) => {
                 self.busy = None;
                 match result {

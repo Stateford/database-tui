@@ -118,7 +118,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Paragraph::new(Line::styled(p.hint.as_str(), dim())), hint);
         }
         Popup::Password(p) => {
-            let r = centered(area, 64, 10);
+            // Room for the error (such as why the saved password is not used):
+            // wrapped between long words, a line holds 40 characters or more.
+            let error_lines = p.error.as_ref().map_or(1, |e| e.chars().count().div_ceil(40).clamp(1, 6)) as u16;
+            let r = centered(area, 64, 9 + error_lines);
             let inner = modal(frame, r, "Password", BLUE).inner(Margin { horizontal: 2, vertical: 1 });
             let [who, field, remember, err, foot] = Layout::vertical([
                 Constraint::Length(2),
@@ -158,7 +161,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(footer(&[("Enter", "connect"), ("Tab", "toggle remember"), ("Esc", "cancel")]), foot);
         }
         Popup::Vault(v) => {
-            let r = centered(area, 70, if v.create { 12 } else { 9 });
+            let r = centered(area, 70, if v.create { 12 } else { 10 });
             let title = if v.create { "Create password vault" } else { "Unlock password vault" };
             let inner = modal(frame, r, title, TEAL).inner(Margin { horizontal: 2, vertical: 1 });
             let [info, a, b, err, foot] = Layout::vertical([
@@ -182,10 +185,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             if v.create {
                 draw_labeled_input(frame, b, "Confirm", &v.confirm, v.focus == 1, true);
             }
-            if let Some(e) = &v.error {
-                frame.render_widget(Paragraph::new(Line::styled(e.as_str(), Style::default().fg(RED))), err);
+            if v.working.is_some() {
+                let text = if v.create { "Creating the vault…" } else { "Checking the master password…" };
+                frame.render_widget(Paragraph::new(Line::styled(text, Style::default().fg(CYAN))), err);
+                frame.render_widget(footer(&[("Esc", "cancel")]), foot);
+            } else {
+                if let Some(e) = &v.error {
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(e.as_str(), Style::default().fg(RED))).wrap(Wrap { trim: true }),
+                        err,
+                    );
+                }
+                frame.render_widget(footer(&[("Enter", "ok"), ("Esc", "cancel")]), foot);
             }
-            frame.render_widget(footer(&[("Enter", "ok"), ("Esc", "cancel")]), foot);
         }
         Popup::CellEditor(c) => {
             let r = centered(area, 80, 14);
@@ -326,7 +338,9 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &ConnectionForm, backend: Secr
             Field::Password => {
                 let input = form.input(*field).expect("text field");
                 if input.value().is_empty() && !is_focused {
-                    let hint = if form.has_stored_password() {
+                    let hint = if let Some(saved) = form.saved_password_elsewhere() {
+                        format!(" saved for {} only", saved.address())
+                    } else if form.has_stored_password() {
                         format!(" saved in {} — leave empty to keep", form.original.credential.label())
                     } else {
                         " asked on connect unless saved".to_string()
