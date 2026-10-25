@@ -10,12 +10,19 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
 - **Explore schemas**: schemas, tables, views and materialized views in a filterable tree.
   The Structure tab lists columns, types, defaults, keys and indexes.
 - **Browse data**: a fast spreadsheet-style grid with paging, sorting, SQL `WHERE` filters,
-  a full-value viewer (JSON is pretty-printed) and copy to the system clipboard (OSC 52).
+  a full-value viewer (JSON is re-indented, nothing else about it changes) and copy to the
+  system clipboard (OSC 52). Copying always copies the stored value; a `NULL` copies nothing.
+  Hidden characters in names and values are shown rather than dropped, and very large values
+  are loaded cut. See [Data from the database](#data-from-the-database).
 - **Edit data safely**: edit cells, set `NULL`, add rows and delete rows. Changes are *staged*
   and highlighted, and you can undo them. Committing first shows a preview of the generated SQL,
   then runs everything in **one transaction**. Each update or delete targets exactly one row by
   primary key, and if any statement would touch a different number of rows, the whole commit is
-  rolled back.
+  rolled back. Values go through the database's normal checks, so one that does not fit the
+  column (too long for `varchar(n)`, say) is rejected rather than cut short. MySQL tables on an
+  engine without transactions (MyISAM, MEMORY…) cannot be rolled back: the preview warns about
+  this, and committing several changes to them needs an explicit `!`. See
+  [How edits reach the right row](#how-edits-reach-the-right-row).
 - **SQL editor**: a multi-line editor with a result grid. You can run the whole buffer or only
   the selection.
 - **Vim or standard keys**: arrows/F-keys/Ctrl shortcuts by default, or a vim-style scheme
@@ -25,9 +32,13 @@ A terminal UI for exploring and editing SQL databases, built with Rust and
   keyring (macOS Keychain, Windows Credential Manager, Secret Service on Linux). When no keyring
   is available (servers, containers, WSL), they go to an encrypted vault instead. The vault uses
   Argon2id for the key and XChaCha20-Poly1305 for the data, and is unlocked once per session
-  with a master password.
+  with a master password. A saved password is only ever sent to the server it was saved for.
+  See [Saved passwords](#saved-passwords).
 - **Permission-aware**: the status bar always shows your access level and your privileges on the
   open table. Read-only users can browse and query, but cannot even start an edit. See below.
+- **Verified connections**: new profiles for remote servers check the server's certificate and
+  host name (`verify-full`). The status bar shows the TLS version actually negotiated, and dbtui
+  warns whenever a remote server is not authenticated. See [Connection security](#connection-security).
 
 ## Permissions
 
@@ -51,9 +62,186 @@ The status bar shows the result:
 
 Without the right privilege, the edit, delete and insert keys do nothing except show a short
 explanation, and their hints disappear from the footer. Rows can only be edited or deleted when
-the table has a primary key. In the SQL editor, a fully read-only session refuses any statement
-that writes before sending it. Statements also run inside a read-only transaction as a second
-safeguard.
+the table has a primary key.
+
+### What read-only covers
+
+In a read-only session (a profile marked read-only, `--read-only`, a read-only server, or an
+account without write privileges):
+
+- edits cannot be staged or committed;
+- the SQL editor refuses, before sending anything, every statement that writes, changes
+  settings (`SET`, `set_config()`, `PRAGMA name = value`) or controls transactions (`BEGIN`,
+  `COMMIT`, `ROLLBACK`…), as well as text it cannot check reliably (an unterminated string or
+  comment, MySQL `/*! … */` comments);
+- as a second safeguard, everything that is sent (SQL editor queries, page loads and row counts,
+  including table filters) runs inside a read-only transaction that is always rolled back
+  (`PRAGMA query_only` on SQLite), so the database itself rejects writes.
+
+Table filters are checked in every session: a filter must be a single condition, without `;`,
+comments or unbalanced parentheses. The checks follow each database's quoting rules, including
+settings that change them (`standard_conforming_strings`, MySQL `NO_BACKSLASH_ESCAPES` and
+`ANSI_QUOTES`).
+
+Read-only mode does not stop side effects that a database allows inside a read-only
+transaction: advisory locks (`pg_advisory_lock`, MySQL `GET_LOCK`), functions that work through
+another connection (`dblink`) or outside the database (untrusted procedural languages), and
+anything else a server-side function may do. Those are governed by the account's privileges.
+For a hard guarantee, connect with an account that can only read.
+
+## How edits reach the right row
+
+Rows are identified by their primary key, never by where they are on screen:
+
+- **Keys are matched exactly as stored.** Binary keys are sent as bytes, not as the `0x…` text
+  the grid shows, and SQLite keys keep their storage class: in a column without type affinity,
+  integer `1` and text `'1'` are different rows that look the same. A row whose key is not shown
+  exactly as stored (text that is not UTF-8, a MySQL `BIT` value) cannot be changed from the
+  grid; use the SQL editor. Binary values themselves cannot be edited as text either, nor
+  pasted from a copy (which holds their `0x…` text).
+- **The cell editor remembers its row and column**, not their position. If the table is
+  reloaded while it is open, the value goes to the same row wherever it now is, or, if the row
+  is gone, the editor closes without staging anything. Confirming without a change stages
+  nothing, and line endings (CRLF, a final newline) are kept.
+- **Nothing can be staged while a page is loading or a commit is running**, and reloading,
+  sorting, filtering or paging waits until staged changes are committed or discarded. Staged
+  changes are never dropped by a reload.
+- **A commit preview is tied to what it shows**: it only commits to the connection and table it
+  was made for, and only while the staged changes are the ones shown. While a commit runs, a
+  second one, discarding, and opening another table wait for its result; afterwards exactly
+  the committed changes are cleared and the table is reloaded, whichever tab is shown. Quitting
+  or disconnecting during a commit warns that it may still be applied, and after a disconnect
+  its result is still reported.
+- **Results of earlier requests are dropped**: a connection that finishes after you asked for
+  another one is closed, and pages, counts, schema lists and query results from a connection
+  you have left never reach the current one.
+
+After a statement in the SQL editor that may have written, the open table is reloaded (or, with
+staged changes, dbtui warns that their rows may have changed).
+
+## Data from the database
+
+Names and values come from the database, and whoever can create a table or store a value there
+chooses them. dbtui shows them for what they are:
+
+- **Hidden characters are shown, never dropped.** Control characters appear as their symbols
+  (`␛` for ESC, `␇` for BEL, `␀`…), and invisible or reordering characters (zero-width spaces
+  and joiners, bidi marks and overrides, the byte order mark…) by code point, such as
+  `⟨U+202E⟩`. On one line, line breaks show as `↵` and tabs as `⇥`. This applies to names,
+  values, error messages, popup titles and the commit preview, so nothing from the database
+  reaches the terminal as a control or bidi character.
+- **Lookalike names are flagged.** A schema, table, column or index name that holds such
+  characters is drawn in orange behind `⚠`: `accounts` and `⚠ accounts⟨U+200B⟩` are two
+  different tables. The commit preview warns when its statements hold such characters, and the
+  cell editor when the value does (the viewer shows them).
+- **Copies are safe to paste.** `Ctrl-C` / `yy` and the viewer's `y` put the value on the system
+  clipboard with control characters other than tabs and line breaks replaced by their symbols:
+  pasted into a terminal, `ESC [201~` in a value would end the paste early and type the rest as
+  keys. dbtui says when it did this; pasting into a cell within dbtui keeps the value exactly.
+  At most 1 MiB goes to the clipboard. A binary value goes there as its `0x…` text, and cannot
+  be pasted into a cell (that would store the text).
+- **Large values are cut when loaded.** At most 256 KiB of each value is kept, and 32 MiB for a
+  whole page or query result; past that, values keep just enough to fill a column. A view can
+  produce values of any size without storing anything. Such a value ends in `…` in the grid, the
+  page footer counts them, and the viewer says how much was loaded. It cannot be edited, pasted
+  into another cell or used as a row's key; setting it to `NULL` or pasting a new value over it
+  works. The server still sends the whole value: use `substr()` / `left()` in the SQL editor to
+  read the rest.
+- **Failures stay contained.** A panic in background work (such as SQLite's driver reading a
+  table whose columns another program has just changed) ends that request with an
+  "internal error" instead of leaving it loading, and any other is reported on screen. If the UI
+  itself crashes, or dbtui gets SIGTERM or SIGHUP, the terminal is restored (raw mode, alternate
+  screen, bracketed paste) before it exits. Quitting gives the terminal back first, then waits at
+  most 2 seconds for work still running on the connection (a query, a commit) before closing it;
+  SIGTERM and SIGHUP end dbtui at any point.
+
+## Connection security
+
+The SSL mode of a profile uses the libpq names. With dbtui's driver (sqlx), only `verify-full`
+proves that you are talking to the right server:
+
+| Mode          | Encrypted            | Server authenticated                                        |
+|---------------|----------------------|-------------------------------------------------------------|
+| `disable`     | no                   | no                                                          |
+| `prefer`      | if the server agrees | no: any certificate is accepted, and TLS can be refused     |
+| `require`     | yes                  | no: any certificate is accepted                             |
+| `verify-ca`   | refused              | no: any public certificate passes (see below)               |
+| `verify-full` | yes                  | yes: a trusted certificate for the host name you typed      |
+
+Without authentication, anyone who can intercept or redirect the connection (shared Wi-Fi, a
+spoofed DNS name, a compromised router) can pose as the server and receive the password,
+including one saved in the keyring or vault. So:
+
+- **Defaults**: a new profile uses `verify-full`, or `prefer` when the host is `localhost`, a
+  loopback address or a Unix socket directory. A profile written without `ssl_mode` gets the
+  same default (earlier versions used `prefer`). Saved modes are kept as they are. When
+  `verify-full` refuses a certificate, the error says what to do: set a CA file, or use the host
+  name the certificate is for.
+- **Warnings**: the connection form, the connection list, the connect message and the status
+  bar warn when a remote profile uses `disable`, `prefer` or `require`. On a narrow terminal the
+  status bar keeps the warning (shortened to `⚠ unverified`) over less important details.
+- **Saved passwords only go to an authenticated server unasked**: connecting to a remote server
+  with one of those modes asks before sending the saved password, saying why (`y` sends it, `n`
+  or `Esc` cancels, `Enter` does nothing), and `Ctrl-T` in the form only tests with a typed
+  password. Profiles saved by earlier versions have `ssl_mode = "prefer"` written out, so they
+  ask until they are switched to `verify-full`.
+- **What was negotiated**: the status bar shows the transport the server reports (`pg_stat_ssl`
+  on PostgreSQL, `Ssl_version` / `Ssl_cipher` on MySQL): `✓ TLSv1.3 verified`,
+  `⚠ TLSv1.3 unverified`, `⚠ NOT ENCRYPTED`, or a plain `no TLS` / `socket` for local
+  connections. `Ctrl-T` in the form reports it too.
+- **Private CAs**: certificates are checked against the Mozilla root set built into the driver,
+  not the operating system's store. For a server with a private CA (company CA, AWS RDS, Cloud
+  SQL, MySQL's self-generated certificates), set **CA file** (`ssl_ca`) to a PEM file. It is
+  trusted in addition to the public roots.
+- **`verify-ca` is refused**: sqlx trusts the public roots in addition to the CA file and does
+  not check the host name, so any publicly trusted certificate, issued for any domain, would
+  pass. Use `verify-full`, with a CA file for a private CA. A profile saved with `verify-ca` must
+  be changed (in the form, changing its mode starts from `verify-full`). A CA file with
+  `disable`, `prefer` or `require` is refused too, because those modes ignore it.
+- **MySQL cleartext passwords**: sqlx 0.9 sends the password in clear text when the server's
+  first packet asks for the `mysql_clear_password` plugin (an upstream bug: its own
+  cleartext-plugin setting is not applied there). With `disable` or `prefer`, an attacker on the
+  network can therefore read the password. `verify-full` refuses a server that does not
+  complete TLS with a valid certificate, so the password only ever goes to the real server.
+- **No implicit settings**: connection settings come from the profile only. sqlx would read
+  PostgreSQL defaults from `PG*` environment variables (`PGPASSWORD`, `PGSSLCERT` / `PGSSLKEY`,
+  `PGSSLROOTCERT`, `PGOPTIONS`, `PGUSER`…), so dbtui removes every `PG*` variable at start-up,
+  and it does not read `~/.pgpass`. Client certificates are not supported.
+- **SQLite files from elsewhere** are opened with `PRAGMA trusted_schema = OFF` (SQL stored in
+  the file, such as views and triggers, may only use functions and virtual tables that SQLite
+  marks as safe) and `PRAGMA cell_size_check = ON`. A path starting with `file:` is a file
+  name, never an SQLite URI, and extensions cannot be loaded.
+
+## Saved passwords
+
+A password you choose to save goes to the OS keyring or, when there is none (or with
+`secret_backend = "vault"`), to the encrypted vault.
+
+- **Bound to their server**: a password is saved together with the driver, host, port and user
+  it was entered for, and is only sent there. If `config.toml` is edited to point a profile
+  somewhere else, connecting asks for the password, says which server the saved one belongs to,
+  and saves what you type for the new server. Pointing a profile elsewhere in the form removes
+  its saved password when the form is saved (the form says so beforehand). `Ctrl-T` in the form
+  only uses the saved password while the form still points to that server.
+- **Passwords saved by earlier versions** do not record their server, and the profile may have
+  been pointed elsewhere since. They are never sent unasked: connecting shows where the
+  password would go and asks first (`Ctrl-T` does not use them). Once a connection with one
+  works, it is saved again with its server, and no longer asked about.
+- **Cleaned up**: deleting a profile removes its password from both the keyring and the vault,
+  and a password that moves from one to the other is removed from the first.
+- **Slow keyrings**: a keyring waiting for its unlock prompt is not treated as a failure. After
+  15 seconds dbtui says so; the password is saved once the keyring answers, and is not put in
+  the vault meanwhile. If the profile has been deleted by then, or its password changed or no
+  longer to be saved, what the keyring stored is removed again.
+- **The vault** (`vault.toml`, next to the config file) derives its key from the master password
+  (8+ characters, never stored) with Argon2id, 64 MiB of memory and 3 passes. Vaults made by
+  earlier versions (19 MiB, 2 passes) are re-encrypted with these settings when unlocked, and a
+  vault file asking for more than 1 GiB, 10 passes or 8 lanes is refused. Creating a vault never
+  replaces an existing one, such as a vault that another dbtui instance has just created, and
+  pressing `Esc` while it is being created leaves no vault behind.
+- **In memory**: password fields and decrypted passwords are wiped once used, including the key
+  derivation's working memory, and core dumps are disabled on Unix. The database driver keeps
+  its own copy of the password while connected.
 
 ## Screenshots
 
@@ -80,9 +268,15 @@ cargo build --release && ./target/release/dbtui
 ```sh
 dbtui                 # connection manager
 dbtui "prod replica"  # open a saved connection by name
+dbtui --read-only "prod replica"  # ...without allowing any change, whatever the profile says
+dbtui --read-only     # every connection opened in this run is read-only
 dbtui ./app.db        # open a SQLite file directly (add --read-only to be safe)
 dbtui --vim           # use (and remember) vim keys
 ```
+
+`--read-only` applies to every connection opened in that run, including ones opened again from
+the connection manager after disconnecting; the status bar shows `READ-ONLY RUN`, and the
+connection's read-only reason names the flag. Saved profiles are not changed.
 
 Press `n` in the connection manager to add a connection. `Ctrl-T` tests it and `Ctrl-S` saves it.
 Press `?` or `F1` anywhere for the full key reference.
@@ -108,8 +302,13 @@ Press `?` or `F1` anywhere for the full key reference.
 ## Configuration
 
 Settings live in `config.toml` in the platform config directory (for example
-`~/.config/dbtui/` on Linux). Set `DBTUI_CONFIG_DIR` to use a different directory. The file is
-created with `0600` permissions and never contains passwords.
+`~/.config/dbtui/` on Linux). Set `DBTUI_CONFIG_DIR` to use a different directory. The file never
+contains passwords. Like the vault, it is replaced atomically by a new, randomly named file that
+only you can read (`0600`); a missing config directory is created `0700`, and an existing one
+that earlier versions left readable by others is made `0700` if it holds only dbtui's files (a
+directory chosen with `DBTUI_CONFIG_DIR` that holds other files is left alone). Several dbtui instances
+can share the directory: each change is made, under a lock (`config.lock`, `vault.lock`), to the
+file as it is on disk, so an instance never overwrites what another one saved.
 
 ```toml
 keymap = "vim"            # or "standard"
@@ -124,7 +323,9 @@ host = "localhost"
 port = 5432
 user = "app"
 database = "app"
-ssl_mode = "prefer"       # disable, prefer, require, verify-ca, verify-full
+ssl_mode = "prefer"       # disable, prefer, require or verify-full; if left out:
+                          # verify-full, or prefer for localhost and sockets
+# ssl_ca = "~/certs/db-ca.pem"   # optional, with verify-full: PEM file of a private CA
 read_only = false
 credential = "keyring"    # where the password is stored: none, keyring or vault
 ```
@@ -137,7 +338,15 @@ The encrypted vault (`vault.toml`) sits next to the config file.
 cargo test     # unit tests plus end-to-end tests against temporary SQLite databases
 cargo clippy --all-targets
 cargo fmt
+cargo audit    # known vulnerabilities in the locked dependencies
 ```
+
+CI runs these with `--locked` on Linux, macOS and Windows, plus `cargo audit` on every push and
+weekly. Its token can only read the repository, and its actions are pinned to commit SHAs.
+
+`docker compose -f dev/docker-compose.yml up -d` starts PostgreSQL and MySQL with sample data
+for manual testing. Their passwords are well known (`dbtui` / `dbtui`, `root` / `root`, `reader` /
+`reader`), so the ports are only published on `127.0.0.1`.
 
 The code is organised as:
 

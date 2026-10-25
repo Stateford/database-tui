@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::input::Input;
 use crate::config::{ConnectionProfile, CredentialStore, SslMode};
 use crate::db::Driver;
+use crate::secrets::Endpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -16,6 +17,7 @@ pub enum Field {
     Password,
     Database,
     Ssl,
+    SslCa,
     Path,
     SavePassword,
     ReadOnly,
@@ -32,6 +34,7 @@ impl Field {
             Field::Password => "Password",
             Field::Database => "Database",
             Field::Ssl => "SSL mode",
+            Field::SslCa => "CA file",
             Field::Path => "File",
             Field::SavePassword => "Save password",
             Field::ReadOnly => "Read-only",
@@ -63,6 +66,11 @@ pub struct ConnectionForm {
     pub database: Input,
     pub path: Input,
     pub ssl: SslMode,
+    /// The SSL mode follows the host (see [`SslMode::default_for_host`])
+    /// until it is chosen by hand. Only for new profiles: a saved profile
+    /// keeps its mode.
+    pub ssl_auto: bool,
+    pub ssl_ca: Input,
     pub save_password: bool,
     pub read_only: bool,
     pub focus: usize,
@@ -81,6 +89,8 @@ impl ConnectionForm {
             database: Input::new(&profile.database),
             path: Input::new(&profile.path),
             ssl: profile.ssl_mode,
+            ssl_auto: is_new,
+            ssl_ca: Input::new(&profile.ssl_ca),
             save_password: is_new || profile.credential != CredentialStore::None,
             read_only: profile.read_only,
             focus: 0,
@@ -102,6 +112,7 @@ impl ConnectionForm {
                 Field::Password,
                 Field::Database,
                 Field::Ssl,
+                Field::SslCa,
                 Field::SavePassword,
                 Field::ReadOnly,
             ],
@@ -121,6 +132,7 @@ impl ConnectionForm {
             Field::User => &self.user,
             Field::Password => &self.password,
             Field::Database => &self.database,
+            Field::SslCa => &self.ssl_ca,
             Field::Path => &self.path,
             _ => return None,
         })
@@ -134,6 +146,7 @@ impl ConnectionForm {
             Field::User => &mut self.user,
             Field::Password => &mut self.password,
             Field::Database => &mut self.database,
+            Field::SslCa => &mut self.ssl_ca,
             Field::Path => &mut self.path,
             _ => return None,
         })
@@ -141,6 +154,30 @@ impl ConnectionForm {
 
     pub fn has_stored_password(&self) -> bool {
         self.original.credential != CredentialStore::None
+    }
+
+    /// The server of the saved profile, when the form now points to another
+    /// one: its saved password is then not used (see [`Endpoint`]).
+    pub fn saved_password_elsewhere(&self) -> Option<Endpoint> {
+        let saved = Endpoint::of(&self.original);
+        let port = self.port.value().trim().parse().ok();
+        let current = Endpoint::new(self.driver, self.host.value(), port, self.user.value());
+        (self.has_stored_password() && current != saved).then_some(saved)
+    }
+
+    /// Warning about the TLS mode for the host currently in the form.
+    pub fn tls_warning(&self) -> Option<&'static str> {
+        let mut p = self.original.clone();
+        p.driver = self.driver;
+        p.host = self.host.value().to_string();
+        p.ssl_mode = self.ssl;
+        p.tls_warning()
+    }
+
+    fn host_changed(&mut self) {
+        if self.ssl_auto {
+            self.ssl = SslMode::default_for_host(self.host.value());
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FormOutcome {
@@ -170,6 +207,9 @@ impl ConnectionForm {
                 if let Some(input) = self.input_mut(field) {
                     input.handle_key(key);
                 }
+                if field == Field::Host {
+                    self.host_changed();
+                }
             }
         }
         self.error = None;
@@ -180,6 +220,9 @@ impl ConnectionForm {
         let field = self.focused();
         if let Some(input) = self.input_mut(field) {
             input.insert_str(text.lines().next().unwrap_or_default());
+        }
+        if field == Field::Host {
+            self.host_changed();
         }
     }
 
@@ -196,14 +239,19 @@ impl ConnectionForm {
                 }
                 if !new.is_file_based() && self.host.value().is_empty() {
                     self.host.set("localhost");
+                    self.host_changed();
                 }
                 self.driver = new;
                 self.focus = 1;
             }
             Field::Ssl => {
                 let all = SslMode::ALL;
-                let idx = all.iter().position(|s| *s == self.ssl).unwrap_or(0) as i32;
-                self.ssl = all[(idx + dir).rem_euclid(all.len() as i32) as usize];
+                self.ssl = match all.iter().position(|s| *s == self.ssl) {
+                    Some(idx) => all[(idx as i32 + dir).rem_euclid(all.len() as i32) as usize],
+                    // verify-ca, saved by an older version: what it was meant to do.
+                    None => SslMode::VerifyFull,
+                };
+                self.ssl_auto = false;
             }
             Field::SavePassword => self.save_password = !self.save_password,
             Field::ReadOnly => self.read_only = !self.read_only,
@@ -230,6 +278,7 @@ impl ConnectionForm {
             p.port = None;
             p.user.clear();
             p.database.clear();
+            p.ssl_ca.clear();
         } else {
             p.host = self.host.value().trim().to_string();
             p.port = match self.port.value().trim() {
@@ -239,7 +288,9 @@ impl ConnectionForm {
             p.user = self.user.value().trim().to_string();
             p.database = self.database.value().trim().to_string();
             p.ssl_mode = self.ssl;
+            p.ssl_ca = self.ssl_ca.value().trim().to_string();
             p.path.clear();
+            p.check_tls()?;
         }
         Ok(p)
     }

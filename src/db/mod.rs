@@ -11,7 +11,10 @@ pub mod sql;
 mod sqlite;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod transport_tests;
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -25,10 +28,23 @@ use sqlx::{AssertSqlSafe, Column, Either, Executor, Row};
 
 use crate::config::{ConnectionProfile, SslMode};
 
-pub use sql::Statement;
+pub use sql::{Statement, Value};
 
 /// Maximum number of rows kept from an ad-hoc query.
 pub const QUERY_ROW_LIMIT: usize = 2_000;
+
+/// Most bytes of a value's text kept when rows are loaded: a larger value
+/// is cut, and its cell marked as such ([`CellKind::Truncated`]). A view
+/// can produce values of any size at no cost to whoever created it.
+pub const CELL_BYTES: usize = 256 * 1024;
+
+/// Most bytes of values kept for one page or query result. Past it, each
+/// value is cut to [`CELL_BYTES_PAST_BUDGET`], which still fills a column
+/// of the grid.
+pub const RESULT_BYTES: usize = 32 * 1024 * 1024;
+
+/// See [`RESULT_BYTES`].
+pub const CELL_BYTES_PAST_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -147,7 +163,13 @@ pub struct SchemaInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ColumnInfo {
     pub name: String,
+    /// Type as shown to the user, e.g. `character varying(40)`.
     pub data_type: String,
+    /// PostgreSQL only: the type that bound values are cast to. It has no
+    /// length or precision modifier and domains are resolved to their base
+    /// type, because an explicit cast to `varchar(40)` silently truncates;
+    /// the server's assignment rules then reject values that do not fit.
+    pub base_type: String,
     pub nullable: bool,
     pub default: Option<String>,
     pub primary_key: bool,
@@ -167,6 +189,9 @@ pub struct IndexInfo {
 pub struct TableStructure {
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
+    /// MySQL storage engine of the table when it cannot roll back
+    /// (MyISAM, MEMORY…): a failed commit keeps the statements before it.
+    pub non_transactional_engine: Option<String>,
 }
 
 /// Rows returned by a query; every value is rendered as text, `None` is SQL NULL.
@@ -174,9 +199,53 @@ pub struct TableStructure {
 pub struct ResultSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// Per row, what each cell's text stands for; empty when it is all
+    /// plain text (see [`CellKind`]).
+    pub kinds: Vec<Vec<CellKind>>,
     pub rows_affected: u64,
+    /// Rows were left out (past the row limit).
     pub truncated: bool,
     pub elapsed: Duration,
+}
+
+/// What a cell's text stands for, when it is not just that text. Rows are
+/// found again by their key cells (to update or delete them), which must
+/// then be bound as the values they were read from: text that merely looks
+/// the same can belong to another row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CellKind {
+    /// The text itself (or SQL NULL).
+    #[default]
+    Text,
+    /// A SQLite INTEGER: shown the same as text '1', but a different key.
+    Integer,
+    /// A SQLite REAL, shown so that it reads back as the same number.
+    Real,
+    /// Bytes shown as `0x` and hex (SQLite BLOB, MySQL binary strings that
+    /// are not UTF-8), which are not that text.
+    Bytes,
+    /// Text that does not give the value back exactly (text that is not
+    /// UTF-8, a MySQL BIT value…): never used to find a row.
+    Inexact,
+    /// Only the start of a value too large to keep (see [`CELL_BYTES`]):
+    /// the size of its whole text, in bytes. Never used to find a row, and
+    /// never edited, as that would store the start alone.
+    Truncated(u64),
+}
+
+impl CellKind {
+    /// Binary data, shown as `0x…`: editing that text would store the text.
+    pub fn is_binary(self) -> bool {
+        matches!(self, CellKind::Bytes | CellKind::Inexact)
+    }
+
+    /// The size of the whole value's text, when only its start was kept.
+    pub fn truncated(self) -> Option<u64> {
+        match self {
+            CellKind::Truncated(len) => Some(len),
+            _ => None,
+        }
+    }
 }
 
 /// How much the session may change, summarised for the status bar.
@@ -205,6 +274,72 @@ pub struct SessionInfo {
     pub superuser: bool,
     /// Set when nothing can be written in this session, with the reason why.
     pub read_only_reason: Option<String>,
+    /// How the session reaches the server, as the server reports it.
+    pub transport: Transport,
+}
+
+/// Transport of a session, as reported by the server (`pg_stat_ssl`, MySQL
+/// `Ssl_version` / `Ssl_cipher`): with `prefer`, nothing else tells whether
+/// TLS was actually negotiated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Transport {
+    /// The server did not say.
+    #[default]
+    Unknown,
+    /// SQLite: a local file.
+    File,
+    /// Unix-domain socket.
+    Socket,
+    /// TCP without encryption.
+    Plain,
+    /// TLS; either part may be empty when the server leaves it out.
+    Tls { version: String, cipher: String },
+}
+
+/// How much a session's transport can be trusted, for the status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportTrust {
+    /// Stays on this machine.
+    Local,
+    /// TLS with the server's certificate and host name verified.
+    Verified,
+    /// Encrypted, but the server was not authenticated.
+    Unverified,
+    /// Not encrypted, over a network.
+    Exposed,
+}
+
+impl Transport {
+    /// Summary of `self` for a session opened with `profile`: a short label
+    /// and how far it can be trusted. `None` for SQLite files.
+    pub fn summary(&self, profile: &ConnectionProfile) -> Option<(String, TransportTrust)> {
+        let tls = |version: &str| {
+            let version = if version.is_empty() { "TLS" } else { version };
+            match profile.ssl_mode {
+                SslMode::VerifyFull => (format!("{version} verified"), TransportTrust::Verified),
+                SslMode::VerifyCa => (format!("{version} host unchecked"), TransportTrust::Unverified),
+                _ => (format!("{version} unverified"), TransportTrust::Unverified),
+            }
+        };
+        let plain = || ("NOT ENCRYPTED".to_string(), TransportTrust::Exposed);
+        let (label, trust) = match self {
+            Transport::File => return None,
+            Transport::Socket => ("socket".to_string(), TransportTrust::Local),
+            Transport::Plain => plain(),
+            Transport::Tls { version, .. } => tls(version),
+            // sqlx refuses plain TCP from `require` on; `disable` never tries TLS.
+            Transport::Unknown => match profile.ssl_mode {
+                SslMode::Disable => plain(),
+                SslMode::Prefer => ("TLS unknown".to_string(), TransportTrust::Unverified),
+                _ => tls(""),
+            },
+        };
+        if profile.is_local() && trust != TransportTrust::Verified {
+            let label = if trust == TransportTrust::Exposed { "no TLS".to_string() } else { label };
+            return Some((label, TransportTrust::Local));
+        }
+        Some((label, trust))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,8 +369,19 @@ impl Database {
         }
     }
 
+    /// Connects with the profile's settings only. `password` is always sent
+    /// as given (empty when `None`). sqlx also reads PostgreSQL defaults from
+    /// `PG*` environment variables, which `main` removes at start-up (see
+    /// [`clear_client_environment`]).
     pub async fn connect(profile: &ConnectionProfile, password: Option<&str>) -> Result<Database> {
         let timeout = Duration::from_secs(10);
+        let ssl_ca = match profile.driver {
+            Driver::Sqlite => None,
+            _ => {
+                profile.check_tls().map_err(anyhow::Error::msg)?;
+                non_empty(&profile.ssl_ca).map(ca_file).transpose()?
+            }
+        };
         match profile.driver {
             Driver::Postgres => {
                 let mut opts = PgConnectOptions::new_without_pgpass()
@@ -246,14 +392,16 @@ impl Database {
                         SslMode::Disable => PgSslMode::Disable,
                         SslMode::Prefer => PgSslMode::Prefer,
                         SslMode::Require => PgSslMode::Require,
-                        SslMode::VerifyCa => PgSslMode::VerifyCa,
-                        SslMode::VerifyFull => PgSslMode::VerifyFull,
-                    });
+                        // verify-ca is refused by `check_tls`.
+                        SslMode::VerifyCa | SslMode::VerifyFull => PgSslMode::VerifyFull,
+                    })
+                    // Even when empty, so that PGPASSWORD is never sent.
+                    .password(password.unwrap_or_default());
+                if let Some(ca) = &ssl_ca {
+                    opts = opts.ssl_root_cert(ca);
+                }
                 if let Some(user) = non_empty(&profile.user) {
                     opts = opts.username(user);
-                }
-                if let Some(pw) = password {
-                    opts = opts.password(pw);
                 }
                 if let Some(db) = non_empty(&profile.database) {
                     opts = opts.database(db);
@@ -278,9 +426,11 @@ impl Database {
                         SslMode::Disable => MySqlSslMode::Disabled,
                         SslMode::Prefer => MySqlSslMode::Preferred,
                         SslMode::Require => MySqlSslMode::Required,
-                        SslMode::VerifyCa => MySqlSslMode::VerifyCa,
-                        SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+                        SslMode::VerifyCa | SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
                     });
+                if let Some(ca) = &ssl_ca {
+                    opts = opts.ssl_ca(ca);
+                }
                 if let Some(user) = non_empty(&profile.user) {
                     opts = opts.username(user);
                 }
@@ -308,17 +458,23 @@ impl Database {
                 Ok(Database::MySql(pool))
             }
             Driver::Sqlite => {
-                let path = PathBuf::from(expand_tilde(profile.path.trim()));
                 if profile.path.trim().is_empty() {
                     bail!("no database file configured");
                 }
+                let path = sqlite_file(&profile.path)?;
                 if !path.exists() {
                     bail!("database file {} does not exist", path.display());
                 }
                 let opts = SqliteConnectOptions::new()
                     .filename(&path)
                     .read_only(profile.read_only || !sqlite::file_is_writable(&path))
-                    .busy_timeout(Duration::from_secs(5));
+                    .busy_timeout(Duration::from_secs(5))
+                    // The file may come from anywhere. SQL stored in its schema
+                    // (views, triggers, defaults…) may then only call functions
+                    // SQLite marks as harmless, and corrupt pages are detected
+                    // before use.
+                    .pragma("trusted_schema", "OFF")
+                    .pragma("cell_size_check", "ON");
                 let pool = SqlitePoolOptions::new()
                     .max_connections(2)
                     .acquire_timeout(timeout)
@@ -367,14 +523,16 @@ impl Database {
         }
     }
 
-    pub async fn fetch_page(&self, table: &TableRef, req: &PageRequest) -> Result<ResultSet> {
+    /// One page of a table. `read_only` runs it like a read-only
+    /// [`run_query`](Self::run_query), as the filter is user-supplied SQL.
+    pub async fn fetch_page(&self, table: &TableRef, req: &PageRequest, read_only: bool) -> Result<ResultSet> {
         let sql = sql::select_page(self.driver(), table, req);
-        self.run_raw(&sql, req.limit.max(1)).await
+        self.run_query_limited(&sql, req.limit.max(1), read_only).await
     }
 
-    pub async fn count_rows(&self, table: &TableRef, filter: Option<&str>) -> Result<u64> {
+    pub async fn count_rows(&self, table: &TableRef, filter: Option<&str>, read_only: bool) -> Result<u64> {
         let sql = sql::count_rows(self.driver(), table, filter);
-        let rs = self.run_raw(&sql, 1).await?;
+        let rs = self.run_query_limited(&sql, 1, read_only).await?;
         let value = rs.rows.first().and_then(|r| r.first().cloned().flatten()).unwrap_or_default();
         value.trim().parse::<u64>().with_context(|| format!("unexpected row count {value:?}"))
     }
@@ -382,30 +540,39 @@ impl Database {
     /// Run SQL typed by the user. When `read_only` is set the statement is
     /// executed inside a read-only transaction that is always rolled back.
     pub async fn run_query(&self, query: &str, read_only: bool) -> Result<ResultSet> {
+        self.run_query_limited(query, QUERY_ROW_LIMIT, read_only).await
+    }
+
+    /// With `read_only`, writes are refused here by `sql::write_keyword`, as
+    /// the app already does, and then by the database itself
+    /// ([`run_read_only`](Self::run_read_only)).
+    async fn run_query_limited(&self, query: &str, limit: usize, read_only: bool) -> Result<ResultSet> {
         if !read_only {
-            return self.run_raw(query, QUERY_ROW_LIMIT).await;
+            return self.run_raw(query, limit).await;
         }
+        // The transaction cannot stop text that ends it, so don't rely on
+        // every caller having checked.
+        if let Some(keyword) = sql::write_keyword(self.driver(), query) {
+            bail!("refused {keyword}: read-only session");
+        }
+        self.run_read_only(query, limit).await
+    }
+
+    /// The SQL runs in a read-only transaction started just for it and
+    /// always rolled back (PostgreSQL, MySQL), or with `PRAGMA query_only`
+    /// (SQLite). This does not depend on session defaults that the SQL could
+    /// change; it relies on `sql::write_keyword` refusing text that ends the
+    /// transaction.
+    async fn run_read_only(&self, query: &str, limit: usize) -> Result<ResultSet> {
         match self {
             Database::Postgres(p) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("START TRANSACTION READ ONLY").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("ROLLBACK").await;
-                result
+                run_guarded(p.acquire().await?, "START TRANSACTION READ ONLY", "ROLLBACK", query, limit).await
             }
             Database::MySql(p) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("START TRANSACTION READ ONLY").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("ROLLBACK").await;
-                result
+                run_guarded(p.acquire().await?, "START TRANSACTION READ ONLY", "ROLLBACK", query, limit).await
             }
             Database::Sqlite(p, _) => {
-                let mut conn = p.acquire().await?;
-                conn.execute("PRAGMA query_only = ON").await?;
-                let result = run_raw_on(&mut *conn, query, QUERY_ROW_LIMIT).await;
-                let _ = conn.execute("PRAGMA query_only = OFF").await;
-                result
+                run_guarded(p.acquire().await?, "PRAGMA query_only = ON", "PRAGMA query_only = OFF", query, limit).await
             }
         }
     }
@@ -418,11 +585,7 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
@@ -431,11 +594,7 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
@@ -444,15 +603,20 @@ impl Database {
                 let mut tx = p.begin().await?;
                 let mut total = 0;
                 for st in statements {
-                    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
-                    for v in &st.params {
-                        q = q.bind(v.clone());
-                    }
-                    total += check_affected(st, q.execute(&mut *tx).await?.rows_affected())?;
+                    total += check_affected(st, bind_params(st).execute(&mut *tx).await?.rows_affected())?;
                 }
                 tx.commit().await?;
                 Ok(total)
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Database::Postgres(p) => p.is_closed(),
+            Database::MySql(p) => p.is_closed(),
+            Database::Sqlite(p, _) => p.is_closed(),
         }
     }
 
@@ -465,38 +629,122 @@ impl Database {
     }
 }
 
+/// The statement with its parameters bound, each with its own type.
+fn bind_params<'q, DB>(st: &Statement) -> sqlx::query::Query<'q, DB, DB::Arguments>
+where
+    DB: sqlx::Database,
+    for<'t> Option<String>: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> String: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> i64: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> f64: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+    for<'t> Vec<u8>: sqlx::Encode<'t, DB> + sqlx::Type<DB>,
+{
+    let mut q = sqlx::query(AssertSqlSafe(st.sql.clone()));
+    for value in &st.params {
+        q = match value {
+            None => q.bind(None::<String>),
+            Some(Value::Text(s)) => q.bind(s.clone()),
+            Some(Value::Integer(i)) => q.bind(*i),
+            Some(Value::Real(f)) => q.bind(*f),
+            Some(Value::Bytes(b)) => q.bind(b.clone()),
+        };
+    }
+    q
+}
+
 fn check_affected(st: &Statement, affected: u64) -> Result<u64> {
     if st.expect_one && affected != 1 {
+        // Not "all changes": non-transactional MySQL engines keep earlier
+        // statements; the app explains that case.
         bail!(
             "expected to change exactly 1 row but {affected} would be affected; \
-             the row may have been modified elsewhere. All changes were rolled back.\n{}",
+             the row may have been modified elsewhere. The transaction was rolled back.\n{}",
             st.sql
         );
     }
     Ok(affected)
 }
 
-/// Decodes a single value to display text. Implemented per driver because the
-/// wire formats differ.
+/// Runs `query` on `conn` between `enter` and `leave`. A connection that
+/// could not be reset is closed instead of going back to the pool.
+async fn run_guarded<DB>(
+    mut conn: sqlx::pool::PoolConnection<DB>,
+    enter: &'static str,
+    leave: &'static str,
+    query: &str,
+    limit: usize,
+) -> Result<ResultSet>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Row: CellText,
+    DB::QueryResult: QueryResultExt,
+{
+    conn.execute(enter).await?;
+    let result = run_raw_on(&mut *conn, query, limit).await;
+    if conn.execute(leave).await.is_err() {
+        conn.close_on_drop();
+    }
+    result
+}
+
+/// Decodes a single value to display text, and what that text stands for.
+/// Implemented per driver because the wire formats differ. Text longer than
+/// `max` bytes is cut (see [`CELL_BYTES`]).
 trait CellText: Row {
-    fn cell_text(&self, idx: usize) -> Option<String>;
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind);
 }
 
 impl CellText for sqlx::postgres::PgRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        postgres::cell_text(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        postgres::cell(self, idx, max)
     }
 }
 
 impl CellText for sqlx::mysql::MySqlRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        mysql::cell_text(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        mysql::cell(self, idx, max)
     }
 }
 
 impl CellText for sqlx::sqlite::SqliteRow {
-    fn cell_text(&self, idx: usize) -> Option<String> {
-        sqlite::cell_text(self, idx)
+    fn cell(&self, idx: usize, max: usize) -> (Option<String>, CellKind) {
+        sqlite::cell(self, idx, max)
+    }
+}
+
+/// A value's text, or its start when longer than `max` bytes.
+fn capped_text(text: &str, kind: CellKind, max: usize) -> (Option<String>, CellKind) {
+    match crate::util::clip(text, max) {
+        (all, false) => (Some(all.to_string()), kind),
+        (start, true) => (Some(start.to_string()), CellKind::Truncated(text.len() as u64)),
+    }
+}
+
+/// Bytes shown as `0x` and hex, or the start of that when longer than
+/// `max` bytes.
+fn capped_hex(bytes: &[u8], kind: CellKind, max: usize) -> (Option<String>, CellKind) {
+    let len = 2 + 2 * bytes.len();
+    if len <= max {
+        return (Some(hex_bytes(bytes)), kind);
+    }
+    let keep = max.saturating_sub(2) / 2;
+    (Some(hex_bytes(&bytes[..keep])), CellKind::Truncated(len as u64))
+}
+
+/// How much of a result is kept: rows, and bytes of value text.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    rows: usize,
+    /// Per value (see [`CELL_BYTES`]).
+    cell: usize,
+    /// For all values of the result (see [`RESULT_BYTES`]).
+    result: usize,
+}
+
+impl Limits {
+    fn rows(rows: usize) -> Limits {
+        Limits { rows, cell: CELL_BYTES, result: RESULT_BYTES }
     }
 }
 
@@ -509,12 +757,27 @@ where
     DB::Row: CellText,
     DB::QueryResult: QueryResultExt,
 {
+    run_raw_with(executor, query, Limits::rows(limit)).await
+}
+
+/// [`run_raw_on`], keeping no more than `limits`. The driver still reads
+/// each row whole; only what is kept of it is bounded.
+async fn run_raw_with<'e, E, DB>(executor: E, query: &str, limits: Limits) -> Result<ResultSet>
+where
+    E: Executor<'e, Database = DB>,
+    DB: sqlx::Database,
+    DB::Row: CellText,
+    DB::QueryResult: QueryResultExt,
+{
     let started = Instant::now();
     let mut stream = sqlx::raw_sql(AssertSqlSafe(query.to_string())).fetch_many(executor);
     let mut result = ResultSet::default();
     let mut current: Vec<Vec<Option<String>>> = Vec::new();
+    let mut current_kinds: Vec<Vec<CellKind>> = Vec::new();
     let mut current_cols: Vec<String> = Vec::new();
     let mut truncated = false;
+    // Bytes of value text kept for the current result.
+    let mut kept = 0;
     while let Some(item) = stream.try_next().await? {
         match item {
             Either::Left(done) => {
@@ -522,24 +785,37 @@ where
                 if !current_cols.is_empty() {
                     result.columns = std::mem::take(&mut current_cols);
                     result.rows = std::mem::take(&mut current);
+                    result.kinds = std::mem::take(&mut current_kinds);
                     result.truncated = std::mem::take(&mut truncated);
+                    kept = 0;
                 }
             }
             Either::Right(row) => {
                 if current_cols.is_empty() {
                     current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                if current.len() >= limit {
+                if current.len() >= limits.rows {
                     truncated = true;
                     continue;
                 }
-                current.push((0..row.len()).map(|i| row.cell_text(i)).collect());
+                let mut cells = Vec::with_capacity(row.len());
+                let mut kinds = Vec::with_capacity(row.len());
+                for i in 0..row.len() {
+                    let max = if kept < limits.result { limits.cell } else { limits.cell.min(CELL_BYTES_PAST_BUDGET) };
+                    let (text, kind) = row.cell(i, max);
+                    kept += text.as_ref().map_or(0, String::len);
+                    cells.push(text);
+                    kinds.push(kind);
+                }
+                current.push(cells);
+                current_kinds.push(if kinds.iter().all(|k| *k == CellKind::Text) { Vec::new() } else { kinds });
             }
         }
     }
     if !current_cols.is_empty() {
         result.columns = current_cols;
         result.rows = current;
+        result.kinds = current_kinds;
         result.truncated = truncated;
     }
     result.elapsed = started.elapsed();
@@ -597,6 +873,47 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// The database file of a SQLite profile, made absolute. SQLite reads a
+/// name starting with `file:` as a URI whose parameters (`nolock`,
+/// `immutable`, `vfs`…) change how the file is opened; an absolute path
+/// never starts with it, so the name always means a file.
+fn sqlite_file(path: &str) -> Result<PathBuf> {
+    let path = expand_tilde(path.trim());
+    std::path::absolute(&path).with_context(|| format!("invalid database file {path:?}"))
+}
+
+/// The CA certificate file of a profile, which must exist.
+fn ca_file(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(expand_tilde(path));
+    if !path.is_file() {
+        bail!("CA certificate file {} not found", path.display());
+    }
+    Ok(path)
+}
+
+/// Removes the environment variables that sqlx reads as PostgreSQL
+/// connection defaults (every name starting with `PG`): `PGPASSWORD`,
+/// a client certificate and key (`PGSSLCERT`/`PGSSLKEY`), extra CA roots
+/// (`PGSSLROOTCERT`), `PGOPTIONS`, `PGUSER`… Variables exported for psql
+/// would otherwise be used for whatever server a profile names, and sqlx
+/// offers no way to unset some of them per connection.
+///
+/// # Safety
+///
+/// No other thread may exist yet (see [`std::env::remove_var`]).
+pub unsafe fn clear_client_environment() {
+    let names: Vec<_> = std::env::vars_os().map(|(name, _)| name).filter(|n| is_client_variable(n)).collect();
+    for name in names {
+        // SAFETY: the caller guarantees the process is single-threaded.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+/// Environment variable names are case-insensitive on Windows.
+fn is_client_variable(name: &OsStr) -> bool {
+    name.as_encoded_bytes().get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"PG"))
 }
 
 fn non_empty(s: &str) -> Option<&str> {

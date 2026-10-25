@@ -2,26 +2,30 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use sqlx::mysql::{MySqlPool, MySqlRow};
-use sqlx::{Row, ValueRef};
+use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::grants::Grants;
 use super::{
-    ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind, TableRef,
-    TableStructure, hex_bytes, run_raw_on, text_col, truthy,
+    CellKind, ColumnInfo, IndexInfo, Privileges, QUERY_ROW_LIMIT, SchemaInfo, SessionInfo, TableInfo, TableKind,
+    TableRef, TableStructure, Transport, capped_hex, capped_text, run_raw_on, text_col, truthy,
 };
 
 const SYSTEM_SCHEMAS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
 
-pub(super) fn cell_text(row: &MySqlRow, idx: usize) -> Option<String> {
-    let raw = row.try_get_raw(idx).ok()?;
+pub(super) fn cell(row: &MySqlRow, idx: usize, max: usize) -> (Option<String>, CellKind) {
+    let Ok(raw) = row.try_get_raw(idx) else { return (None, CellKind::Inexact) };
     if raw.is_null() {
-        return None;
+        return (None, CellKind::Text);
     }
+    // A BIT value arrives as its bytes, and compares as a number: no text
+    // or bytes given back to the server would surely match it alone.
+    let bit = raw.type_info().name() == "BIT";
     // Text protocol: numbers, dates, etc. all arrive as strings.
-    let bytes = row.try_get_unchecked::<Vec<u8>, _>(idx).ok()?;
-    match String::from_utf8(bytes) {
-        Ok(s) => Some(s),
-        Err(e) => Some(hex_bytes(e.as_bytes())),
+    let Ok(bytes) = row.try_get_unchecked::<&[u8], _>(idx) else { return (None, CellKind::Inexact) };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => capped_text(s, if bit { CellKind::Inexact } else { CellKind::Text }, max),
+        // Only binary strings are not UTF-8 (sqlx asks for utf8mb4).
+        Err(_) => capped_hex(bytes, if bit { CellKind::Inexact } else { CellKind::Bytes }, max),
     }
 }
 
@@ -79,7 +83,32 @@ pub(super) async fn session_info(pool: &MySqlPool) -> Result<SessionInfo> {
         database: get(2),
         superuser,
         read_only_reason,
+        transport: transport(pool).await,
     })
+}
+
+/// TLS state of a pooled connection (they all use the same options).
+async fn transport(pool: &MySqlPool) -> Transport {
+    match run_raw_on(pool, "SHOW SESSION STATUS WHERE Variable_name IN ('Ssl_version', 'Ssl_cipher')", 10).await {
+        Ok(rs) => transport_from(&rs.rows),
+        Err(_) => Transport::Unknown,
+    }
+}
+
+/// From `Variable_name, Value` rows; both values are empty without TLS.
+fn transport_from(rows: &[Vec<Option<String>>]) -> Transport {
+    let get = |name: &str| {
+        rows.iter()
+            .find(|r| r.first().cloned().flatten().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            .and_then(|r| r.get(1).cloned().flatten())
+            .unwrap_or_default()
+    };
+    let (version, cipher) = (get("Ssl_version"), get("Ssl_cipher"));
+    match (rows.is_empty(), version.is_empty() && cipher.is_empty()) {
+        (true, _) => Transport::Unknown,
+        (false, true) => Transport::Plain,
+        (false, false) => Transport::Tls { version, cipher },
+    }
 }
 
 pub(super) async fn schemas(pool: &MySqlPool) -> Result<Vec<SchemaInfo>> {
@@ -141,6 +170,7 @@ pub(super) async fn structure(pool: &MySqlPool, table: &TableRef) -> Result<Tabl
             default: text_col(row, 3),
             primary_key: text_col(row, 4).as_deref() == Some("PRI"),
             extra: text_col(row, 5).filter(|s| !s.is_empty()),
+            base_type: String::new(),
         })
         .collect();
     let rows = sqlx::query(
@@ -167,5 +197,58 @@ pub(super) async fn structure(pool: &MySqlPool, table: &TableRef) -> Result<Tabl
             }
         })
         .collect();
-    Ok(TableStructure { columns, indexes })
+    let engine = sqlx::query(
+        "SELECT CAST(t.ENGINE AS CHAR), CAST(e.TRANSACTIONS AS CHAR)
+         FROM information_schema.TABLES t
+         LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE
+         WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?",
+    )
+    .bind(&table.schema)
+    .bind(&table.name)
+    .fetch_optional(pool)
+    .await?;
+    let non_transactional_engine =
+        engine.and_then(|row| non_transactional(text_col(&row, 0), text_col(&row, 1).as_deref()));
+    Ok(TableStructure { columns, indexes, non_transactional_engine })
+}
+
+/// Returns the engine's name when it cannot roll back a transaction.
+/// `transactions` is the `TRANSACTIONS` column of `information_schema.ENGINES`.
+fn non_transactional(engine: Option<String>, transactions: Option<&str>) -> Option<String> {
+    // Views have no engine of their own.
+    let engine = engine.filter(|e| !e.is_empty())?;
+    let transactional = match transactions {
+        Some(flag) => flag.eq_ignore_ascii_case("YES"),
+        // Not listed: only trust engines known to be transactional.
+        None => matches!(engine.to_ascii_lowercase().as_str(), "innodb" | "ndbcluster" | "ndb" | "rocksdb"),
+    };
+    (!transactional).then_some(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Transport, non_transactional, transport_from};
+
+    #[test]
+    fn transport_from_session_status() {
+        let row = |n: &str, v: &str| vec![Some(n.to_string()), Some(v.to_string())];
+        let tls = [row("Ssl_cipher", "TLS_AES_128_GCM_SHA256"), row("Ssl_version", "TLSv1.3")];
+        assert_eq!(
+            transport_from(&tls),
+            Transport::Tls { version: "TLSv1.3".into(), cipher: "TLS_AES_128_GCM_SHA256".into() }
+        );
+        assert_eq!(transport_from(&[row("Ssl_cipher", ""), row("Ssl_version", "")]), Transport::Plain);
+        assert_eq!(transport_from(&[]), Transport::Unknown);
+    }
+
+    #[test]
+    fn engines_without_transactions() {
+        let check = |engine: Option<&str>, tx: Option<&str>| non_transactional(engine.map(Into::into), tx);
+        assert_eq!(check(Some("InnoDB"), Some("YES")), None);
+        assert_eq!(check(Some("MyISAM"), Some("NO")), Some("MyISAM".into()));
+        assert_eq!(check(Some("MEMORY"), Some("NO")), Some("MEMORY".into()));
+        assert_eq!(check(Some("InnoDB"), None), None);
+        assert_eq!(check(Some("Aria"), None), Some("Aria".into()));
+        assert_eq!(check(None, None), None);
+    }
 }

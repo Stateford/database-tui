@@ -1,4 +1,9 @@
 # Local test databases for dbtui: docker compose -f dev/docker-compose.yml up -d
+#
+# The passwords below are well known and the accounts are superusers, so the
+# ports are published on this machine's loopback interface only. Docker's
+# own firewall rules would otherwise expose them to the network, whatever
+# ufw or firewalld say.
 name: dbtui-dev
 
 services:
@@ -8,7 +13,7 @@ services:
       POSTGRES_USER: dbtui
       POSTGRES_PASSWORD: dbtui
       POSTGRES_DB: dbtui
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes:
       - ./postgres:/docker-entrypoint-initdb.d:ro
       - pgdata:/var/lib/postgresql/data
@@ -24,7 +29,7 @@ services:
       MYSQL_USER: dbtui
       MYSQL_PASSWORD: dbtui
       MYSQL_DATABASE: dbtui
-    ports: ["3306:3306"]
+    ports: ["127.0.0.1:3306:3306"]
     volumes:
       - ./mysql:/docker-entrypoint-initdb.d:ro
       - mysqldata:/var/lib/mysql

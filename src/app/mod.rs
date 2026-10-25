@@ -8,16 +8,20 @@ pub mod query;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-use self::browser::{Browser, Focus, OpenTable, Tab, TreeItem};
+use self::browser::{Browser, CommitSnapshot, Committing, Focus, OpenTable, Tab, TreeItem};
 use self::form::{ConnectionForm, FormOutcome};
-use self::grid::Grid;
+use self::grid::{Grid, RowKey};
 use self::input::Input;
 use self::query::{EditorFocus, EditorOutcome, VimMode};
 use crate::config::{Config, ConnectionProfile, CredentialStore, KeymapMode, SecretBackend};
@@ -25,44 +29,152 @@ use crate::db::{
     Database, Driver, PageRequest, ResultSet, SchemaInfo, SessionInfo, Statement, TableRef, TableStructure, sql,
 };
 use crate::keymap::{Action, Context, Keymap};
-use crate::secrets::{self, Vault};
+use crate::secrets::{Endpoint, KEYRING_TIMEOUT, Keyring, StoredSecret, Vault, VaultChanged, VaultExists};
 
 /// Results of background work, delivered to the UI loop.
+///
+/// Each carries what it was requested for: the connection attempt
+/// (`attempt`), or the connection ([`Browser::generation`]) and the request
+/// (`seq`). Results of attempts or requests made since are dropped.
 pub enum AppEvent {
     Connected {
+        attempt: u64,
         profile: ConnectionProfile,
         db: Database,
-        session: SessionInfo,
+        session: Box<SessionInfo>,
         schemas: Vec<SchemaInfo>,
-        remember: Option<Zeroizing<String>>,
+    },
+    /// The password saved in the keyring for a profile being connected.
+    SavedPassword {
+        attempt: u64,
+        profile: ConnectionProfile,
+        result: Result<Option<StoredSecret>, String>,
     },
     ConnectFailed {
+        attempt: u64,
         profile: ConnectionProfile,
         error: String,
         needs_password: bool,
     },
-    TestResult(Result<String, String>),
-    Schemas(Result<Vec<SchemaInfo>, String>),
+    /// The level is a warning when the server was not authenticated.
+    TestResult(Result<(Level, String), String>),
+    Schemas {
+        generation: u64,
+        seq: u64,
+        result: Result<Vec<SchemaInfo>, String>,
+    },
     Page {
+        generation: u64,
         seq: u64,
         structure: Option<Result<TableStructure, String>>,
         data: Result<ResultSet, String>,
     },
     Count {
+        generation: u64,
         seq: u64,
         count: Result<u64, String>,
     },
+    /// `may_write`: the SQL is not plainly read-only.
     Query {
+        generation: u64,
         seq: u64,
+        may_write: bool,
         result: Result<ResultSet, String>,
     },
-    Committed(Result<u64, String>),
-    KeyringStored {
-        id: String,
-        password: Zeroizing<String>,
+    /// `profile`: the name of the connection, which may be closed by now.
+    Committed {
+        generation: u64,
+        seq: u64,
+        profile: String,
+        result: Result<u64, String>,
+    },
+    /// A keyring write finished, possibly long after it was requested.
+    KeyringStored(SaveRequest, Result<(), String>),
+    /// `report`: tell the user if it failed (the keyring was known to hold
+    /// the password, rather than possibly holding an old copy).
+    KeyringRemoved {
+        op: u64,
+        report: bool,
         result: Result<(), String>,
     },
-    KeyringRemoved(Result<(), String>),
+    /// The vault prompt's master password was checked in the background
+    /// (`create`: a new vault was made with it).
+    VaultOpened {
+        seq: u64,
+        create: bool,
+        result: anyhow::Result<Vault>,
+    },
+}
+
+/// A password to save for a profile, once its connection has worked.
+pub struct Remember {
+    pub password: Zeroizing<String>,
+    /// Save again, bound to its server and where it already is, a password
+    /// saved before passwords were bound; rather than one the user typed,
+    /// which goes to the configured backend.
+    pub rebind: bool,
+    /// The profile's credential generation when connecting (see
+    /// [`CredentialOps`]): if it has changed since, the password was saved
+    /// or forgotten in the meantime and this one is not kept.
+    pub generation: u64,
+}
+
+/// A password being saved for a profile.
+pub struct SaveRequest {
+    pub id: String,
+    pub endpoint: Endpoint,
+    pub password: Zeroizing<String>,
+    /// The credential generation this save belongs to.
+    pub generation: u64,
+    /// Re-saving a password that is already saved: no message on success.
+    pub quiet: bool,
+}
+
+/// Bookkeeping that lets results of background keyring work be matched to
+/// what the user did since: a profile deleted, its password saved again or
+/// no longer saved. Such late results are cleaned up, not recorded.
+#[derive(Default)]
+struct CredentialOps {
+    counter: u64,
+    /// Per profile id, the generation of its latest password change (saved,
+    /// re-saved or forgotten). A result from an older generation is stale.
+    generation: HashMap<String, u64>,
+    /// Per profile id, the last keyring write or delete queued. The keyring
+    /// runs them in order, so that one decides what the keyring ends up
+    /// holding for the profile.
+    last_keyring_op: HashMap<String, u64>,
+    /// Keyring operations not answered yet: when they started, and whether
+    /// the user has been told that the keyring is slow (deletes are not
+    /// worth telling about).
+    pending: HashMap<u64, (Instant, bool)>,
+}
+
+impl CredentialOps {
+    fn next(&mut self) -> u64 {
+        self.counter += 1;
+        self.counter
+    }
+
+    /// Starts a new generation for a profile's password.
+    fn bump(&mut self, id: &str) -> u64 {
+        let generation = self.next();
+        self.generation.insert(id.to_string(), generation);
+        generation
+    }
+
+    fn generation(&self, id: &str) -> u64 {
+        self.generation.get(id).copied().unwrap_or(0)
+    }
+
+    /// Whether the profile's password is being saved to the keyring.
+    fn saving(&self, id: &str) -> bool {
+        self.pending.contains_key(&self.generation(id))
+    }
+
+    /// Whether anything about the profile's password happened this session.
+    fn knows(&self, id: &str) -> bool {
+        self.generation.contains_key(id) || self.last_keyring_op.contains_key(id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,11 +203,30 @@ pub enum ConfirmAction {
     Quit,
     DiscardAndOpen(TableRef),
     DiscardEdits,
+    /// Connect with a saved password the user is asked about first (see
+    /// [`App::send_saved_password`]).
+    SendSavedPassword(Box<SavedPassword>),
+}
+
+impl ConfirmAction {
+    /// Whether Enter confirms, as well as `y`. Not for sending a password:
+    /// a second Enter after the one that asked to connect must not do it.
+    pub fn enter_confirms(&self) -> bool {
+        !matches!(self, ConfirmAction::SendSavedPassword(_))
+    }
+}
+
+/// A saved password waiting for the user's go-ahead.
+pub struct SavedPassword {
+    pub profile: ConnectionProfile,
+    pub password: Zeroizing<String>,
+    /// Saved before passwords were bound to their server: bound once it works.
+    pub unbound: bool,
 }
 
 pub enum AfterUnlock {
     Connect(ConnectionProfile),
-    Store { id: String, password: Zeroizing<String> },
+    Store(SaveRequest),
 }
 
 pub struct PasswordPrompt {
@@ -113,16 +244,64 @@ pub struct VaultPrompt {
     pub focus: usize,
     pub error: Option<String>,
     pub then: AfterUnlock,
+    /// While the master password is checked in the background (deriving the
+    /// key takes a moment): the `seq` of that request.
+    pub working: Option<u64>,
 }
 
+/// The row a cell editor edits.
+pub enum EditTarget {
+    /// A fetched row, by its key: wherever it is when the edit is applied.
+    Row(RowKey),
+    /// A new row staged in the grid ([`Grid::id`]), by position.
+    NewRow { grid: u64, index: usize },
+}
+
+/// Edits one cell. It remembers the cell by connection, table, row key and
+/// column name, not by position: the edit is staged on that cell, wherever
+/// it is by then, or not at all if it is gone.
 pub struct CellEditor {
     pub editor: TextArea<'static>,
-    pub row: usize,
-    pub col: usize,
+    pub generation: u64,
+    pub table: TableRef,
+    pub target: EditTarget,
     pub column: String,
+    /// The value when the editor opened (`None`: NULL or the default).
+    pub original: Option<String>,
+    /// How the lines are joined: CRLF when the value used it throughout,
+    /// so that the value comes back exactly as it was.
+    pub newline: &'static str,
+    /// Whether the text was changed at all.
+    pub modified: bool,
     pub data_type: String,
     pub nullable: bool,
     pub new_row: bool,
+    /// The value holds characters the editor cannot show (see
+    /// [`crate::util::has_hidden`]); the viewer shows them.
+    pub hidden: bool,
+}
+
+impl CellEditor {
+    pub fn value(&self) -> String {
+        self.editor.lines().join(self.newline)
+    }
+
+    /// Whether confirming `value` would change nothing: the same text, or a
+    /// NULL (or default) left untouched.
+    fn unchanged(&self, value: &str) -> bool {
+        match &self.original {
+            Some(original) => original == value,
+            None => !self.modified,
+        }
+    }
+}
+
+/// Splits a value into editor lines that join back into exactly that value
+/// (`str::lines` would drop `\r` and a final newline).
+fn editor_lines(text: &str) -> (Vec<String>, &'static str) {
+    let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+    let newline = if crlf { "\r\n" } else { "\n" };
+    (text.split(newline).map(String::from).collect(), newline)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,16 +318,83 @@ pub struct Prompt {
 }
 
 pub enum Popup {
-    Help { scroll: u16 },
-    Confirm { title: String, message: String, action: ConfirmAction },
-    Message { title: String, body: String, error: bool, scroll: u16 },
+    Help {
+        scroll: u16,
+    },
+    Confirm {
+        title: String,
+        message: String,
+        action: ConfirmAction,
+    },
+    Message {
+        title: String,
+        body: String,
+        error: bool,
+        scroll: u16,
+    },
     Form(Box<ConnectionForm>),
     Password(PasswordPrompt),
     Vault(VaultPrompt),
     CellEditor(Box<CellEditor>),
-    CellView { title: String, text: String, scroll: u16 },
+    // `text` is what is shown: the value made safe to display (JSON
+    // re-indented); `value` is the cell's value, which is what gets copied
+    // (`None`: NULL or the default); `cut`: only the start of the value was
+    // loaded, and the size of all of it; `binary`: the value is bytes shown
+    // as `0x…`. `wrapped`: `text` wrapped to a width, kept until the width
+    // changes, as a large value takes a while.
+    CellView {
+        title: String,
+        text: String,
+        value: Option<String>,
+        cut: Option<u64>,
+        binary: bool,
+        scroll: usize,
+        wrapped: Option<(usize, Vec<String>)>,
+    },
     Prompt(Prompt),
-    Commit { statements: Vec<Statement>, scroll: u16 },
+    // `previews`: the statements as shown (see `commit_preview`); `hidden`:
+    // they hold characters that would not show as themselves;
+    // `non_transactional`: engine of a MySQL table that cannot roll back;
+    // `snapshot`: what the statements were built from (see `CommitSnapshot`).
+    Commit {
+        statements: Vec<Statement>,
+        previews: Vec<String>,
+        hidden: bool,
+        scroll: u16,
+        non_transactional: Option<String>,
+        snapshot: Box<CommitSnapshot>,
+    },
+}
+
+/// Most bytes of a statement shown in the commit preview: its values can be
+/// large (a pasted document, say).
+const PREVIEW_BYTES: usize = 4096;
+
+/// A statement as the commit preview shows it: made safe to display, and
+/// cut if very long.
+fn commit_preview(statement: &Statement) -> String {
+    let full = statement.preview();
+    match crate::util::clip(&full, PREVIEW_BYTES) {
+        (all, false) => crate::util::display_safe(all),
+        (start, true) => format!(
+            "{} … ({} more)",
+            crate::util::display_safe(start),
+            crate::util::size((full.len() - start.len()) as u64)
+        ),
+    }
+}
+
+/// A change a cell editor stages.
+enum CellChange {
+    Set(Option<String>),
+    /// Back to the column default (new rows only).
+    Default,
+}
+
+/// Several statements on a table that cannot roll back are only committed
+/// after an explicit `!`: if one fails, the ones before it stay applied.
+pub fn commit_needs_force(statements: &[Statement], non_transactional: Option<&String>) -> bool {
+    non_transactional.is_some() && statements.len() > 1
 }
 
 pub struct App {
@@ -162,6 +408,20 @@ pub struct App {
     pub toast: Option<Toast>,
     pub keymap: Keymap,
     pub vault: Option<Vault>,
+    keyring: Keyring,
+    credentials: CredentialOps,
+    /// Last vault prompt request (see [`VaultPrompt::working`]).
+    vault_seq: u64,
+    /// Id of the latest connection attempt, and that attempt while it is
+    /// not over: the result of any other one is discarded.
+    connect_seq: u64,
+    connecting: Option<u64>,
+    /// The password to save once the attempt in `connecting` works.
+    to_remember: Option<Remember>,
+    /// `--read-only`: every connection opened in this run is read-only.
+    pub read_only_run: bool,
+    /// Where `config.toml` and `vault.toml` live.
+    config_dir: Option<PathBuf>,
     pub busy: Option<String>,
     pub tick: usize,
     pub should_quit: bool,
@@ -186,6 +446,45 @@ fn err_text(e: anyhow::Error) -> String {
     out
 }
 
+/// A failed connection's error, with what to do about it when the server's
+/// certificate was refused.
+fn connect_error(e: anyhow::Error) -> String {
+    with_certificate_hint(err_text(e), "\n\n")
+}
+
+fn with_certificate_hint(error: String, separator: &str) -> String {
+    match certificate_hint(&error) {
+        Some(hint) => format!("{error}{separator}{hint}"),
+        None => error,
+    }
+}
+
+/// What to do when the server's certificate could not be verified: a
+/// remote profile verifies it by default (verify-full), including one saved
+/// without an SSL mode, which earlier versions connected with `prefer`.
+fn certificate_hint(error: &str) -> Option<&'static str> {
+    if !error.contains("invalid peer certificate") {
+        return None;
+    }
+    Some(if error.contains("UnknownIssuer") {
+        "The server's certificate is not from a CA dbtui trusts. If the server uses a private CA (a company CA, \
+         AWS RDS, Cloud SQL, MySQL's self-generated certificates), set CA file (ssl_ca) in the connection form to \
+         that CA's PEM file. Choose a weaker SSL mode only if you accept that the server is not verified."
+    } else if error.contains("not valid for name") || error.contains("NotValidForName") {
+        "The certificate was issued for another host name: connect with a name it is valid for."
+    } else {
+        "The server's certificate could not be verified (SSL mode verify-full): check the host name and the CA \
+         file (ssl_ca) in the connection form."
+    })
+}
+
+/// Runs background work whose result the app waits for, turning a panic in
+/// it (a bug in a database driver, say) into an error: the request then
+/// ends like a failed one, rather than leaving the app loading forever.
+async fn guarded<T>(work: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+    crate::terminal::catch_panic(work).await.unwrap_or_else(|panic| Err(format!("internal error: {panic}")))
+}
+
 impl App {
     pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
         Self {
@@ -198,6 +497,14 @@ impl App {
             toast: None,
             keymap: Keymap::default(),
             vault: None,
+            keyring: Keyring::os(),
+            credentials: CredentialOps::default(),
+            vault_seq: 0,
+            connect_seq: 0,
+            connecting: None,
+            to_remember: None,
+            read_only_run: false,
+            config_dir: crate::config::config_dir().ok(),
             busy: None,
             tick: 0,
             should_quit: false,
@@ -224,21 +531,63 @@ impl App {
         if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
             self.toast = None;
         }
-    }
-
-    fn save_config(&mut self) {
-        if let Err(e) = self.config.save() {
-            self.notify(Level::Error, format!("Could not save configuration: {}", err_text(e)));
+        // A panic on a thread of its own (a database driver's, say): the
+        // work it was doing fails or is retried, and the app goes on.
+        if let Some(panic) = crate::terminal::take_background_panic() {
+            self.notify(Level::Error, format!("Internal error in a background thread: {panic}"));
+        }
+        // A slow keyring is not a failure: the write completes (or fails)
+        // whenever the keyring answers, and is handled then.
+        let mut slow = false;
+        for (started, told) in self.credentials.pending.values_mut() {
+            if !*told && started.elapsed() >= KEYRING_TIMEOUT {
+                *told = true;
+                slow = true;
+            }
+        }
+        if slow {
+            self.notify(
+                Level::Warning,
+                "The OS keyring is not answering (is it locked?). The password will be saved there once it does, \
+                 and is not saved anywhere else meanwhile.",
+            );
         }
     }
 
+    fn config_path(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.config_dir.as_ref().context("could not determine a configuration directory")?;
+        Ok(dir.join("config.toml"))
+    }
+
+    fn vault_path(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.config_dir.as_ref().context("could not determine a configuration directory")?;
+        Ok(dir.join("vault.toml"))
+    }
+
+    /// Changes the configuration and saves it. The change is made to the
+    /// file as it is on disk, which another dbtui instance may have changed
+    /// meanwhile, and the result becomes this app's configuration.
+    fn update_config(&mut self, mut change: impl FnMut(&mut Config)) {
+        match self.config_path().and_then(|path| Config::update_at(&path, &mut change)) {
+            Ok(config) => self.config = config,
+            Err(e) => {
+                change(&mut self.config);
+                self.notify(Level::Error, format!("Could not save configuration: {}", err_text(e)));
+            }
+        }
+        self.selected_conn = self.selected_conn.min(self.config.connections.len().saturating_sub(1));
+    }
+
+    fn profile(&self, id: &str) -> Option<&ConnectionProfile> {
+        self.config.connections.iter().find(|p| p.id == id)
+    }
+
     fn set_keymap(&mut self, mode: KeymapMode) {
-        self.config.keymap = mode;
         self.keymap.clear();
         if let Some(b) = &mut self.browser {
             b.query.vim_mode = VimMode::Normal;
         }
-        self.save_config();
+        self.update_config(|c| c.keymap = mode);
         let how = match mode {
             KeymapMode::Vim => "Vim keys enabled (hjkl, gg/G, dd, :w …)",
             KeymapMode::Standard => "Standard keys enabled (arrows, Enter, Del, Ctrl-S …)",
@@ -251,16 +600,18 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn on_paste(&mut self, text: String) {
+        // It may be a password: wiped once used.
+        let text = Zeroizing::new(text);
         match &mut self.popup {
             Some(Popup::Form(form)) => form.paste(&text),
             Some(Popup::Password(p)) => p.input.insert_str(text.lines().next().unwrap_or_default()),
-            Some(Popup::Vault(v)) => {
+            Some(Popup::Vault(v)) if v.working.is_none() => {
                 let target = if v.focus == 0 { &mut v.input } else { &mut v.confirm };
                 target.insert_str(text.lines().next().unwrap_or_default());
             }
             Some(Popup::Prompt(p)) => p.input.insert_str(&text.replace('\n', " ")),
             Some(Popup::CellEditor(c)) => {
-                c.editor.insert_str(text);
+                c.modified |= c.editor.insert_str(text.as_str());
             }
             Some(_) => {}
             None => {
@@ -271,7 +622,7 @@ impl App {
                     && b.focus == Focus::Main
                     && b.query.focus == EditorFocus::Editor
                 {
-                    b.query.editor.insert_str(text);
+                    b.query.editor.insert_str(text.as_str());
                 }
             }
         }
@@ -323,7 +674,10 @@ impl App {
             }
             Action::EditItem => {
                 if let Some(p) = self.config.connections.get(self.selected_conn).cloned() {
-                    self.popup = Some(Popup::Form(Box::new(ConnectionForm::new(p, false))));
+                    let mut form = ConnectionForm::new(p, false);
+                    // Its password is still on its way to the keyring.
+                    form.save_password |= self.credentials.saving(&form.original.id);
+                    self.popup = Some(Popup::Form(Box::new(form)));
                 }
             }
             Action::DeleteItem => {
@@ -608,14 +962,13 @@ impl App {
                     self.run_query();
                 }
             }
-            Action::Select => {
-                // Enter edits when allowed, otherwise shows the value.
-                if self.edit_permission(false).is_ok() {
-                    self.edit_cell();
-                } else {
-                    self.view_cell();
-                }
-            }
+            // Enter edits when allowed, otherwise shows the value; while the
+            // table is busy, it says why it cannot edit yet.
+            Action::Select => match self.edit_permission(false) {
+                Ok(()) if !self.binary_cell() && self.cut_cell().is_none() => self.edit_cell(),
+                Err(reason) if self.table_busy().is_some_and(|busy| reason == busy) => self.deny(reason),
+                _ => self.view_cell(),
+            },
             Action::Edit => self.edit_cell(),
             Action::SetNull => self.set_current_cell(None),
             Action::Paste => {
@@ -628,6 +981,9 @@ impl App {
             Action::DeleteRow => self.delete_row(),
             Action::InsertRow => self.insert_row(),
             Action::Undo => {
+                if let Some(reason) = self.table_busy() {
+                    return self.deny(reason.into());
+                }
                 if let Some(grid) = self.active_grid()
                     && !grid.undo()
                 {
@@ -647,17 +1003,50 @@ impl App {
     // Permissions
     // ------------------------------------------------------------------
 
+    /// Why the open table cannot be changed right now: its rows are being
+    /// replaced, or its changes committed. Changes staged meanwhile would
+    /// land on whatever rows are there once that is done.
+    fn table_busy(&self) -> Option<&'static str> {
+        let b = self.browser.as_ref()?;
+        if b.commit.is_some() {
+            return Some("A commit is running — wait for its result");
+        }
+        b.table.as_ref().filter(|t| t.loading).map(|_| "The table is loading — wait for it to finish")
+    }
+
+    /// Whether the table cannot be reloaded (or filtered, sorted, paged)
+    /// now; tells the user why.
+    fn reload_blocked(&mut self) -> bool {
+        let Some(b) = &self.browser else { return true };
+        if b.commit.is_some() {
+            self.notify(Level::Warning, "A commit is running — wait for its result");
+            return true;
+        }
+        if b.has_pending_edits() {
+            let hint = match self.config.keymap {
+                KeymapMode::Vim => ":w to commit, :e! to discard",
+                KeymapMode::Standard => "Ctrl-S to commit, Ctrl-Z to undo",
+            };
+            self.notify(Level::Warning, format!("Pending changes — {hint} before reloading"));
+            return true;
+        }
+        false
+    }
+
     /// Checks whether the current cell may be edited. `Err` carries the reason.
     fn edit_permission(&self, set_null: bool) -> Result<(), String> {
         let b = self.browser.as_ref().ok_or("not connected")?;
         let t = b.table.as_ref().ok_or("no table open")?;
+        if let Some(reason) = &b.session.read_only_reason {
+            return Err(format!("Read-only session: {reason}"));
+        }
+        if let Some(reason) = self.table_busy() {
+            return Err(reason.into());
+        }
         if t.grid.is_empty() {
             return Err("no rows".into());
         }
         let row = t.grid.row;
-        if let Some(reason) = &b.session.read_only_reason {
-            return Err(format!("Read-only session: {reason}"));
-        }
         if t.grid.is_inserted(row) {
             return if t.privileges().insert {
                 Ok(())
@@ -675,8 +1064,8 @@ impl App {
             return Err("Row is marked for deletion — undo first".into());
         }
         if set_null
-            && let Some(col) =
-                t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == t.grid.columns[t.grid.col]))
+            && let Some(name) = t.grid.columns.get(t.grid.col)
+            && let Some(col) = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == *name))
             && !col.nullable
         {
             return Err(format!("Column {} does not accept NULL", col.name));
@@ -692,24 +1081,70 @@ impl App {
     // Grid editing
     // ------------------------------------------------------------------
 
+    /// Whether the current cell holds a stored binary value, shown as
+    /// `0x…`: editing that text would store the text instead.
+    fn binary_cell(&self) -> bool {
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return false };
+        t.grid.binary(t.grid.row, t.grid.col)
+    }
+
+    /// When the current cell shows only the start of a value too large to
+    /// load in full: the size of that start and of all of it. Editing the
+    /// start would store it alone.
+    fn cut_cell(&self) -> Option<(usize, u64)> {
+        let t = self.browser.as_ref()?.table.as_ref()?;
+        let full = t.grid.cut(t.grid.row, t.grid.col)?;
+        Some((t.grid.current_text().map_or(0, |s| s.len()), full))
+    }
+
     fn edit_cell(&mut self) {
         if let Err(reason) = self.edit_permission(false) {
             return self.deny(reason);
         }
-        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
+        if self.binary_cell() {
+            return self.deny("This is binary data, shown as hex: edit it with SQL".into());
+        }
+        if let Some((loaded, full)) = self.cut_cell() {
+            return self.deny(format!(
+                "Only the first {} of this {} value were loaded: edit it with SQL",
+                crate::util::size(loaded as u64),
+                crate::util::size(full)
+            ));
+        }
+        let Some(b) = self.browser.as_ref() else { return };
+        let Some(t) = b.table.as_ref() else { return };
         let (row, col) = (t.grid.row, t.grid.col);
-        let column = t.grid.columns[col].clone();
+        let Some(column) = t.grid.columns.get(col).cloned() else { return };
+        let new_row = t.grid.is_inserted(row);
+        let target = if new_row {
+            EditTarget::NewRow { grid: t.grid.id, index: row - t.grid.rows.len() }
+        } else {
+            match t.grid.row_key(row, &t.key_columns()) {
+                Some(key) => EditTarget::Row(key),
+                None => {
+                    return self.deny(format!("{} has no primary key, so rows cannot be edited safely", t.info.table));
+                }
+            }
+        };
         let info = t.structure.as_ref().and_then(|s| s.columns.iter().find(|c| c.name == column));
-        let mut editor = TextArea::from(t.grid.cell_text(row, col).unwrap_or_default().lines());
+        let original = t.grid.cell_text(row, col);
+        let hidden = original.as_deref().is_some_and(crate::util::has_hidden);
+        let (lines, newline) = editor_lines(original.as_deref().unwrap_or_default());
+        let mut editor = TextArea::new(lines);
         editor.move_cursor(ratatui_textarea::CursorMove::Bottom);
         editor.move_cursor(ratatui_textarea::CursorMove::End);
         self.popup = Some(Popup::CellEditor(Box::new(CellEditor {
             editor,
-            row,
-            col,
+            generation: b.generation,
+            table: t.info.table.clone(),
+            target,
+            original,
+            newline,
+            modified: false,
             data_type: info.map(|c| c.data_type.clone()).unwrap_or_default(),
             nullable: info.is_none_or(|c| c.nullable),
-            new_row: t.grid.is_inserted(row),
+            new_row,
+            hidden,
             column,
         })));
     }
@@ -725,6 +1160,9 @@ impl App {
     }
 
     fn delete_row(&mut self) {
+        if let Some(reason) = self.table_busy() {
+            return self.deny(reason.into());
+        }
         let Some(b) = self.browser.as_ref() else { return };
         let Some(t) = b.table.as_ref() else { return };
         if t.grid.is_empty() {
@@ -757,6 +1195,8 @@ impl App {
             Some(format!("Read-only session: {reason}"))
         } else if !t.privileges().insert {
             Some(format!("Read-only: no INSERT permission on {}", t.info.table))
+        } else if let Some(reason) = self.table_busy() {
+            Some(reason.to_string())
         } else if !t.loaded || t.grid.columns.is_empty() {
             Some("Table is still loading".to_string())
         } else {
@@ -780,32 +1220,81 @@ impl App {
         };
         let Some(grid) = grid.filter(|g| !g.is_empty()) else { return };
         let column = grid.columns.get(grid.col).cloned().unwrap_or_default();
-        let text = match grid.cell(grid.row, grid.col).0 {
-            grid::CellValue::Value(v) => v.to_string(),
-            grid::CellValue::Null => "NULL".into(),
-            grid::CellValue::Default => "(default)".into(),
+        let (cut, binary) = (grid.cut(grid.row, grid.col), grid.binary(grid.row, grid.col));
+        let (value, text) = match grid.cell(grid.row, grid.col).0 {
+            grid::CellValue::Value(v) => (Some(v.to_string()), None),
+            grid::CellValue::Null => (None, Some("NULL".to_string())),
+            grid::CellValue::Default => (None, Some("(default)".to_string())),
         };
-        self.popup = Some(Popup::CellView { title: column, text: pretty_value(&text), scroll: 0 });
+        // The start of a document is not one.
+        let formatted = value.as_deref().filter(|_| cut.is_none()).and_then(pretty_value);
+        let title = if formatted.is_some() { format!("{column} · JSON, re-indented") } else { column };
+        let shown = formatted.as_deref().or(text.as_deref()).or(value.as_deref()).unwrap_or_default();
+        let text = crate::util::display_safe_lines(shown);
+        self.popup = Some(Popup::CellView { title, text, value, cut, binary, scroll: 0, wrapped: None });
     }
 
     fn copy_cell(&mut self) {
-        let text = self.active_grid().and_then(|g| g.current_text());
+        let Some(grid) = self.active_grid() else { return };
+        let (text, cut, binary) = (grid.current_text(), grid.cut(grid.row, grid.col), grid.binary(grid.row, grid.col));
         match text {
-            Some(text) => {
-                crate::clipboard::copy(&text);
-                let preview: String = text.chars().take(40).collect();
-                self.register = Some(text);
-                self.notify(Level::Success, format!("Copied “{preview}”"));
-            }
+            Some(text) => self.copy_value(text, cut, binary),
             None => self.notify(Level::Info, "Cell is NULL — nothing copied"),
         }
     }
 
-    fn change_page(&mut self, delta: isize) {
-        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before changing page");
+    /// Copies a cell's value: to the system clipboard, made safe to paste
+    /// there (see [`crate::clipboard::clipboard_text`]), and as it is to the
+    /// register that pastes into cells, unless only its start was loaded
+    /// (`cut`: the size of all of it), which would store that start alone,
+    /// or it is `binary` data shown as `0x…`, which would store that text.
+    fn copy_value(&mut self, value: String, cut: Option<u64>, binary: bool) {
+        let preview: String = value.chars().take(40).collect();
+        let copied = crate::clipboard::copy(&value);
+        let mut level = Level::Success;
+        let mut message = format!("Copied “{preview}”");
+        if let Some(full) = cut {
+            level = Level::Warning;
+            message = format!(
+                "Copied the first {} of “{preview}”: only that much of its {} was loaded. \
+                 It cannot be pasted into a cell.",
+                crate::util::size(value.len() as u64),
+                crate::util::size(full)
+            );
+            self.register = None;
+        } else if binary {
+            level = Level::Warning;
+            message.push_str(
+                ": binary data, shown as hex. It cannot be pasted into a cell, which would store the text: \
+                 use SQL.",
+            );
+            self.register = None;
+        } else {
+            self.register = Some(value);
         }
+        if copied.cut {
+            level = Level::Warning;
+            message.push_str(&format!(
+                " Only the first {} went to the clipboard.",
+                crate::util::size(crate::clipboard::COPY_LIMIT as u64)
+            ));
+        }
+        if copied.escaped > 0 {
+            level = Level::Warning;
+            message.push_str(&format!(
+                " {} control character(s) are shown as symbols (␛…) on the clipboard, so that pasting cannot \
+                 type keys; pasting into a cell here keeps them.",
+                copied.escaped
+            ));
+        }
+        self.notify(level, message);
+    }
+
+    fn change_page(&mut self, delta: isize) {
+        if self.reload_blocked() {
+            return;
+        }
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
         if delta > 0 && !t.has_next_page() {
             return self.notify(Level::Info, "Already on the last page");
         }
@@ -818,10 +1307,10 @@ impl App {
     }
 
     fn open_filter_prompt(&mut self) {
-        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before filtering");
+        if self.browser.as_ref().is_none_or(|b| b.table.is_none()) || self.reload_blocked() {
+            return;
         }
+        let Some(t) = self.browser.as_ref().and_then(|b| b.table.as_ref()) else { return };
         let column = t.grid.columns.get(t.grid.col).cloned();
         self.popup = Some(Popup::Prompt(Prompt {
             kind: PromptKind::Filter,
@@ -835,10 +1324,10 @@ impl App {
     }
 
     fn toggle_sort(&mut self) {
-        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
-        if t.grid.has_pending() {
-            return self.notify(Level::Warning, "Commit or undo pending changes before sorting");
+        if self.reload_blocked() {
+            return;
         }
+        let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) else { return };
         let Some(col) = t.grid.columns.get(t.grid.col).cloned() else { return };
         t.order_by = match &t.order_by {
             Some((c, true)) if *c == col => Some((col, false)),
@@ -886,21 +1375,36 @@ impl App {
                     scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
                 }),
             },
-            Popup::CellView { title, text, scroll } => match key.code {
+            Popup::CellView { title, text, value, cut, binary, mut scroll, wrapped } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') | KeyCode::Char('v') => None,
-                KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || key.code == KeyCode::Char('c') => {
-                    crate::clipboard::copy(&text);
-                    self.register = Some(text.clone());
-                    self.notify(Level::Success, "Copied value");
-                    Some(Popup::CellView { title, text, scroll })
+                code => {
+                    match code {
+                        KeyCode::Char('y') | KeyCode::Char('c') if !ctrl || code == KeyCode::Char('c') => {
+                            // The value itself, as the grid copies it: not the
+                            // re-indented text, and nothing for NULL (which would
+                            // otherwise be pasted back as the text 'NULL').
+                            match &value {
+                                Some(v) => self.copy_value(v.clone(), cut, binary),
+                                None if text == "NULL" => self.notify(Level::Info, "Cell is NULL — nothing copied"),
+                                None => self.notify(Level::Info, "Cell uses the column default — nothing copied"),
+                            }
+                        }
+                        // Scrolling stops at the end when drawn.
+                        KeyCode::Home => scroll = 0,
+                        KeyCode::Char('g') if vim => scroll = 0,
+                        KeyCode::End => scroll = usize::MAX,
+                        KeyCode::Char('G') if vim => scroll = usize::MAX,
+                        _ => {
+                            if let Some(d) = scroll_delta(&key) {
+                                scroll = scroll.saturating_add_signed(d as isize);
+                            }
+                        }
+                    }
+                    Some(Popup::CellView { title, text, value, cut, binary, scroll, wrapped })
                 }
-                _ => Some(Popup::CellView {
-                    title,
-                    text,
-                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
-                }),
             },
             Popup::Confirm { title, message, action } => match key.code {
+                KeyCode::Enter if !action.enter_confirms() => Some(Popup::Confirm { title, message, action }),
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm(action);
                     self.popup.take()
@@ -908,17 +1412,33 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => None,
                 _ => Some(Popup::Confirm { title, message, action }),
             },
-            Popup::Commit { statements, scroll } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.apply_statements(statements);
-                    None
+            Popup::Commit { statements, previews, hidden, scroll, non_transactional, snapshot } => {
+                let force = commit_needs_force(&statements, non_transactional.as_ref());
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !force => {
+                        self.apply_statements(statements, non_transactional, *snapshot);
+                        None
+                    }
+                    KeyCode::Char('!') if force => {
+                        self.apply_statements(statements, non_transactional, *snapshot);
+                        None
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
+                    code => {
+                        if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
+                            self.notify(Level::Warning, "This table cannot roll back: press ! to commit anyway");
+                        }
+                        Some(Popup::Commit {
+                            statements,
+                            previews,
+                            hidden,
+                            scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
+                            non_transactional,
+                            snapshot,
+                        })
+                    }
                 }
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
-                _ => Some(Popup::Commit {
-                    statements,
-                    scroll: scroll_delta(&key).map_or(scroll, |d| scrolled(scroll, d)),
-                }),
-            },
+            }
             Popup::Form(mut form) => match form.handle_key(key) {
                 FormOutcome::None => Some(Popup::Form(form)),
                 FormOutcome::Cancel => None,
@@ -935,7 +1455,7 @@ impl App {
                 KeyCode::Esc => None,
                 KeyCode::Enter => {
                     let password = Zeroizing::new(p.input.value().to_string());
-                    let remember = p.remember.then(|| password.clone());
+                    let remember = p.remember.then(|| self.remember(&p.profile, password.clone(), false));
                     self.spawn_connect(p.profile.clone(), Some(password), remember);
                     None
                 }
@@ -961,6 +1481,7 @@ impl App {
                     }
                     None
                 }
+                _ if v.working.is_some() => Some(Popup::Vault(v)),
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down if v.create => {
                     v.focus = 1 - v.focus;
                     Some(Popup::Vault(v))
@@ -1012,30 +1533,25 @@ impl App {
                     KeyCode::Esc => None,
                     KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         c.editor.insert_newline();
+                        c.modified = true;
                         Some(Popup::CellEditor(c))
                     }
                     KeyCode::Enter => {
-                        let value = c.editor.lines().join("\n");
-                        self.apply_cell_edit(c.row, c.col, Some(value));
-                        None
+                        let value = c.value();
+                        // Nothing to stage: not even a rewritten line ending.
+                        if c.unchanged(&value) { None } else { self.stage_from_editor(c, CellChange::Set(Some(value))) }
                     }
                     KeyCode::Char('n') if ctrl => {
                         if c.nullable {
-                            self.apply_cell_edit(c.row, c.col, None);
-                            None
+                            self.stage_from_editor(c, CellChange::Set(None))
                         } else {
                             self.notify(Level::Warning, format!("Column {} does not accept NULL", c.column));
                             Some(Popup::CellEditor(c))
                         }
                     }
-                    KeyCode::Char('d') if ctrl && c.new_row => {
-                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-                            t.grid.set_default(c.row, c.col);
-                        }
-                        None
-                    }
+                    KeyCode::Char('d') if ctrl && c.new_row => self.stage_from_editor(c, CellChange::Default),
                     _ => {
-                        c.editor.input(key);
+                        c.modified |= c.editor.input(key);
                         Some(Popup::CellEditor(c))
                     }
                 }
@@ -1043,11 +1559,56 @@ impl App {
         };
     }
 
-    fn apply_cell_edit(&mut self, row: usize, col: usize, value: Option<String>) {
+    /// Where the cell an editor edits is now, if it is still there: the
+    /// same connection and table, the row with the same key (or the same
+    /// new row), and the column with the same name.
+    fn editor_cell(&self, c: &CellEditor) -> Option<(usize, usize)> {
+        let b = self.browser.as_ref().filter(|b| b.generation == c.generation)?;
+        let t = b.table.as_ref().filter(|t| t.info.table == c.table)?;
+        let col = t.grid.columns.iter().position(|name| *name == c.column)?;
+        let row = match &c.target {
+            EditTarget::Row(key) => t.grid.find_row(key)?,
+            EditTarget::NewRow { grid, index } => {
+                (t.grid.id == *grid && *index < t.grid.edits.inserted.len()).then(|| t.grid.rows.len() + index)?
+            }
+        };
+        Some((row, col))
+    }
+
+    /// Stages what a cell editor asks for on its cell, wherever that is
+    /// now. While the table is busy the editor stays open, to try again.
+    fn stage_from_editor(&mut self, c: Box<CellEditor>, change: CellChange) -> Option<Popup> {
+        if let Some(reason) = self.table_busy() {
+            self.deny(reason.into());
+            return Some(Popup::CellEditor(c));
+        }
+        let Some((row, col)) = self.editor_cell(&c) else {
+            self.notify(Level::Warning, "The row is no longer shown (the table was reloaded): nothing was staged");
+            return None;
+        };
         if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-            t.grid.set_cell(row, col, value);
+            match change {
+                CellChange::Set(value) => t.grid.set_cell(row, col, value),
+                CellChange::Default => t.grid.set_default(row, col),
+            }
             t.grid.row = row;
             t.grid.col = col;
+        }
+        None
+    }
+
+    /// After the open table's rows or staged changes were replaced: closes
+    /// a cell editor whose cell is gone, rather than leaving it to stage
+    /// its value on another one.
+    fn check_cell_editor(&mut self) {
+        if let Some(Popup::CellEditor(c)) = &self.popup
+            && self.editor_cell(c).is_none()
+        {
+            self.popup = None;
+            self.notify(
+                Level::Warning,
+                "The row being edited is no longer shown (the table was reloaded): nothing was staged",
+            );
         }
     }
 
@@ -1060,8 +1621,12 @@ impl App {
                 }
             }
             PromptKind::Filter => {
+                let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
+                if self.reload_blocked() {
+                    return;
+                }
                 let value = p.input.value().trim().to_string();
-                if let Err(e) = sql::validate_filter(&value) {
+                if let Err(e) = sql::validate_filter(driver, &value) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
                 }
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
@@ -1077,16 +1642,25 @@ impl App {
     fn confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::DeleteProfile(id) => {
-                if let Some(pos) = self.config.connections.iter().position(|p| p.id == id) {
-                    let profile = self.config.connections.remove(pos);
-                    self.forget_password(&profile);
-                    self.selected_conn = self.selected_conn.min(self.config.connections.len().saturating_sub(1));
-                    self.save_config();
+                if let Some(profile) = self.profile(&id).cloned() {
                     self.notify(Level::Success, format!("Deleted {}", profile.name));
+                    self.update_config(|c| c.connections.retain(|p| p.id != id));
+                    self.forget_password(&id, profile.credential);
                 }
             }
             ConfirmAction::Disconnect => self.disconnect(),
             ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::SendSavedPassword(saved) => {
+                let SavedPassword { profile, password, unbound } = *saved;
+                // Saved before passwords were bound: bind it once it works.
+                let rebind = unbound.then(|| self.remember(&profile, password.clone(), true));
+                self.spawn_connect(profile, Some(password), rebind);
+            }
+            // The changes being committed are not discarded: they are no
+            // longer the user's to discard.
+            ConfirmAction::DiscardAndOpen(_) | ConfirmAction::DiscardEdits if self.commit_running() => {
+                self.notify(Level::Warning, "A commit is running — wait for its result");
+            }
             ConfirmAction::DiscardAndOpen(table) => {
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
                     t.grid.clear_edits();
@@ -1103,9 +1677,23 @@ impl App {
         }
     }
 
+    fn commit_running(&self) -> bool {
+        self.browser.as_ref().is_some_and(|b| b.commit.is_some())
+    }
+
     fn request_quit(&mut self) {
         let pending = self.browser.as_ref().map(|b| b.pending_count()).unwrap_or(0);
-        if pending > 0 {
+        if let Some(b) = self.browser.as_ref().filter(|b| b.commit.is_some()) {
+            self.popup = Some(Popup::Confirm {
+                title: "Quit".into(),
+                message: format!(
+                    "A commit to {} is still running. It may still be applied, and its result will not be shown. \
+                     Quit anyway?",
+                    b.profile.name
+                ),
+                action: ConfirmAction::Quit,
+            });
+        } else if pending > 0 {
             self.popup = Some(Popup::Confirm {
                 title: "Quit".into(),
                 message: format!("You have {pending} uncommitted change(s). Quit and discard them?"),
@@ -1119,7 +1707,9 @@ impl App {
     fn request_disconnect(&mut self) {
         let Some(b) = &self.browser else { return };
         let pending = b.pending_count();
-        let message = if pending > 0 {
+        let message = if b.commit.is_some() {
+            format!("A commit to {} is still running and may still be applied. Disconnect anyway?", b.profile.name)
+        } else if pending > 0 {
             format!("Disconnect from {} and discard {pending} uncommitted change(s)?", b.profile.name)
         } else {
             format!("Disconnect from {}?", b.profile.name)
@@ -1131,7 +1721,19 @@ impl App {
         if let Some(b) = self.browser.take() {
             let db = b.db.clone();
             tokio::spawn(async move { db.close().await });
-            self.notify(Level::Info, format!("Disconnected from {}", b.profile.name));
+            if b.commit.is_some() {
+                // Its result is reported when it comes (see `Committed`).
+                self.busy = None;
+                self.notify(
+                    Level::Warning,
+                    format!(
+                        "Disconnected from {}; its commit is still running and may still be applied",
+                        b.profile.name
+                    ),
+                );
+            } else {
+                self.notify(Level::Info, format!("Disconnected from {}", b.profile.name));
+            }
         }
         self.screen = Screen::Connections;
     }
@@ -1174,7 +1776,11 @@ impl App {
             }
             "run" if connected => self.run_query(),
             "filter" | "where" if connected => {
-                if let Err(e) = sql::validate_filter(arg) {
+                let Some(driver) = self.browser.as_ref().map(|b| b.db.driver()) else { return };
+                if self.reload_blocked() {
+                    return;
+                }
+                if let Err(e) = sql::validate_filter(driver, arg) {
                     return self.notify(Level::Error, format!("Invalid filter: {e}"));
                 }
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
@@ -1185,6 +1791,9 @@ impl App {
             }
             "nofilter" if connected => self.run_command("filter"),
             "sort" if connected => {
+                if self.reload_blocked() {
+                    return;
+                }
                 let mut parts = arg.split_whitespace();
                 if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
                     t.order_by = parts.next().map(|c| (c.to_string(), !matches!(parts.next(), Some("desc" | "DESC"))));
@@ -1218,26 +1827,113 @@ impl App {
         }
     }
 
+    /// Starts a connection attempt. Whatever an earlier attempt still
+    /// brings back (a connection, an error, a saved password) is discarded.
+    fn begin_connect(&mut self) -> u64 {
+        self.connect_seq += 1;
+        self.connecting = Some(self.connect_seq);
+        self.to_remember = None;
+        self.connect_seq
+    }
+
     fn connect(&mut self, profile: ConnectionProfile) {
+        let attempt = self.begin_connect();
         if !profile.needs_password() {
             return self.spawn_connect(profile, None, None);
         }
         match profile.credential {
             CredentialStore::None => self.ask_password(profile, None),
-            // Read from the keyring in the background task.
-            CredentialStore::Keyring => self.spawn_connect(profile, None, None),
+            // Read from the keyring in the background: it can be slow.
+            CredentialStore::Keyring => {
+                self.busy = Some(format!("Connecting to {}", profile.name));
+                let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = keyring.get(&profile.id).map_err(err_text);
+                    let _ = tx.send(AppEvent::SavedPassword { attempt, profile, result });
+                });
+            }
             CredentialStore::Vault => match &self.vault {
                 None => self.open_vault_prompt(AfterUnlock::Connect(profile)),
-                Some(vault) => match vault.get(&profile.id) {
-                    Ok(Some(pw)) => self.spawn_connect(profile, Some(Zeroizing::new(pw)), None),
-                    Ok(None) => self.ask_password(profile, Some("No password saved in the vault".into())),
-                    Err(e) => self.ask_password(profile, Some(err_text(e))),
-                },
+                Some(vault) => {
+                    let result = vault.get(&profile.id);
+                    self.connect_with_saved(profile, result, "the vault");
+                }
             },
         }
     }
 
+    /// Connects with the password saved for `profile`, if it was saved for
+    /// the server the profile now points to (see [`App::send_saved_password`]);
+    /// otherwise asks for one.
+    fn connect_with_saved(
+        &mut self,
+        profile: ConnectionProfile,
+        saved: anyhow::Result<Option<StoredSecret>>,
+        store: &str,
+    ) {
+        let secret = match saved {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return self.ask_password(profile, Some(format!("No password saved in {store}"))),
+            Err(e) => {
+                if e.is::<VaultChanged>() {
+                    self.vault = None;
+                }
+                return self.ask_password(profile, Some(err_text(e)));
+            }
+        };
+        if let Some(password) = secret.unbound_password() {
+            return self.send_saved_password(profile, password.clone(), true);
+        }
+        match secret.password_for(&Endpoint::of(&profile)) {
+            Ok(password) => self.send_saved_password(profile, password.clone(), false),
+            Err(mismatch) => self.ask_password(profile, Some(mismatch)),
+        }
+    }
+
+    /// Connects with a saved password, unless the user should decide first
+    /// whether it goes there: one saved before passwords were bound to their
+    /// server (nothing says the profile still points to it), or a remote
+    /// server that the SSL mode does not authenticate (whoever is on the
+    /// network path could pose as it and receive the password).
+    fn send_saved_password(&mut self, profile: ConnectionProfile, password: Zeroizing<String>, unbound: bool) {
+        let mut reasons = Vec::new();
+        if let Some(warning) = profile.tls_warning() {
+            reasons.push(format!(
+                "⚠ SSL mode {}: {warning}. Whoever is on the network path could pose as the server and receive \
+                 the password.",
+                profile.ssl_mode.label()
+            ));
+        }
+        if unbound {
+            reasons.push(
+                "⚠ It was saved by an earlier version of dbtui, which did not record the server it is for: check \
+                 that this is that server. Once it works, it is saved for this server only."
+                    .to_string(),
+            );
+        }
+        if reasons.is_empty() {
+            return self.spawn_connect(profile, Some(password), None);
+        }
+        self.busy = None;
+        self.connecting = None;
+        self.popup = Some(Popup::Confirm {
+            title: "Send saved password?".into(),
+            message: format!(
+                "Send the password saved for {} to {}?\n\n{}",
+                profile.name,
+                Endpoint::of(&profile),
+                reasons.join("\n\n")
+            ),
+            action: ConfirmAction::SendSavedPassword(Box::new(SavedPassword { profile, password, unbound })),
+        });
+    }
+
+    fn remember(&self, profile: &ConnectionProfile, password: Zeroizing<String>, rebind: bool) -> Remember {
+        Remember { password, rebind, generation: self.credentials.generation(&profile.id) }
+    }
+
     fn ask_password(&mut self, profile: ConnectionProfile, error: Option<String>) {
+        self.busy = None;
         self.popup = Some(Popup::Password(PasswordPrompt {
             remember: profile.credential != CredentialStore::None,
             profile,
@@ -1249,89 +1945,121 @@ impl App {
 
     fn spawn_connect(
         &mut self,
-        profile: ConnectionProfile,
+        mut profile: ConnectionProfile,
         password: Option<Zeroizing<String>>,
-        remember: Option<Zeroizing<String>>,
+        remember: Option<Remember>,
     ) {
+        let attempt = self.begin_connect();
+        self.to_remember = remember;
         self.busy = Some(format!("Connecting to {}", profile.name));
+        let forced_read_only = self.read_only_run && !profile.read_only;
+        profile.read_only |= self.read_only_run;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let password = match password {
-                Some(p) => Some(p),
-                None if profile.needs_password() && profile.credential == CredentialStore::Keyring => {
-                    let id = profile.id.clone();
-                    let res = tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await;
-                    match res {
-                        Ok(Ok(Some(p))) => Some(Zeroizing::new(p)),
-                        Ok(Ok(None)) => {
-                            let _ = tx.send(AppEvent::ConnectFailed {
-                                profile,
-                                error: "No password found in the OS keyring".into(),
-                                needs_password: true,
-                            });
-                            return;
+            let result = guarded(async {
+                let db = Database::connect(&profile, password.as_deref().map(String::as_str))
+                    .await
+                    .map_err(connect_error)?;
+                let info = async { anyhow::Ok((db.session_info(&profile).await?, db.schemas().await?)) }.await;
+                match info {
+                    Ok((mut session, schemas)) => {
+                        if forced_read_only {
+                            session.read_only_reason = Some("dbtui was started with --read-only".into());
                         }
-                        Ok(Err(e)) => {
-                            let _ =
-                                tx.send(AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: true });
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::ConnectFailed {
-                                profile,
-                                error: e.to_string(),
-                                needs_password: true,
-                            });
-                            return;
-                        }
+                        Ok((db, session, schemas))
+                    }
+                    Err(e) => {
+                        db.close().await;
+                        Err(err_text(e))
                     }
                 }
-                None => None,
-            };
-            let result = async {
-                let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
-                let session = db.session_info(&profile).await?;
-                let schemas = db.schemas().await?;
-                anyhow::Ok((db, session, schemas))
-            }
+            })
             .await;
             let event = match result {
-                Ok((db, session, schemas)) => AppEvent::Connected { profile, db, session, schemas, remember },
-                Err(e) => AppEvent::ConnectFailed { profile, error: err_text(e), needs_password: false },
+                Ok((db, session, schemas)) => {
+                    AppEvent::Connected { attempt, profile, db, session: Box::new(session), schemas }
+                }
+                Err(error) => AppEvent::ConnectFailed { attempt, profile, error, needs_password: false },
             };
             let _ = tx.send(event);
         });
     }
 
     fn test_connection(&mut self, form: &ConnectionForm) {
-        let profile = match form.to_profile() {
+        let mut profile = match form.to_profile() {
             Ok(p) => p,
             Err(e) => return self.notify(Level::Error, e),
         };
+        profile.read_only |= self.read_only_run;
+        // Where its password is saved now, which may have changed since the
+        // form was opened.
+        profile.credential = self.profile(&profile.id).map_or(CredentialStore::None, |p| p.credential);
+        let endpoint = Endpoint::of(&profile);
         let mut password =
             (!form.password.value().is_empty()).then(|| Zeroizing::new(form.password.value().to_string()));
-        if password.is_none() && profile.credential == CredentialStore::Vault {
-            password = self.vault.as_ref().and_then(|v| v.get(&profile.id).ok().flatten()).map(Zeroizing::new);
+        let saved =
+            if password.is_none() && profile.needs_password() { profile.credential } else { CredentialStore::None };
+        // A saved password is only used, unasked, for the server it was saved
+        // for, and when that server is authenticated (or local); otherwise
+        // it is typed. Connecting from the list asks instead.
+        if saved != CredentialStore::None
+            && let Some(warning) = profile.tls_warning()
+        {
+            let error = format!(
+                "The saved password is not sent unasked with SSL mode {} ({warning}): type it in Password to test",
+                profile.ssl_mode.label()
+            );
+            let _ = self.tx.send(AppEvent::TestResult(Err(error)));
+            return;
         }
-        let use_keyring = password.is_none() && profile.credential == CredentialStore::Keyring;
+        let use_keyring = saved == CredentialStore::Keyring;
+        if saved == CredentialStore::Vault
+            && let Some(vault) = &self.vault
+        {
+            let saved = vault.get(&profile.id).map_err(err_text).and_then(|secret| match secret {
+                Some(secret) => secret.password_for(&endpoint).map(|pw| Some(pw.clone())),
+                None => Ok(None),
+            });
+            match saved {
+                Ok(saved) => password = saved,
+                // Reported like any other test failure, once the form is back.
+                Err(e) => {
+                    let _ = self.tx.send(AppEvent::TestResult(Err(e)));
+                    return;
+                }
+            }
+        }
         self.busy = Some("Testing connection".into());
-        let tx = self.tx.clone();
+        let (keyring, tx) = (self.keyring.clone(), self.tx.clone());
         tokio::spawn(async move {
-            let result = async {
+            let test = async {
                 let mut password = password;
                 if use_keyring {
                     let id = profile.id.clone();
-                    password =
-                        tokio::task::spawn_blocking(move || secrets::keyring_get(&id)).await??.map(Zeroizing::new);
+                    let saved = tokio::task::spawn_blocking(move || keyring.get(&id)).await??;
+                    if let Some(secret) = saved {
+                        password = Some(secret.password_for(&endpoint).map_err(anyhow::Error::msg)?.clone());
+                    }
                 }
                 let db = Database::connect(&profile, password.as_deref().map(String::as_str)).await?;
                 let info = db.session_info(&profile).await;
                 db.close().await;
                 let info = info?;
-                anyhow::Ok(format!("Connected to {} as {}", info.server_version, info.user))
-            }
-            .await;
-            let _ = tx.send(AppEvent::TestResult(result.map_err(err_text)));
+                let mut msg = format!("Connected to {} as {}", info.server_version, info.user);
+                if let Some((transport, _)) = info.transport.summary(&profile) {
+                    msg.push_str(&format!(" · {transport}"));
+                }
+                let level = match profile.tls_warning() {
+                    Some(warning) => {
+                        msg.push_str(&format!(" · ⚠ {}: {warning}", profile.ssl_mode.label()));
+                        Level::Warning
+                    }
+                    None => Level::Success,
+                };
+                anyhow::Ok((level, msg))
+            };
+            let result = guarded(async { test.await.map_err(|e| with_certificate_hint(err_text(e), " ")) }).await;
+            let _ = tx.send(AppEvent::TestResult(result));
         });
     }
 
@@ -1345,60 +2073,128 @@ impl App {
                 return;
             }
         };
+        let id = profile.id.clone();
+        // The profile as saved now: its password may have been saved (by a
+        // keyring that was slow to answer) since the form was opened.
+        let saved = self.profile(&id).cloned();
+        profile.credential = saved.as_ref().map_or(CredentialStore::None, |p| p.credential);
         let password = Zeroizing::new(form.password.value().to_string());
         let save_password = form.save_password && profile.needs_password();
-        if !save_password && profile.credential != CredentialStore::None {
-            self.forget_password(&profile);
-            profile.credential = CredentialStore::None;
+        let (name, endpoint) = (profile.name.clone(), Endpoint::of(&profile));
+        // A saved password is for the server it was saved for: one pointed
+        // elsewhere loses it (one saved by an earlier version, which does
+        // not say which server it is for, would otherwise go there).
+        let moved_from = saved.as_ref().map(Endpoint::of).filter(|old| *old != endpoint && profile.needs_password());
+        let had_password = profile.credential != CredentialStore::None || self.credentials.knows(&id);
+        let forget = had_password && (!save_password || moved_from.is_some());
+        if forget {
+            self.forget_password(&id, profile.credential);
         }
-        let id = profile.id.clone();
-        let name = profile.name.clone();
-        match self.config.connections.iter().position(|p| p.id == id) {
-            Some(pos) => {
-                self.config.connections[pos] = profile;
-                self.selected_conn = pos;
+        self.update_config(|c| {
+            let mut p = profile.clone();
+            match c.connections.iter().position(|p| p.id == id) {
+                Some(pos) => {
+                    // Where its password is saved is recorded as it is on
+                    // disk, unless it was just forgotten.
+                    p.credential = if forget { CredentialStore::None } else { c.connections[pos].credential };
+                    c.connections[pos] = p;
+                }
+                None => c.connections.push(p),
             }
-            None => {
-                self.config.connections.push(profile);
-                self.selected_conn = self.config.connections.len() - 1;
-            }
-        }
-        self.save_config();
-        self.notify(Level::Success, format!("Saved {name}"));
+        });
+        self.selected_conn = self.config.connections.iter().position(|p| p.id == id).unwrap_or(0);
         if save_password && !password.is_empty() {
-            self.store_password(&id, &password);
+            self.notify(Level::Success, format!("Saved {name}"));
+            self.store_password(&id, endpoint, password);
+        } else if let Some(old) = moved_from.filter(|_| forget) {
+            self.notify(
+                Level::Info,
+                format!(
+                    "Saved {name}. Its saved password was for {} and has been removed: it is asked for on connect.",
+                    old.address()
+                ),
+            );
+        } else {
+            self.notify(Level::Success, format!("Saved {name}"));
         }
     }
 
-    fn set_credential(&mut self, id: &str, store: CredentialStore) {
-        if let Some(p) = self.config.connections.iter_mut().find(|p| p.id == id) {
-            p.credential = store;
-        }
-        self.save_config();
+    /// Records where a profile's password now is. False if the profile is
+    /// gone (perhaps deleted by another dbtui instance).
+    fn set_credential(&mut self, id: &str, store: CredentialStore) -> bool {
+        self.update_config(|c| {
+            if let Some(p) = c.connections.iter_mut().find(|p| p.id == id) {
+                p.credential = store;
+            }
+        });
+        self.profile(id).is_some()
     }
 
-    /// Saves a password using the configured backend (keyring first, vault as fallback).
-    fn store_password(&mut self, id: &str, password: &str) {
+    /// Saves a password for profile `id`, bound to `endpoint`, using the
+    /// configured backend (keyring first, vault as fallback).
+    fn store_password(&mut self, id: &str, endpoint: Endpoint, password: Zeroizing<String>) {
+        let generation = self.credentials.bump(id);
+        let request = SaveRequest { id: id.to_string(), endpoint, password, generation, quiet: false };
         if self.config.secret_backend == SecretBackend::Vault {
-            return self.store_in_vault(id, password);
+            return self.store_in_vault(request);
         }
-        // The keyring can block for a long time (e.g. waiting to be unlocked),
-        // so it is never called on the UI thread; the result comes back as
-        // `AppEvent::KeyringStored`.
-        let (id, password) = (id.to_string(), Zeroizing::new(password.to_string()));
+        self.store_in_keyring(request);
+    }
+
+    /// Saves a password that was saved before passwords were bound to their
+    /// server again, bound, where it already is.
+    fn rebind_password(&mut self, profile: &ConnectionProfile, password: Zeroizing<String>) {
+        let generation = self.credentials.bump(&profile.id);
+        let request =
+            SaveRequest { id: profile.id.clone(), endpoint: Endpoint::of(profile), password, generation, quiet: true };
+        match profile.credential {
+            CredentialStore::Keyring => self.store_in_keyring(request),
+            CredentialStore::Vault => self.store_in_vault(request),
+            CredentialStore::None => {}
+        }
+    }
+
+    /// The keyring can block for a long time (e.g. waiting to be unlocked),
+    /// so it is never called on the UI thread; the result comes back as
+    /// `AppEvent::KeyringStored`, whenever the keyring answers.
+    fn store_in_keyring(&mut self, request: SaveRequest) {
+        let generation = request.generation;
+        self.credentials.last_keyring_op.insert(request.id.clone(), generation);
+        self.credentials.pending.insert(generation, (Instant::now(), false));
         let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = secrets::keyring_set(&id, &password).map_err(err_text);
-            let _ = tx.send(AppEvent::KeyringStored { id, password, result });
+        let (id, endpoint, password) = (request.id.clone(), request.endpoint.clone(), request.password.clone());
+        self.keyring.set(&id, &endpoint, &password, move |result| {
+            let _ = tx.send(AppEvent::KeyringStored(request, result.map_err(err_text)));
         });
     }
 
-    fn keyring_stored(&mut self, id: &str, password: &str, result: Result<(), String>) {
+    fn keyring_stored(&mut self, request: SaveRequest, result: Result<(), String>) {
+        let SaveRequest { id, generation, quiet, .. } = &request;
+        self.credentials.pending.remove(generation);
+        if self.credentials.generation(id) != *generation || self.profile(id).is_none() {
+            // Stale: the profile was deleted, or its password saved again or
+            // no longer saved, while the keyring was busy. Unless a later
+            // keyring operation for it is queued (it runs after this one, and
+            // decides what the keyring holds), remove what this one wrote.
+            if self.credentials.last_keyring_op.get(id) == Some(generation) {
+                self.keyring_delete(id, false);
+            }
+            return;
+        }
         match result {
             Ok(()) => {
-                self.set_credential(id, CredentialStore::Keyring);
-                self.notify(Level::Success, "Password saved in the OS keyring");
+                let id = id.clone();
+                if !self.set_credential(&id, CredentialStore::Keyring) {
+                    return self.keyring_delete(&id, false);
+                }
+                // The password may have been in the vault until now.
+                self.vault_delete(&id, false);
+                if !quiet {
+                    self.notify(Level::Success, "Password saved in the OS keyring");
+                }
             }
+            // A password that is already saved stays where it is.
+            Err(_) if *quiet => {}
             // Don't replace whatever dialog the user opened in the meantime with the vault prompt.
             Err(e)
                 if self.config.secret_backend == SecretBackend::Keyring
@@ -1406,48 +2202,92 @@ impl App {
             {
                 self.notify(Level::Error, format!("Could not save password: {e}"));
             }
-            Err(_) => self.store_in_vault(id, password),
+            Err(_) => self.store_in_vault(request),
         }
     }
 
-    fn store_in_vault(&mut self, id: &str, password: &str) {
-        match self.vault.as_mut() {
-            Some(vault) => match vault.set(id, password) {
-                Ok(()) => {
-                    self.set_credential(id, CredentialStore::Vault);
-                    self.notify(Level::Success, "Password saved in the encrypted vault");
-                }
-                Err(e) => self.notify(Level::Error, format!("Could not save password: {}", err_text(e))),
-            },
-            None => self.open_vault_prompt(AfterUnlock::Store {
-                id: id.to_string(),
-                password: Zeroizing::new(password.to_string()),
-            }),
+    fn store_in_vault(&mut self, request: SaveRequest) {
+        // Saved again or forgotten, or the profile deleted, meanwhile (e.g.
+        // while the vault prompt was open).
+        if self.credentials.generation(&request.id) != request.generation || self.profile(&request.id).is_none() {
+            return;
         }
-    }
-
-    fn forget_password(&mut self, profile: &ConnectionProfile) {
-        let result = match profile.credential {
-            CredentialStore::None => Ok(()),
-            CredentialStore::Keyring => {
-                let (id, tx) = (profile.id.clone(), self.tx.clone());
-                tokio::task::spawn_blocking(move || {
-                    let _ = tx.send(AppEvent::KeyringRemoved(secrets::keyring_delete(&id).map_err(err_text)));
-                });
-                Ok(())
-            }
-            CredentialStore::Vault => match self.vault.as_mut() {
-                Some(v) => v.remove(&profile.id),
-                None => Vault::default_path().and_then(|p| Vault::remove_locked(&p, &profile.id)),
-            },
+        let Some(vault) = &self.vault else {
+            return self.open_vault_prompt(AfterUnlock::Store(request));
         };
-        if let Err(e) = result {
+        let SaveRequest { id, endpoint, password, quiet, .. } = &request;
+        if let Err(e) = vault.set(id, endpoint, password) {
+            if e.is::<VaultChanged>() {
+                self.vault = None;
+            }
+            return self.notify(Level::Error, format!("Could not save password: {}", err_text(e)));
+        }
+        let previous = self.profile(id).map(|p| p.credential);
+        if !self.set_credential(id, CredentialStore::Vault) {
+            return self.vault_delete(id, false);
+        }
+        // The keyring may still hold an older copy.
+        if previous == Some(CredentialStore::Keyring) || self.credentials.last_keyring_op.contains_key(id) {
+            self.keyring_delete(id, previous == Some(CredentialStore::Keyring));
+        }
+        if !quiet {
+            self.notify(Level::Success, "Password saved in the encrypted vault");
+        }
+    }
+
+    /// Removes a profile's saved password from both stores (it may have been
+    /// saved in either one at some point), and makes saves still in progress
+    /// stale, so that their results are removed rather than recorded.
+    fn forget_password(&mut self, id: &str, credential: CredentialStore) {
+        self.credentials.bump(id);
+        self.vault_delete(id, credential == CredentialStore::Vault);
+        self.keyring_delete(id, credential == CredentialStore::Keyring);
+    }
+
+    /// Removes a profile's vault entry, if any; the vault need not be unlocked.
+    fn vault_delete(&mut self, id: &str, report: bool) {
+        if let Err(e) = self.vault_path().and_then(|path| Vault::remove(&path, id))
+            && report
+        {
             self.notify(Level::Warning, format!("Could not remove saved password: {}", err_text(e)));
         }
     }
 
+    fn keyring_delete(&mut self, id: &str, report: bool) {
+        let op = self.credentials.next();
+        self.credentials.last_keyring_op.insert(id.to_string(), op);
+        self.credentials.pending.insert(op, (Instant::now(), true));
+        let tx = self.tx.clone();
+        self.keyring.delete(id, move |result| {
+            let _ = tx.send(AppEvent::KeyringRemoved { op, report, result: result.map_err(err_text) });
+        });
+    }
+
+    /// Whether keyring work is still in progress: a password being saved or
+    /// removed, whose result should be recorded before quitting.
+    pub fn keyring_busy(&self) -> bool {
+        !self.credentials.pending.is_empty()
+    }
+
+    /// Saves the password a connection worked with, if asked to.
+    fn remember_password(&mut self, connected: &ConnectionProfile, remember: Remember) {
+        // Only for the profile as it was connected: not if it has been
+        // deleted or now points to another server, or if its password was
+        // saved or forgotten in the meantime.
+        let Some(current) = self.profile(&connected.id).cloned() else { return };
+        let endpoint = Endpoint::of(connected);
+        if Endpoint::of(&current) != endpoint || self.credentials.generation(&current.id) != remember.generation {
+            return;
+        }
+        if remember.rebind {
+            self.rebind_password(&current, remember.password);
+        } else {
+            self.store_password(&current.id, endpoint, remember.password);
+        }
+    }
+
     fn open_vault_prompt(&mut self, then: AfterUnlock) {
-        let create = match Vault::default_path() {
+        let create = match self.vault_path() {
             Ok(p) => !Vault::exists(&p),
             Err(e) => return self.notify(Level::Error, err_text(e)),
         };
@@ -1458,42 +2298,77 @@ impl App {
             focus: 0,
             error: None,
             then,
+            working: None,
         }));
     }
 
+    /// Checks the master password in the background: deriving the key is
+    /// deliberately slow. The result comes back as `AppEvent::VaultOpened`.
     fn submit_vault(&mut self, mut v: VaultPrompt) -> Option<Popup> {
-        let path = match Vault::default_path() {
+        let path = match self.vault_path() {
             Ok(p) => p,
             Err(e) => {
                 v.error = Some(err_text(e));
                 return Some(Popup::Vault(v));
             }
         };
-        let result = if v.create {
-            if v.input.value() != v.confirm.value() {
-                v.error = Some("Passwords do not match".into());
-                return Some(Popup::Vault(v));
+        if v.create && v.input.value() != v.confirm.value() {
+            v.error = Some("Passwords do not match".into());
+            return Some(Popup::Vault(v));
+        }
+        let master = Zeroizing::new(v.input.value().to_string());
+        self.vault_seq += 1;
+        let (seq, create, tx) = (self.vault_seq, v.create, self.tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let open = || if create { Vault::create(&path, &master) } else { Vault::unlock(&path, &master) };
+            let result = crate::terminal::catch_panic_blocking(open)
+                .unwrap_or_else(|panic| Err(anyhow::anyhow!("internal error: {panic}")));
+            let _ = tx.send(AppEvent::VaultOpened { seq, create, result });
+        });
+        v.working = Some(seq);
+        v.error = None;
+        Some(Popup::Vault(v))
+    }
+
+    fn vault_opened(&mut self, seq: u64, create: bool, result: anyhow::Result<Vault>) {
+        let prompt = match self.popup.take() {
+            Some(Popup::Vault(v)) if v.working == Some(seq) => Some(v),
+            other => {
+                self.popup = other;
+                None
             }
-            Vault::create(&path, v.input.value())
-        } else {
-            Vault::unlock(&path, v.input.value())
         };
-        match result {
-            Ok(vault) => {
+        match (result, prompt) {
+            (Ok(vault), Some(v)) => {
                 self.vault = Some(vault);
-                match std::mem::replace(&mut v.then, AfterUnlock::Connect(ConnectionProfile::new(Driver::Sqlite))) {
+                match v.then {
                     AfterUnlock::Connect(profile) => self.connect(profile),
-                    AfterUnlock::Store { id, password } => self.store_in_vault(&id, &password),
+                    AfterUnlock::Store(request) => self.store_in_vault(request),
                 }
-                self.popup.take()
             }
-            Err(e) => {
-                v.error = Some(err_text(e));
+            // Cancelled while it was created: no vault after all.
+            (Ok(vault), None) if create => {
+                if !vault.discard_if_empty().unwrap_or(false) {
+                    self.vault = Some(vault);
+                }
+            }
+            // Cancelled while it was checked: keep it unlocked, nothing more.
+            (Ok(vault), None) => self.vault = Some(vault),
+            (Err(e), Some(mut v)) => {
+                v.working = None;
                 v.input.set("");
                 v.confirm.set("");
                 v.focus = 0;
-                Some(Popup::Vault(v))
+                v.error = Some(if e.is::<VaultExists>() {
+                    // Created meanwhile, by another dbtui instance: never replaced.
+                    v.create = false;
+                    "A vault has just been created by another dbtui instance: enter its master password".into()
+                } else {
+                    err_text(e)
+                });
+                self.popup = Some(Popup::Vault(v));
             }
+            (Err(_), None) => {}
         }
     }
 
@@ -1513,6 +2388,9 @@ impl App {
                 }
             }
             return;
+        }
+        if b.commit.is_some() {
+            return self.notify(Level::Warning, "A commit is running — wait for its result");
         }
         if b.has_pending_edits() {
             self.popup = Some(Popup::Confirm {
@@ -1539,21 +2417,18 @@ impl App {
         self.request_page();
     }
 
+    /// Reloads the open table (whichever tab is shown), unless that would
+    /// drop staged changes or come before a commit's result.
     fn request_page(&mut self) {
-        let Some(b) = &mut self.browser else { return };
-        if b.tab == Tab::Query {
+        if self.browser.as_ref().is_none_or(|b| b.table.is_none()) || self.reload_blocked() {
             return;
         }
+        let Some(b) = &mut self.browser else { return };
+        // The filter is user SQL: same read-only guard as the SQL editor.
+        let read_only = b.fully_read_only();
         let Some(t) = &mut b.table else { return };
-        if t.grid.has_pending() {
-            let hint = match self.config.keymap {
-                KeymapMode::Vim => ":w to commit, :e! to discard",
-                KeymapMode::Standard => "Ctrl-S to commit, Ctrl-Z to undo",
-            };
-            return self.notify(Level::Warning, format!("Pending changes — {hint} before reloading"));
-        }
         b.seq += 1;
-        let seq = b.seq;
+        let (generation, seq) = (b.generation, b.seq);
         t.loading = true;
         t.total = None;
         let db = b.db.clone();
@@ -1570,29 +2445,32 @@ impl App {
         tokio::spawn(async move {
             let structure = match &known_structure {
                 Some(_) => None,
-                None => Some(db.structure(&table).await.map_err(err_text)),
+                None => Some(guarded(async { db.structure(&table).await.map_err(err_text) }).await),
             };
             let columns = match (&known_structure, &structure) {
                 (Some(s), _) | (None, Some(Ok(s))) => s.columns.as_slice(),
                 _ => &[],
             };
             req.default_order = columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
-            let data = db.fetch_page(&table, &req).await.map_err(err_text);
+            let data = guarded(async { db.fetch_page(&table, &req, read_only).await.map_err(err_text) }).await;
             let ok = data.is_ok();
-            let _ = tx.send(AppEvent::Page { seq, structure, data });
+            let _ = tx.send(AppEvent::Page { generation, seq, structure, data });
             if ok {
-                let count = db.count_rows(&table, req.filter.as_deref()).await.map_err(err_text);
-                let _ = tx.send(AppEvent::Count { seq, count });
+                let filter = req.filter.as_deref();
+                let count = guarded(async { db.count_rows(&table, filter, read_only).await.map_err(err_text) }).await;
+                let _ = tx.send(AppEvent::Count { generation, seq, count });
             }
         });
     }
 
     fn refresh_schemas(&mut self) {
-        let Some(b) = &self.browser else { return };
-        let db = b.db.clone();
+        let Some(b) = &mut self.browser else { return };
+        b.schema_seq += 1;
+        let (generation, seq, db) = (b.generation, b.schema_seq, b.db.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(AppEvent::Schemas(db.schemas().await.map_err(err_text)));
+            let result = guarded(async { db.schemas().await.map_err(err_text) }).await;
+            let _ = tx.send(AppEvent::Schemas { generation, seq, result });
         });
     }
 
@@ -1603,26 +2481,30 @@ impl App {
             return self.notify(Level::Info, "Nothing to run");
         }
         let read_only = b.fully_read_only();
-        if read_only && let Some(keyword) = sql::write_keyword(&sql) {
+        if read_only && let Some(keyword) = sql::write_keyword(b.db.driver(), &sql) {
             let reason =
                 b.session.read_only_reason.clone().unwrap_or_else(|| "your account has no write permissions".into());
             b.query.message = Some((format!("🔒 Refused {keyword}: read-only session ({reason})"), true));
-            return self.notify(Level::Warning, format!("🔒 Read-only: {keyword} statements are not allowed"));
+            return self.notify(Level::Warning, format!("🔒 Read-only: refused {keyword}"));
         }
         b.query.seq += 1;
         b.query.running = true;
         b.query.message = Some(("Running…".into(), false));
-        let seq = b.query.seq;
+        let (generation, seq) = (b.generation, b.query.seq);
+        let may_write = sql::write_keyword(b.db.driver(), &sql).is_some();
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = db.run_query(&sql, read_only).await.map_err(err_text);
-            let _ = tx.send(AppEvent::Query { seq, result });
+            let result = guarded(async { db.run_query(&sql, read_only).await.map_err(err_text) }).await;
+            let _ = tx.send(AppEvent::Query { generation, seq, may_write, result });
         });
     }
 
     fn begin_commit(&mut self) {
         let Some(b) = &self.browser else { return };
+        if b.commit.is_some() {
+            return self.notify(Level::Warning, "A commit is already running — wait for its result");
+        }
         let Some(t) = &b.table else { return self.notify(Level::Info, "Nothing to commit") };
         if !t.grid.has_pending() {
             return self.notify(Level::Info, "Nothing to commit");
@@ -1630,22 +2512,83 @@ impl App {
         if let Some(reason) = &b.session.read_only_reason {
             return self.deny(format!("Read-only session: {reason}"));
         }
+        if t.loading {
+            return self.notify(Level::Warning, "The table is loading — wait for it to finish");
+        }
         let Some(structure) = &t.structure else { return };
         match t.grid.build_statements(b.db.driver(), &t.info.table, structure) {
-            Ok(statements) => self.popup = Some(Popup::Commit { statements, scroll: 0 }),
+            Ok(statements) => {
+                let non_transactional = structure.non_transactional_engine.clone();
+                let snapshot = CommitSnapshot {
+                    generation: b.generation,
+                    table: t.info.table.clone(),
+                    grid: t.grid.id,
+                    edits: t.grid.edits.clone(),
+                };
+                let previews = statements.iter().map(commit_preview).collect();
+                let hidden = statements.iter().any(|s| crate::util::has_hidden(&s.preview()));
+                self.popup = Some(Popup::Commit {
+                    statements,
+                    previews,
+                    hidden,
+                    scroll: 0,
+                    non_transactional,
+                    snapshot: Box::new(snapshot),
+                })
+            }
             Err(e) => {
                 self.popup = Some(Popup::Message { title: "Cannot commit".into(), body: e, error: true, scroll: 0 })
             }
         }
     }
 
-    fn apply_statements(&mut self, statements: Vec<Statement>) {
-        let Some(b) = &self.browser else { return };
+    /// Runs the statements of a commit preview, if they still are what the
+    /// preview showed: the same connection, table and staged changes.
+    fn apply_statements(
+        &mut self,
+        statements: Vec<Statement>,
+        non_transactional: Option<String>,
+        snapshot: CommitSnapshot,
+    ) {
+        let Some(b) = &mut self.browser else { return };
+        let current = b.table.as_ref().is_some_and(|t| {
+            t.info.table == snapshot.table && t.grid.id == snapshot.grid && t.grid.edits.same_changes(&snapshot.edits)
+        });
+        let refused = if b.generation != snapshot.generation {
+            Some("the connection is not the one the changes were made on")
+        } else if b.commit.is_some() {
+            Some("another commit is still running")
+        } else if !current {
+            Some("the table or its staged changes are no longer the ones previewed")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            return self.notify(Level::Error, format!("Nothing was committed: {reason}"));
+        }
+        b.commit_seq += 1;
+        let (generation, seq, profile) = (b.generation, b.commit_seq, b.profile.name.clone());
+        b.commit = Some(Committing { seq, snapshot });
         self.busy = Some(format!("Committing {} statement(s)", statements.len()));
+        // The database's "rolled back" is not true for these engines.
+        let note = non_transactional.filter(|_| statements.len() > 1).map(|engine| {
+            format!(
+                "\n\n⚠ {engine} tables do not support transactions: statements that ran before the failing \
+                 one were kept. Reload the table to see what changed."
+            )
+        });
         let db = b.db.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(AppEvent::Committed(db.apply(&statements).await.map_err(err_text)));
+            let result = match crate::terminal::catch_panic(db.apply(&statements)).await {
+                Ok(result) => result.map_err(|e| err_text(e) + note.as_deref().unwrap_or_default()),
+                // It may have happened before or after the commit itself.
+                Err(panic) => Err(format!(
+                    "internal error: {panic}\n\nThe changes may or may not have been committed: reload the table \
+                     to see."
+                )),
+            };
+            let _ = tx.send(AppEvent::Committed { generation, seq, profile, result });
         });
     }
 
@@ -1655,22 +2598,41 @@ impl App {
 
     pub fn on_app_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Connected { profile, db, session, schemas, remember } => {
-                self.busy = None;
-                if let Some(pw) = remember {
-                    self.store_password(&profile.id, &pw);
+            AppEvent::Connected { attempt, profile, db, session, schemas } => {
+                if self.connecting != Some(attempt) {
+                    // Another connection was asked for since: this one goes.
+                    tokio::spawn(async move { db.close().await });
+                    return;
                 }
-                let browser = Browser::new(profile, db, session, schemas);
+                self.connecting = None;
+                self.busy = None;
+                if let Some(remember) = self.to_remember.take() {
+                    self.remember_password(&profile, remember);
+                }
+                if let Some(old) = self.browser.take() {
+                    tokio::spawn(async move { old.db.close().await });
+                }
+                let browser = Browser::new(attempt, profile, db, *session, schemas);
                 let level = browser.access_level();
                 let mut msg = format!("Connected as {} · {}", browser.session.user, level.label());
                 if let Some(reason) = &browser.session.read_only_reason {
                     msg.push_str(&format!(" ({reason})"));
                 }
-                self.notify(Level::Success, msg);
+                let mut level = Level::Success;
+                if let Some(warning) = browser.profile.tls_warning() {
+                    msg.push_str(&format!(" · ⚠ {}: {warning}", browser.profile.ssl_mode.label()));
+                    level = Level::Warning;
+                }
+                self.notify(level, msg);
                 self.browser = Some(browser);
                 self.screen = Screen::Browser;
             }
-            AppEvent::ConnectFailed { profile, error, needs_password } => {
+            AppEvent::ConnectFailed { attempt, profile, error, needs_password } => {
+                if self.connecting != Some(attempt) {
+                    return;
+                }
+                self.connecting = None;
+                self.to_remember = None;
                 self.busy = None;
                 if needs_password {
                     self.ask_password(profile, Some(error));
@@ -1683,16 +2645,25 @@ impl App {
                     });
                 }
             }
-            AppEvent::KeyringStored { id, password, result } => self.keyring_stored(&id, &password, result),
-            AppEvent::KeyringRemoved(result) => {
-                if let Err(e) = result {
+            AppEvent::SavedPassword { attempt, profile, result } => {
+                if self.connecting == Some(attempt) {
+                    self.connect_with_saved(profile, result.map_err(anyhow::Error::msg), "the OS keyring")
+                }
+            }
+            AppEvent::KeyringStored(request, result) => self.keyring_stored(request, result),
+            AppEvent::KeyringRemoved { op, report, result } => {
+                self.credentials.pending.remove(&op);
+                if let Err(e) = result
+                    && report
+                {
                     self.notify(Level::Warning, format!("Could not remove saved password: {e}"));
                 }
             }
+            AppEvent::VaultOpened { seq, create, result } => self.vault_opened(seq, create, result),
             AppEvent::TestResult(result) => {
                 self.busy = None;
                 match result {
-                    Ok(msg) => self.notify(Level::Success, msg),
+                    Ok((level, msg)) => self.notify(level, msg),
                     Err(e) => {
                         if let Some(Popup::Form(form)) = &mut self.popup {
                             form.error = Some(e.clone());
@@ -1701,19 +2672,20 @@ impl App {
                     }
                 }
             }
-            AppEvent::Schemas(result) => match result {
-                Ok(schemas) => {
-                    if let Some(b) = &mut self.browser {
-                        b.set_schemas(schemas);
-                    }
-                }
-                Err(e) => self.notify(Level::Error, e),
-            },
-            AppEvent::Page { seq, structure, data } => {
-                let Some(b) = &mut self.browser else { return };
-                if seq != b.seq {
+            AppEvent::Schemas { generation, seq, result } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.schema_seq == seq)
+                else {
                     return;
+                };
+                match result {
+                    Ok(schemas) => b.set_schemas(schemas),
+                    Err(e) => self.notify(Level::Error, e),
                 }
+            }
+            AppEvent::Page { generation, seq, structure, data } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.seq == seq) else {
+                    return;
+                };
                 let Some(t) = &mut b.table else { return };
                 t.loading = false;
                 if let Some(structure) = structure {
@@ -1722,7 +2694,15 @@ impl App {
                         Err(e) => t.error = Some(e),
                     }
                 }
+                // Staged changes are never dropped (reloads wait for them to
+                // be committed or discarded, so this is not expected): they
+                // stay on the rows they were made on.
+                let pending = t.grid.pending_count();
                 match data {
+                    Ok(_) if pending > 0 => self.notify(
+                        Level::Warning,
+                        format!("Not reloaded: {pending} pending change(s) are kept on the rows shown"),
+                    ),
                     Ok(rs) => {
                         let columns = if rs.columns.is_empty() {
                             t.structure
@@ -1733,7 +2713,7 @@ impl App {
                             rs.columns
                         };
                         let (row, col) = (t.grid.row, t.grid.col);
-                        let mut grid = Grid::new(columns, rs.rows);
+                        let mut grid = Grid::new(columns, rs.rows).with_kinds(rs.kinds);
                         grid.row = row.min(grid.total_rows().saturating_sub(1));
                         grid.col = col.min(grid.columns.len().saturating_sub(1));
                         t.grid = grid;
@@ -1742,73 +2722,117 @@ impl App {
                     }
                     Err(e) => {
                         // Don't leave stale rows on screen under a new filter/page.
-                        t.grid.rows.clear();
-                        t.grid.clear_edits();
+                        if pending == 0 {
+                            t.grid.clear_rows();
+                        }
                         t.error = Some(e.clone());
                         self.notify(Level::Error, e);
                     }
                 }
+                self.check_cell_editor();
             }
-            AppEvent::Count { seq, count } => {
+            AppEvent::Count { generation, seq, count } => {
                 if let Some(b) = &mut self.browser
-                    && seq == b.seq
+                    && (b.generation, b.seq) == (generation, seq)
                     && let Some(t) = &mut b.table
                 {
                     t.total = count.ok();
                 }
             }
-            AppEvent::Query { seq, result } => {
-                let Some(b) = &mut self.browser else { return };
-                if seq != b.query.seq {
+            AppEvent::Query { generation, seq, may_write, result } => {
+                let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation && b.query.seq == seq) else {
                     return;
-                }
+                };
                 b.query.running = false;
                 match result {
                     Ok(rs) => {
                         let ms = rs.elapsed.as_secs_f64() * 1000.0;
-                        let msg = if rs.columns.is_empty() {
-                            format!("✓ {} row(s) affected · {ms:.1} ms", rs.rows_affected)
+                        // Statements may have changed the schema or the open table
+                        // (PostgreSQL also counts the rows a SELECT returns).
+                        let changed = may_write && (rs.rows_affected > 0 || rs.columns.is_empty());
+                        let (rows, columns, affected, truncated) =
+                            (rs.rows.len(), rs.columns.is_empty(), rs.rows_affected, rs.truncated);
+                        b.query.result =
+                            (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows).with_kinds(rs.kinds));
+                        let cut = b.query.result.as_ref().map_or(0, Grid::cut_count);
+                        let mut msg = if columns {
+                            format!("✓ {affected} row(s) affected · {ms:.1} ms")
                         } else {
-                            let more =
-                                if rs.truncated { format!(" (first {} shown)", rs.rows.len()) } else { String::new() };
-                            format!("✓ {} row(s){more} · {ms:.1} ms", rs.rows.len())
+                            let more = if truncated { format!(" (first {rows} shown)") } else { String::new() };
+                            format!("✓ {rows} row(s){more} · {ms:.1} ms")
                         };
+                        if cut > 0 {
+                            msg.push_str(&format!(" · ⚠ {cut} large value(s) only partly loaded"));
+                        }
                         b.query.message = Some((msg, false));
-                        // Statements may have changed the schema or the open table.
-                        let changed = rs.rows_affected > 0 || rs.columns.is_empty();
-                        b.query.result = (!rs.columns.is_empty()).then(|| Grid::new(rs.columns, rs.rows));
                         if changed {
                             self.refresh_schemas();
+                            self.reload_after_sql();
                         }
                     }
                     Err(e) => b.query.message = Some((format!("✗ {e}"), true)),
                 }
             }
-            AppEvent::Committed(result) => {
-                self.busy = None;
-                match result {
-                    Ok(n) => {
-                        if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut()) {
-                            t.grid.clear_edits();
-                        }
-                        self.notify(Level::Success, format!("Committed — {n} row(s) affected"));
-                        self.request_page();
-                    }
-                    Err(e) => {
-                        self.popup =
-                            Some(Popup::Message { title: "Commit failed".into(), body: e, error: true, scroll: 0 })
-                    }
+            AppEvent::Committed { generation, seq, profile, result } => {
+                self.committed(generation, seq, profile, result)
+            }
+        }
+    }
+
+    /// After SQL that may have written: the open table's rows may be stale,
+    /// and a row's key may now belong to another record.
+    fn reload_after_sql(&mut self) {
+        let Some(b) = &self.browser else { return };
+        let Some(t) = &b.table else { return };
+        if b.commit.is_some() {
+            // Reloaded once the commit is done.
+        } else if t.grid.has_pending() {
+            let message = format!(
+                "The SQL may have changed {}: check the rows of your {} pending change(s) before committing",
+                t.info.table.name,
+                t.grid.pending_count()
+            );
+            self.notify(Level::Warning, message);
+        } else {
+            self.request_page();
+        }
+    }
+
+    fn committed(&mut self, generation: u64, seq: u64, profile: String, result: Result<u64, String>) {
+        let Some(b) = self.browser.as_mut().filter(|b| b.generation == generation) else {
+            // From a connection closed while the commit ran.
+            return match result {
+                Ok(n) => self.notify(Level::Info, format!("The commit to {profile} finished: {n} row(s) affected")),
+                Err(e) => self.notify(Level::Error, format!("The commit to {profile} failed: {e}")),
+            };
+        };
+        let Some(commit) = b.commit.take_if(|c| c.seq == seq) else { return };
+        self.busy = None;
+        match result {
+            Ok(n) => {
+                let snapshot = commit.snapshot;
+                if let Some(t) = self.browser.as_mut().and_then(|b| b.table.as_mut())
+                    && t.info.table == snapshot.table
+                    && t.grid.id == snapshot.grid
+                {
+                    t.grid.remove_committed(&snapshot.edits);
                 }
+                self.check_cell_editor();
+                self.notify(Level::Success, format!("Committed — {n} row(s) affected"));
+                self.request_page();
+            }
+            Err(e) => {
+                self.popup = Some(Popup::Message { title: "Commit failed".into(), body: e, error: true, scroll: 0 })
             }
         }
     }
 }
 
-/// Pretty-prints JSON values for the cell viewer.
-fn pretty_value(text: &str) -> String {
+/// JSON values re-indented for the cell viewer; `None` for anything else.
+fn pretty_value(text: &str) -> Option<String> {
     let t = text.trim();
     if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
-        return crate::util::pretty_json(t).unwrap_or_else(|| text.to_string());
+        return crate::util::pretty_json(t);
     }
-    text.to_string()
+    None
 }

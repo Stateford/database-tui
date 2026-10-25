@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 
 use super::theme::*;
 use crate::app::grid::{CellState, CellValue, Grid};
-use crate::util::{one_line, truncate};
+use crate::util::{fit, fit_cut, has_hidden, ident};
 
 pub struct GridView<'a> {
     pub focused: bool,
@@ -80,16 +80,19 @@ pub fn render(buf: &mut Buffer, area: Rect, grid: &mut Grid, view: &GridView) {
             }
             _ => "",
         };
-        let label = format!("{}{name}{arrow}", if is_pk { "◆ " } else { "" });
+        let label = format!("{}{}{arrow}", if is_pk { "◆ " } else { "" }, ident(name));
         let mut style = header_style;
         if is_pk {
             style = style.fg(YELLOW);
+        }
+        if has_hidden(name) {
+            style = style.fg(ORANGE);
         }
         if c == grid.col && view.focused {
             style = style.fg(CYAN);
         }
         let space = (right - x) as usize;
-        buf.set_stringn(x, area.y, format!(" {:<w$} ", truncate(&label, w), w = w), space, style);
+        buf.set_stringn(x, area.y, format!(" {:<w$} ", fit(&label, w), w = w), space, style);
         let sx = x + w as u16 + 2;
         if sx < right {
             buf.set_stringn(sx, area.y, "│", 1, header_style.fg(BORDER));
@@ -125,10 +128,12 @@ pub fn render(buf: &mut Buffer, area: Rect, grid: &mut Grid, view: &GridView) {
 
         for &(c, x, w) in &visible {
             let (value, state) = grid.cell(row, c);
-            let (text, mut style) = match value {
-                CellValue::Value(v) => (one_line(v), Style::default().fg(FG)),
-                CellValue::Null => ("NULL".to_string(), null()),
-                CellValue::Default => ("DEFAULT".to_string(), null()),
+            // Only as much of the value as the column shows is read: values
+            // can be large. One cut short when loaded always ends in `…`.
+            let (shown, mut style) = match value {
+                CellValue::Value(v) => (fit_cut(v, w, grid.cut(row, c).is_some()), Style::default().fg(FG)),
+                CellValue::Null => (fit("NULL", w), null()),
+                CellValue::Default => (fit("DEFAULT", w), null()),
             };
             let cell_bg = match state {
                 CellState::Clean => row_bg,
@@ -146,7 +151,6 @@ pub fn render(buf: &mut Buffer, area: Rect, grid: &mut Grid, view: &GridView) {
                 style = if view.focused { style.bg(SELECTION).add_modifier(Modifier::BOLD) } else { style.bg(BORDER) };
             }
             let numeric = matches!(value, CellValue::Value(v) if looks_numeric(v));
-            let shown = truncate(&text, w);
             let padded = if numeric { format!(" {shown:>w$} ") } else { format!(" {shown:<w$} ") };
             let space = (right - x) as usize;
             buf.set_stringn(x, y, padded, space, style);
